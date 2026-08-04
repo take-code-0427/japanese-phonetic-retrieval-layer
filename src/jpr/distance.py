@@ -86,8 +86,13 @@ CONSONANTS: dict[str, Consonant] = {
     "ch": Consonant("postalveolar", "affricate", False, palatalized=True),
     "h": Consonant("glottal", "fricative", False),
     "hy": Consonant("palatal", "fricative", False, palatalized=True),
-    "f": Consonant("labiodental", "fricative", False),
-    "fy": Consonant("labiodental", "fricative", False, palatalized=True),
+    # 日本語の /f/ (フ・ファ行) は IPA では [ɸ] — 両唇摩擦音であって [f] ではない。
+    # labiodental に置くと alveolar と隣接するので f-s が 0.067 まで落ち、「フトン」の
+    # 最近傍が「ストン」・「フウフ」が「スウフ」になった。両唇に直すと f-p 0.26 /
+    # f-s 0.13 と逆転し、調音を共有する p/b/m/h 側に寄る。
+    "f": Consonant("bilabial", "fricative", False),
+    "fy": Consonant("bilabial", "fricative", False, palatalized=True),
+    # ヴ は借用語の [v] で、こちらは実際に唇歯音。
     "v": Consonant("labiodental", "fricative", True),
     "n": Consonant("alveolar", "nasal", True),
     "ny": Consonant("palatal", "nasal", True, palatalized=True),

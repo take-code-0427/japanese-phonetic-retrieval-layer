@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from jpr.distance import (
+    PAD_ID,
     WORST_SUBSTITUTION_COST,
     align_phonemes,
+    edit_distance_batch,
+    edit_distance_ids,
     phoneme_distance,
+    phoneme_ids,
     phonetic_similarity,
     weighted_edit_distance,
 )
@@ -93,6 +98,74 @@ def test_edit_distance_respects_max_distance_cutoff() -> None:
 
 def test_worst_substitution_cost_is_bounded() -> None:
     assert 0.0 < WORST_SUBSTITUTION_COST <= 1.0
+
+
+#: 同じ距離関数に 3 つの実装がある。記号ベース (可読性優先)、ID ベース
+#: (rerank の 1 件経路)、バッチ (rerank の全件経路)。速度のために別実装を
+#: 持っているだけなので、値が食い違えば検索結果が実装依存になる。
+#: 素性表や重みを変えたときに 3 者が揃っていることをここで担保する。
+#:
+#: 下のアライメントのテストと前半の対が重なっているが、意図的に別に持つ。
+#: あちらは空文字列の対を含み (こちらは空入力を専用のテストで見る)、
+#: 検証したい性質も違う (実装間の一致 / コスト総和と距離の一致) ので、
+#: 片方の都合で対を足したときにもう片方が巻き込まれないようにしている。
+_DISTANCE_PAIRS = [
+    ("チクビ", "テクビ"),
+    ("チクビ", "チョコビ"),
+    ("カガク", "カカク"),
+    ("サカナ", "アカ"),
+    ("ラーメン", "ローメン"),
+    ("マツタケ", "ソラ"),
+    ("トウキョウ", "トウギョウ"),
+    ("ガッコウ", "ガクコウ"),
+    ("アリガトウ", "アリタソウ"),
+    ("ア", "アイウエオ"),
+]
+
+
+@pytest.mark.parametrize(("a", "b"), _DISTANCE_PAIRS)
+def test_id_implementation_matches_symbolic(a: str, b: str) -> None:
+    pa = analyze_reading(a).phonemes
+    pb = analyze_reading(b).phonemes
+    expected = weighted_edit_distance(pa, pb)
+    actual = edit_distance_ids(phoneme_ids(pa), phoneme_ids(pb))
+    assert actual == pytest.approx(expected)
+
+
+def test_batch_implementation_matches_symbolic() -> None:
+    """バッチ版は、長さの違う候補を混ぜても 1 件ずつの結果と一致する。
+
+    パディングの扱いを間違えると長さの違う候補だけが狂うので、
+    最長でない候補が混ざった行列で検証する。
+    """
+    query = analyze_reading("チクビ").phonemes
+    candidates = [analyze_reading(b).phonemes for _, b in _DISTANCE_PAIRS]
+
+    lengths = np.array([len(p) for p in candidates], dtype=np.int64)
+    width = int(lengths.max())
+    matrix = np.full((len(candidates), width), PAD_ID, dtype=np.int64)
+    for row, phonemes in enumerate(candidates):
+        matrix[row, : len(phonemes)] = phoneme_ids(phonemes)
+
+    actual = edit_distance_batch(phoneme_ids(query), matrix, lengths)
+    expected = [weighted_edit_distance(query, p) for p in candidates]
+    assert actual == pytest.approx(expected)
+
+
+def test_batch_handles_empty_query_and_no_candidates() -> None:
+    empty = np.zeros(0, dtype=np.int32)
+    phonemes = analyze_reading("チクビ").phonemes
+    matrix = phoneme_ids(phonemes).reshape(1, -1)
+    lengths = np.array([len(phonemes)], dtype=np.int64)
+
+    # クエリが空なら候補を全削除するコスト。
+    assert edit_distance_batch(empty, matrix, lengths) == pytest.approx(
+        [weighted_edit_distance((), phonemes)]
+    )
+    # 候補が無ければ空の配列。
+    assert edit_distance_batch(
+        phoneme_ids(phonemes), np.zeros((0, 0), dtype=np.int64), np.zeros(0, dtype=np.int64)
+    ).shape == (0,)
 
 
 #: アライメントは編集距離の内訳を見せるためのものなので、対ごとのコストの

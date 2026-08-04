@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from jpr.distance import (
+    WORST_SUBSTITUTION_COST,
+    similarity_normalizer,
+    weighted_edit_distance,
+)
 from jpr.index import Category
 from jpr.search import PRESETS, PhoneticSearcher, ScoreWeights
 
@@ -86,6 +91,29 @@ def test_score_components_are_reported(sample_searcher: PhoneticSearcher) -> Non
     assert 0.0 <= result.embedding_similarity <= 1.0
     assert 0.0 <= result.coda_similarity <= 1.0
     assert 0.0 <= result.familiarity <= 1.0
+
+
+def test_reported_similarity_matches_the_reference_implementation(
+    sample_searcher: PhoneticSearcher,
+) -> None:
+    """検索が返す音韻類似度が、記号ベースの実装から求めた値と一致する。
+
+    rerank は速度のために距離をバッチで解き、分母 (`similarity_normalizer`)
+    も配列で写している。片方だけ変えると検索スコアと `compare` の類似度が
+    静かに食い違うので、突き合わせをここで担保する。
+    """
+    query = "乳首"
+    query_phonemes = sample_searcher.pronounce(query).phonemes
+    _, results = sample_searcher.search(query, limit=10)
+    assert results
+
+    for result in results:
+        distance = weighted_edit_distance(query_phonemes, result.phonemes)
+        denominator = similarity_normalizer(
+            len(query_phonemes), len(result.phonemes), WORST_SUBSTITUTION_COST
+        )
+        expected = max(0.0, 1.0 - distance / denominator)
+        assert result.phonetic_similarity == pytest.approx(expected, abs=5e-5), result.surface
 
 
 @pytest.mark.parametrize("preset", sorted(PRESETS))

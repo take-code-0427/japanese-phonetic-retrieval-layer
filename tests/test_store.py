@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from jpr.build import embed_entries
+from jpr.distance import PAD_ID
 from jpr.index import Category, IndexEntry
 from jpr.phonology import analyze_reading
 from jpr.store import FORMAT_VERSION, PhoneticStore, write_store
@@ -58,6 +59,30 @@ def test_entries_roundtrip_exactly(roundtrip: PhoneticStore) -> None:
 def test_all_rows_are_readable(roundtrip: PhoneticStore) -> None:
     surfaces = [roundtrip.surface(row) for row in range(len(roundtrip))]
     assert surfaces == ["乳首", "チョコビ", "東京特許許可局", "ラーメン"]
+
+
+def test_phoneme_id_matrix_matches_row_by_row(roundtrip: PhoneticStore) -> None:
+    """まとめて引いた行列は、1 行ずつ引いたものとパディング以外で一致する。
+
+    音素数の散らばる語 (3 音素の「チクビ」と 20 音素超の「東京特許許可局」)
+    を混ぜているので、パディングの扱いを間違えればここで落ちる。
+    """
+    rows = np.arange(len(roundtrip))
+    matrix, lengths = roundtrip.phoneme_id_matrix(rows)
+
+    assert lengths.tolist() == [roundtrip.phoneme_id_array(row).size for row in rows]
+    assert matrix.shape == (len(roundtrip), int(lengths.max()))
+    for row in rows:
+        expected = roundtrip.phoneme_id_array(row)
+        assert matrix[row, : expected.size].tolist() == expected.tolist()
+        # 余りはパディングで埋まっていて、実データと混ざらない。
+        assert (matrix[row, expected.size :] == PAD_ID).all()
+
+
+def test_phoneme_id_matrix_handles_empty_selection(roundtrip: PhoneticStore) -> None:
+    matrix, lengths = roundtrip.phoneme_id_matrix(np.zeros(0, dtype=np.int64))
+    assert matrix.shape[0] == 0
+    assert lengths.size == 0
 
 
 def test_category_ids_map_back(roundtrip: PhoneticStore) -> None:

@@ -85,7 +85,24 @@ def test_search_is_fast(real_searcher: PhoneticSearcher) -> None:
         real_searcher.search(query, limit=10)
     elapsed = (time.perf_counter() - started) / 5
 
-    assert elapsed < 1.0, f"1 クエリ {elapsed * 1000:.0f}ms は遅すぎる"
+    # 編集距離をバッチ化する前は 1 クエリ平均 440ms、最悪 1.4 秒かかっていた。
+    # 現状は中央値 26ms・最大 41ms だが、他のテストと並走すると一時的に跳ねる。
+    # 退行 (バッチ化を戻すと 440ms) を捕まえるには 150ms で十分なので、
+    # 偶発的な失敗を避けてここに置く。
+    assert elapsed < 0.15, f"1 クエリ {elapsed * 1000:.0f}ms は遅すぎる"
+
+
+def test_limit_is_filled_when_candidates_allow(real_searcher: PhoneticSearcher) -> None:
+    """要求件数ぶん候補があるなら、その数だけ返る。
+
+    rerank は上位だけを `SearchResult` に起こすので、選抜幅を固定にすると
+    同音異表記を畳んだ後に件数が足りなくなる。実測では mishearing の
+    「東京」が 20 件要求に対し 12 件しか返らなかった。
+    """
+    for preset in ("pun", "rhyme", "mishearing"):
+        for query in ("東京", "科学", "ラーメン"):
+            _, results = real_searcher.search(query, limit=20, preset=preset)
+            assert len(results) == 20, f"{preset}:{query} が {len(results)} 件しか返らない"
 
 
 def test_results_are_real_words(real_searcher: PhoneticSearcher) -> None:

@@ -16,18 +16,17 @@ embedding だけに任せないのは、「なぜ近いのか」が曖昧にな�
 
 from __future__ import annotations
 
-import heapq
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from .distance import (
+    INDEL_COST,
     WORST_SUBSTITUTION_COST,
-    edit_distance_ids,
+    edit_distance_batch,
     phoneme_ids,
     phonetic_similarity,
-    similarity_normalizer,
     weighted_edit_distance,
 )
 from .embedding import embed
@@ -155,6 +154,28 @@ class ComparisonResult:
     spaces: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _ScoredCandidates:
+    """rerank で求めた候補全件のスコアと内訳。
+
+    スコア計算と、上位を `SearchResult` に起こす処理を分けている。結果が
+    limit に届かないときは選抜幅だけ広げて起こし直せばよく、配列の計算を
+    やり直す必要がない。
+    """
+
+    rows: np.ndarray
+    scores: np.ndarray
+    phonetic: np.ndarray
+    embedding: np.ndarray
+    coda: np.ndarray
+    vowel: np.ndarray
+    familiarity: np.ndarray
+
+    @property
+    def count(self) -> int:
+        return int(self.rows.size)
+
+
 class PhoneticSearcher:
     """ANN + rerank の 2 段検索。"""
 
@@ -232,21 +253,34 @@ class PhoneticSearcher:
         if rows.size == 0:
             return pronunciation, []
 
-        results = self._rerank(
+        scored = self._score_candidates(
             rows=rows,
             embedding_scores=embedding_scores,
-            query=query,
             pronunciation=pronunciation,
             query_vectors=query_vectors,
             weights=active_weights,
-            exclude_same_reading=exclude_same_reading,
-            candidate_filter=candidate_filter,
-            min_score=min_score,
-            limit=limit,
         )
 
-        if dedupe_by_reading:
-            results = _dedupe_by_reading(results)
+        # 同音異表記が畳まれる分と、除外・フィルタで落ちる分だけ結果が目減りする。
+        # どれだけ減るかは走らせるまでわからないので、limit に届かなければ
+        # 選抜幅を広げて作り直す。スコアは全候補ぶん計算済みなので、
+        # やり直しのコストは選抜と文字列の復号だけ。
+        keep = max(limit * _RERANK_MARGIN, limit)
+        while True:
+            results = self._materialize(
+                scored=scored,
+                query=query,
+                pronunciation=pronunciation,
+                exclude_same_reading=exclude_same_reading,
+                candidate_filter=candidate_filter,
+                min_score=min_score,
+                keep=keep,
+            )
+            if dedupe_by_reading:
+                results = _dedupe_by_reading(results)
+            if len(results) >= limit or keep >= scored.count:
+                break
+            keep = min(keep * 4, scored.count)
 
         results.sort(key=lambda r: (-r.score, r.mora_count, r.surface))
         return pronunciation, results[:limit]
@@ -290,59 +324,84 @@ class PhoneticSearcher:
 
     # --- 段 2: 精密な音韻距離で rerank ------------------------------------
 
-    def _rerank(
+    def _score_candidates(
         self,
         *,
         rows: np.ndarray,
         embedding_scores: np.ndarray,
-        query: str,
         pronunciation: Pronunciation,
         query_vectors: dict[str, np.ndarray],
         weights: ScoreWeights,
-        exclude_same_reading: bool,
-        candidate_filter: Callable[[IndexEntry], bool] | None,
-        min_score: float,
-        limit: int,
-    ) -> list[SearchResult]:
+    ) -> _ScoredCandidates:
+        """候補全件のスコアと内訳を配列で求める。"""
         store = self.store
         query_ids = phoneme_ids(pronunciation.phonemes)
-        query_length = len(pronunciation.phonemes)
-        query_moras = pronunciation.mora_count
-        normalized_query = self.extractor.normalize(query)
 
         # ベクトルの内積とモーラ数・一般性は配列演算でまとめて出す。
         coda = np.clip(query_vectors["coda"] @ store.vectors("coda")[rows].T, 0.0, None)
         vowel = np.clip(query_vectors["vowel"] @ store.vectors("vowel")[rows].T, 0.0, None)
         embedding = np.clip(embedding_scores, 0.0, None)
         candidate_moras = store.mora_counts[rows].astype(np.int32)
-        mora = _mora_similarity_array(query_moras, candidate_moras)
+        mora = _mora_similarity_array(pronunciation.mora_count, candidate_moras)
         familiarity = _familiarity_array(store.costs[rows])
 
-        # 編集距離を除いた部分の上限を先に出し、これだけで min_score に届かない
-        # 候補は距離を計算せずに捨てる。
-        partial = (
+        # 編集距離も候補全体を 1 度の DP で計算する。以前は編集距離を除いた
+        # 上限 (partial + weights.phoneme) の高い順に見て、確定済み上位の
+        # 最低スコアを打ち切り線にし、見込みのない候補には距離を掛けなかった。
+        # 1 件ずつの距離計算が支配的だった頃はこれが効いたが、バッチ化すると
+        # 1 件あたり 80μs から 4μs に落ちる。打ち切りで削れるのは実測で候補の
+        # 15% 程度しかなく、全件まとめて計算するほうが速い (2000 件で
+        # 190ms -> 9ms)。上限計算が不要になったので、スコアの重み構成を
+        # 変えても距離計算側の妥当性を気にする必要はなくなった。
+        matrix, lengths = store.phoneme_id_matrix(rows)
+        distances = edit_distance_batch(query_ids, matrix, lengths)
+        phonetic = _edit_similarity_array(distances, query_ids.size, lengths)
+
+        scores = (
             weights.embedding * embedding
             + weights.mora * mora
             + weights.coda * coda
             + weights.vowel * vowel
             + weights.familiarity * familiarity
+            + weights.phoneme * phonetic
         )
-        reachable = partial + weights.phoneme
-        order = np.argsort(-reachable)
 
-        # 上限の高い順に見て、確定した上位の最低スコアを打ち切り線に使う。
-        # 語尾・母音・一般性で既に見込みが低い候補には編集距離を掛けない。
-        # 同音の異表記が畳まれることを考えて、必要数より多めに確定させる。
-        keep = max(limit * _RERANK_MARGIN, limit)
-        confirmed: list[float] = []
+        return _ScoredCandidates(
+            rows=rows,
+            scores=scores,
+            phonetic=phonetic,
+            embedding=embedding,
+            coda=coda,
+            vowel=vowel,
+            familiarity=familiarity,
+        )
+
+    def _materialize(
+        self,
+        *,
+        scored: _ScoredCandidates,
+        query: str,
+        pronunciation: Pronunciation,
+        exclude_same_reading: bool,
+        candidate_filter: Callable[[IndexEntry], bool] | None,
+        min_score: float,
+        keep: int,
+    ) -> list[SearchResult]:
+        """スコア上位 `keep` 件を `SearchResult` に起こす。
+
+        文字列の復号と `IndexEntry` の生成はここだけで行う。候補全件で
+        `entry()` を作ると 2000 件で 40ms かかるが、必要なのは同音異表記を
+        畳んだ後に limit 件残る分だけ。
+        """
+        store = self.store
+        scores = scored.scores
+        eligible = np.flatnonzero(scores >= min_score) if min_score > 0.0 else None
+        selected = _top_positions(scores, keep, eligible)
+
         results: list[SearchResult] = []
-        threshold = min_score
-        for position in order.tolist():
-            if reachable[position] < threshold:
-                # 以降はさらに上限が低いので、これ以上見る必要がない。
-                break
-
-            row = int(rows[position])
+        normalized_query = self.extractor.normalize(query)
+        for position in selected:
+            row = int(scored.rows[position])
             reading = store.reading(row)
             if exclude_same_reading and reading == pronunciation.reading:
                 continue
@@ -350,42 +409,26 @@ class PhoneticSearcher:
             if surface in (query, normalized_query):
                 continue
 
-            entry: IndexEntry | None = None
-            if candidate_filter is not None:
-                entry = store.entry(row)
-                if not candidate_filter(entry):
-                    continue
-
-            phonetic = _edit_similarity_ids(query_ids, store.phoneme_id_array(row), query_length)
-            score = float(partial[position]) + weights.phoneme * phonetic
-            if score < min_score:
+            entry = store.entry(row)
+            if candidate_filter is not None and not candidate_filter(entry):
                 continue
-
-            if entry is None:
-                entry = store.entry(row)
 
             results.append(
                 SearchResult(
                     surface=entry.surface,
                     reading=entry.reading,
-                    score=round(score, 4),
-                    phonetic_similarity=round(phonetic, 4),
-                    embedding_similarity=round(float(embedding[position]), 4),
-                    coda_similarity=round(float(coda[position]), 4),
-                    vowel_similarity=round(float(vowel[position]), 4),
+                    score=round(float(scores[position]), 4),
+                    phonetic_similarity=round(float(scored.phonetic[position]), 4),
+                    embedding_similarity=round(float(scored.embedding[position]), 4),
+                    coda_similarity=round(float(scored.coda[position]), 4),
+                    vowel_similarity=round(float(scored.vowel[position]), 4),
                     mora_count=entry.mora_count,
                     pos=entry.pos,
                     category=entry.category,
                     phonemes=entry.phonemes,
-                    familiarity=round(float(familiarity[position]), 3),
+                    familiarity=round(float(scored.familiarity[position]), 3),
                 )
             )
-
-            heapq.heappush(confirmed, score)
-            if len(confirmed) > keep:
-                heapq.heappop(confirmed)
-            if len(confirmed) == keep:
-                threshold = max(threshold, confirmed[0])
 
         return results
 
@@ -436,26 +479,50 @@ def compare_pronunciations(
     )
 
 
-def _edit_similarity(a: tuple[str, ...], b: tuple[str, ...]) -> float:
-    """精密な音韻編集距離ベースの類似度。"""
-    if not a or not b:
-        return 0.0
-    distance = weighted_edit_distance(a, b)
-    denominator = similarity_normalizer(len(a), len(b), WORST_SUBSTITUTION_COST)
-    if denominator <= 0.0:
-        return 1.0
-    return max(0.0, 1.0 - distance / denominator)
+def _edit_similarity_array(
+    distances: np.ndarray,
+    query_length: int,
+    candidate_lengths: np.ndarray,
+) -> np.ndarray:
+    """編集距離を候補ごとの分母で正規化して類似度にする。
+
+    分母は `distance.similarity_normalizer` と同じ式を候補全体に対して
+    配列で解いたもの。**片方だけ変えると検索スコアと `compare` の類似度が
+    静かに食い違う** (`tests/test_search.py` が両者の一致を検証する)。
+    """
+    if distances.size == 0:
+        return distances
+    shorter = np.minimum(candidate_lengths, query_length).astype(np.float64)
+    longer = np.maximum(candidate_lengths, query_length).astype(np.float64)
+    denominator = shorter * WORST_SUBSTITUTION_COST + (longer - shorter) * INDEL_COST
+    # 長さが 0 の候補は分母も 0 になる。距離で割れないので類似度 0 とする。
+    similarity = np.divide(
+        distances,
+        denominator,
+        out=np.ones_like(distances),
+        where=denominator > 0.0,
+    )
+    return np.clip(1.0 - similarity, 0.0, None)
 
 
-def _edit_similarity_ids(a: np.ndarray, b: np.ndarray, len_a: int) -> float:
-    """`_edit_similarity` の ID 配列版。rerank の内側で使う。"""
-    if len_a == 0 or b.size == 0:
-        return 0.0
-    distance = edit_distance_ids(a, b)
-    denominator = similarity_normalizer(len_a, int(b.size), WORST_SUBSTITUTION_COST)
-    if denominator <= 0.0:
-        return 1.0
-    return max(0.0, 1.0 - distance / denominator)
+def _top_positions(
+    scores: np.ndarray,
+    keep: int,
+    eligible: np.ndarray | None,
+) -> list[int]:
+    """スコア上位 `keep` 件の位置を降順で返す。
+
+    全体を argsort すると候補数に比例したコストを払うが、必要なのは上位
+    数十件だけなので argpartition で切ってから並べ替える。
+    """
+    positions = np.arange(scores.size) if eligible is None else eligible
+    if positions.size == 0:
+        return []
+    values = scores if eligible is None else scores[eligible]
+    if positions.size > keep:
+        cut = np.argpartition(-values, keep - 1)[:keep]
+        positions, values = positions[cut], values[cut]
+    return positions[np.argsort(-values)].tolist()
 
 
 def _mora_similarity(a: int, b: int) -> float:

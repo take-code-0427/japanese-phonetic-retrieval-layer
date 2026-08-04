@@ -1,10 +1,10 @@
 """索引構築パイプライン (オフライン処理)。
 
-    SudachiDict system.dic
-        -> 語彙 (表層 + 読み + 品詞 + コスト)
-        -> 音素列 / モーラ列
-        -> 各空間の phonetic embedding
-        -> NumPy 行列 + HNSW 索引
+SudachiDict system.dic
+    -> 語彙 (表層 + 読み + 品詞 + コスト)
+    -> 音素列 / モーラ列
+    -> 各空間の phonetic embedding
+    -> NumPy 行列 + HNSW 索引
 """
 
 from __future__ import annotations

@@ -48,9 +48,7 @@ async def test_search_warns_that_score_ignores_meaning(server) -> None:
 
 @pytest.mark.asyncio
 async def test_search_rejects_unknown_preset(server) -> None:
-    payload = await call(
-        server, "search_phonetically", {"query": "乳首", "preset": "nonexistent"}
-    )
+    payload = await call(server, "search_phonetically", {"query": "乳首", "preset": "nonexistent"})
     assert "error" in payload
     assert "pun" in payload["available"]
 

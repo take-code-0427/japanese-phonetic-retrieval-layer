@@ -128,9 +128,7 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
         "pos_vocabulary": np.array(pos_values, dtype=np.str_),
         "pos_ids": np.array([pos_ids[e.pos] for e in entries], dtype=np.int16),
         "category_vocabulary": np.array(category_values, dtype=np.str_),
-        "category_ids": np.array(
-            [category_ids[e.category.value] for e in entries], dtype=np.int8
-        ),
+        "category_ids": np.array([category_ids[e.category.value] for e in entries], dtype=np.int8),
         "costs": np.array([e.cost for e in entries], dtype=np.int32),
         "mora_counts": np.array([e.mora_count for e in entries], dtype=np.int16),
         "phoneme_vocabulary": np.array(phoneme_vocabulary, dtype=np.str_),
@@ -151,8 +149,7 @@ class PhoneticStore:
         meta_file = self.path / _META_FILE
         if not meta_file.exists():
             raise FileNotFoundError(
-                f"索引が見つかりません: {self.path}\n"
-                "`jpr build-index` で構築してください。"
+                f"索引が見つかりません: {self.path}\n`jpr build-index` で構築してください。"
             )
         self.meta = StoreMeta.from_json(meta_file.read_text(encoding="utf-8"))
         if self.meta.version != FORMAT_VERSION:
@@ -165,9 +162,7 @@ class PhoneticStore:
             self._data = {name: archive[name] for name in archive.files}
 
         self._pos_vocabulary = [str(v) for v in self._data["pos_vocabulary"]]
-        self._category_vocabulary = [
-            Category(str(v)) for v in self._data["category_vocabulary"]
-        ]
+        self._category_vocabulary = [Category(str(v)) for v in self._data["category_vocabulary"]]
         self._phoneme_vocabulary = [str(v) for v in self._data["phoneme_vocabulary"]]
 
         self._vectors: dict[str, np.ndarray] = {}
@@ -179,14 +174,10 @@ class PhoneticStore:
     # --- 語彙メタデータ ---------------------------------------------------
 
     def surface(self, row: int) -> str:
-        return _decode_string(
-            self._data["surface_blob"], self._data["surface_bounds"], row
-        )
+        return _decode_string(self._data["surface_blob"], self._data["surface_bounds"], row)
 
     def reading(self, row: int) -> str:
-        return _decode_string(
-            self._data["reading_blob"], self._data["reading_bounds"], row
-        )
+        return _decode_string(self._data["reading_blob"], self._data["reading_bounds"], row)
 
     def phonemes(self, row: int) -> tuple[str, ...]:
         bounds = self._data["phoneme_bounds"]
@@ -233,9 +224,7 @@ class PhoneticStore:
     def vectors(self, space: str) -> np.ndarray:
         """指定した空間の (N, D) 行列を mmap で返す。"""
         if space not in self._vectors:
-            self._vectors[space] = np.load(
-                self.path / f"vectors-{space}.npy", mmap_mode="r"
-            )
+            self._vectors[space] = np.load(self.path / f"vectors-{space}.npy", mmap_mode="r")
         return self._vectors[space]
 
     def ann(self, space: str, ef: int = 200):

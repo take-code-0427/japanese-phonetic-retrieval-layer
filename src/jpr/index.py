@@ -109,9 +109,7 @@ def is_searchable_surface(surface: str) -> bool:
     """
     if not surface:
         return False
-    return any(
-        "ぁ" <= ch <= "ヿ" or "一" <= ch <= "鿿" or ch == "ー" for ch in surface
-    )
+    return any("ぁ" <= ch <= "ヿ" or "一" <= ch <= "鿿" or ch == "ー" for ch in surface)
 
 
 __all__ = [

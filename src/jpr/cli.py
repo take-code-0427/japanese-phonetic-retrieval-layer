@@ -33,6 +33,11 @@ def _open_searcher(path: Path) -> PhoneticSearcher:
     return PhoneticSearcher(store)
 
 
+def _print_json(payload: object) -> None:
+    """CLI の JSON 出力。日本語をエスケープせずに整形して出す。"""
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def _parse_categories(value: str | None) -> list[Category] | None:
     if not value:
         return None
@@ -64,36 +69,32 @@ def cmd_similar(args: argparse.Namespace) -> int:
     elapsed = (time.perf_counter() - started) * 1000
 
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "query": args.query,
-                    "reading": pronunciation.reading,
-                    "phonemes": list(pronunciation.phonemes),
-                    "mora_count": pronunciation.mora_count,
-                    "preset": args.preset,
-                    "elapsed_ms": round(elapsed, 1),
-                    "results": [
-                        {
-                            "word": r.surface,
-                            "reading": r.reading,
-                            "score": r.score,
-                            "phonetic_similarity": r.phonetic_similarity,
-                            "embedding_similarity": r.embedding_similarity,
-                            "coda_similarity": r.coda_similarity,
-                            "vowel_similarity": r.vowel_similarity,
-                            "mora_count": r.mora_count,
-                            "category": r.category.value,
-                            "pos": r.pos,
-                            "familiarity": r.familiarity,
-                            "phonemes": list(r.phonemes),
-                        }
-                        for r in results
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        _print_json(
+            {
+                "query": args.query,
+                "reading": pronunciation.reading,
+                "phonemes": list(pronunciation.phonemes),
+                "mora_count": pronunciation.mora_count,
+                "preset": args.preset,
+                "elapsed_ms": round(elapsed, 1),
+                "results": [
+                    {
+                        "word": r.surface,
+                        "reading": r.reading,
+                        "score": r.score,
+                        "phonetic_similarity": r.phonetic_similarity,
+                        "embedding_similarity": r.embedding_similarity,
+                        "coda_similarity": r.coda_similarity,
+                        "vowel_similarity": r.vowel_similarity,
+                        "mora_count": r.mora_count,
+                        "category": r.category.value,
+                        "pos": r.pos,
+                        "familiarity": r.familiarity,
+                        "phonemes": list(r.phonemes),
+                    }
+                    for r in results
+                ],
+            }
         )
         return 0
 
@@ -118,30 +119,35 @@ def cmd_similar(args: argparse.Namespace) -> int:
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
-    searcher = _open_searcher(args.index)
-    comparison = searcher.compare(args.a, args.b)
+    """2 語を比較する。索引を必要とせず、辞書だけで完結する。"""
+    from .reading import ReadingExtractor
+    from .search import compare_pronunciations
+
+    extractor = ReadingExtractor(dict_type=args.dict)
+    comparison = compare_pronunciations(
+        args.a,
+        args.b,
+        analyze_reading(extractor.reading_of(args.a)),
+        analyze_reading(extractor.reading_of(args.b)),
+    )
 
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "a": {
-                        "text": comparison.a_text,
-                        "reading": comparison.a_reading,
-                        "phonemes": list(comparison.a_phonemes),
-                    },
-                    "b": {
-                        "text": comparison.b_text,
-                        "reading": comparison.b_reading,
-                        "phonemes": list(comparison.b_phonemes),
-                    },
-                    "similarity": comparison.similarity,
-                    "distance": comparison.distance,
-                    "spaces": comparison.spaces,
+        _print_json(
+            {
+                "a": {
+                    "text": comparison.a_text,
+                    "reading": comparison.a_reading,
+                    "phonemes": list(comparison.a_phonemes),
                 },
-                ensure_ascii=False,
-                indent=2,
-            )
+                "b": {
+                    "text": comparison.b_text,
+                    "reading": comparison.b_reading,
+                    "phonemes": list(comparison.b_phonemes),
+                },
+                "similarity": comparison.similarity,
+                "distance": comparison.distance,
+                "spaces": comparison.spaces,
+            }
         )
         return 0
 
@@ -176,8 +182,7 @@ def cmd_build_index(args: argparse.Namespace) -> int:
     path = args.index
     if path.exists() and not args.force:
         print(
-            f"エラー: 索引が既に存在します: {path}\n"
-            "上書きするには --force を指定してください。",
+            f"エラー: 索引が既に存在します: {path}\n上書きするには --force を指定してください。",
             file=sys.stderr,
         )
         return 1
@@ -267,8 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare = subparsers.add_parser("compare", help="2 語の音韻類似度を計算する")
     compare.add_argument("a")
     compare.add_argument("b")
+    compare.add_argument("--dict", default="full", help="SudachiDict の種類 (既定: %(default)s)")
     compare.add_argument("--json", action="store_true", help="JSON で出力する")
-    _add_store_argument(compare)
     compare.set_defaults(func=cmd_compare)
 
     pronounce = subparsers.add_parser("pronounce", help="読みと音素列を表示する")

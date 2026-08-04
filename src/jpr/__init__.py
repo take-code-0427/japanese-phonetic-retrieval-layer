@@ -13,7 +13,14 @@ from .distance import phoneme_distance, phonetic_similarity, weighted_edit_dista
 from .index import Category, IndexEntry
 from .phonology import Mora, Pronunciation, analyze_reading
 from .reading import ReadingExtractor
-from .search import PRESETS, ComparisonResult, PhoneticSearcher, ScoreWeights, SearchResult
+from .search import (
+    PRESETS,
+    ComparisonResult,
+    PhoneticSearcher,
+    ScoreWeights,
+    SearchResult,
+    compare_pronunciations,
+)
 from .store import PhoneticStore, default_store_path
 
 __all__ = [
@@ -29,6 +36,7 @@ __all__ = [
     "ScoreWeights",
     "SearchResult",
     "analyze_reading",
+    "compare_pronunciations",
     "default_store_path",
     "phoneme_distance",
     "phonetic_similarity",

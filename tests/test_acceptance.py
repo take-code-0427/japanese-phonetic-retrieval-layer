@@ -98,8 +98,7 @@ def test_results_are_real_words(real_searcher: PhoneticSearcher) -> None:
     assert results
     for result in results:
         assert any(
-            "ぁ" <= ch <= "ヿ" or "一" <= ch <= "鿿" or ch == "ー"
-            for ch in result.surface
+            "ぁ" <= ch <= "ヿ" or "一" <= ch <= "鿿" or ch == "ー" for ch in result.surface
         ), f"日本語の文字を含まない表層が返った: {result.surface}"
 
 
@@ -112,9 +111,7 @@ def test_person_and_place_are_excluded_by_default(
     """
     _, results = real_searcher.search("乳首", limit=20)
     assert results
-    assert all(
-        r.category not in (Category.PERSON, Category.PLACE) for r in results
-    )
+    assert all(r.category not in (Category.PERSON, Category.PLACE) for r in results)
 
 
 def test_person_search_works_when_requested(real_searcher: PhoneticSearcher) -> None:
@@ -156,9 +153,7 @@ def test_rhyme_preset_returns_rhyming_words(real_searcher: PhoneticSearcher) -> 
     _, results = real_searcher.search("ラーメン", preset="rhyme", limit=10)
     assert results
     # 上位は母音骨格か語尾のどちらかが強く一致している。
-    assert any(
-        r.vowel_similarity > 0.9 or r.coda_similarity > 0.9 for r in results[:5]
-    )
+    assert any(r.vowel_similarity > 0.9 or r.coda_similarity > 0.9 for r in results[:5])
 
 
 def test_scores_stay_in_range(real_searcher: PhoneticSearcher) -> None:

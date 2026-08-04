@@ -52,12 +52,7 @@ class ScoreWeights:
 
     def normalized(self) -> ScoreWeights:
         total = (
-            self.phoneme
-            + self.embedding
-            + self.mora
-            + self.coda
-            + self.vowel
-            + self.familiarity
+            self.phoneme + self.embedding + self.mora + self.coda + self.vowel + self.familiarity
         )
         if total <= 0:
             raise ValueError("重みの合計が 0 です")
@@ -357,30 +352,38 @@ class PhoneticSearcher:
 
     def compare(self, a: str, b: str) -> ComparisonResult:
         """2 つのテキストの音韻類似度を計算する。"""
-        pa = self.pronounce(a)
-        pb = self.pronounce(b)
-        va, vb = embed(pa), embed(pb)
+        return compare_pronunciations(a, b, self.pronounce(a), self.pronounce(b))
 
-        spaces: dict[str, float] = {}
-        for name in va:
-            if name == "rhythm":
-                # rhythm は正規化していないので距離で見る。
-                gap = float(np.linalg.norm(va[name] - vb[name]))
-                spaces[name] = round(max(0.0, 1.0 - gap), 4)
-            else:
-                spaces[name] = round(float(va[name] @ vb[name]), 4)
 
-        return ComparisonResult(
-            a_text=a,
-            a_reading=pa.reading,
-            a_phonemes=pa.phonemes,
-            b_text=b,
-            b_reading=pb.reading,
-            b_phonemes=pb.phonemes,
-            similarity=round(phonetic_similarity(pa, pb), 4),
-            distance=round(weighted_edit_distance(pa.phonemes, pb.phonemes), 4),
-            spaces=spaces,
-        )
+def compare_pronunciations(
+    a_text: str,
+    b_text: str,
+    a: Pronunciation,
+    b: Pronunciation,
+) -> ComparisonResult:
+    """2 つの音韻表現を比較する。索引を必要としない。"""
+    va, vb = embed(a), embed(b)
+
+    spaces: dict[str, float] = {}
+    for name in va:
+        if name == "rhythm":
+            # rhythm は正規化していないので距離で見る。
+            gap = float(np.linalg.norm(va[name] - vb[name]))
+            spaces[name] = round(max(0.0, 1.0 - gap), 4)
+        else:
+            spaces[name] = round(float(va[name] @ vb[name]), 4)
+
+    return ComparisonResult(
+        a_text=a_text,
+        a_reading=a.reading,
+        a_phonemes=a.phonemes,
+        b_text=b_text,
+        b_reading=b.reading,
+        b_phonemes=b.phonemes,
+        similarity=round(phonetic_similarity(a, b), 4),
+        distance=round(weighted_edit_distance(a.phonemes, b.phonemes), 4),
+        spaces=spaces,
+    )
 
 
 def _edit_similarity(a: tuple[str, ...], b: tuple[str, ...]) -> float:
@@ -426,4 +429,5 @@ __all__ = [
     "PhoneticSearcher",
     "ScoreWeights",
     "SearchResult",
+    "compare_pronunciations",
 ]

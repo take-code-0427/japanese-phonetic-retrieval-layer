@@ -1,0 +1,44 @@
+[project]
+name = "jpr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "take-code-0427", email = "take-code-0427@e-seikatsu.co.jp" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "hnswlib>=0.8.0",
+    "mcp>=2.0.0",
+    "numpy>=2.5.1",
+    "sudachidict-core>=20260723",
+    "sudachidict-full>=20260723",
+    "sudachipy>=0.6.11",
+]
+
+[project.scripts]
+jpr = "jpr.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# RUF001-003 は全角記号を ASCII の誤入力として警告する。コメントや文字列を
+# 日本語で書くこのプロジェクトでは正常な表記なので無効にする。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

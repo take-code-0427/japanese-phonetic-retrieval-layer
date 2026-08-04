@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jpr — 日本語音韻検索</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-mark" aria-hidden="true">
+    <!-- 母音空間 (前後 x 高さ) の 5 点。この座標系がページ全体の色の根拠。 -->
+    <svg viewBox="0 0 40 40" class="mark">
+      <path d="M4 4 H36 M4 20 H36 M4 36 H36" class="mark-grid"/>
+      <circle cx="5"  cy="5"  r="3.2" style="fill:var(--v-i)"/>
+      <circle cx="5"  cy="20" r="3.2" style="fill:var(--v-e)"/>
+      <circle cx="20" cy="35" r="3.2" style="fill:var(--v-a)"/>
+      <circle cx="35" cy="20" r="3.2" style="fill:var(--v-o)"/>
+      <circle cx="35" cy="5"  r="3.2" style="fill:var(--v-u)"/>
+    </svg>
+  </div>
+  <div class="masthead-text">
+    <h1>音韻検索レイヤー</h1>
+    <p class="masthead-sub">
+      意味ではなく<em>発音の近さ</em>だけを引く。<span id="corpus-note">索引を読み込み中…</span>
+    </p>
+  </div>
+  <nav class="tabs" role="tablist" aria-label="機能">
+    <button role="tab" class="tab is-active" data-view="search" aria-selected="true">検索</button>
+    <button role="tab" class="tab" data-view="pronounce" aria-selected="false">読み</button>
+    <button role="tab" class="tab" data-view="info" aria-selected="false">索引</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- ============ 検索 ============ -->
+<section class="view is-active" id="view-search" role="tabpanel">
+  <form class="query" id="search-form">
+    <div class="query-main">
+      <label class="field-label" for="q">検索語</label>
+      <input id="q" name="q" type="search" placeholder="乳首" autocomplete="off" spellcheck="false" required>
+    </div>
+    <div class="query-preset">
+      <span class="field-label">近さの定義</span>
+      <div class="segmented" id="preset-group" role="radiogroup" aria-label="近さの定義">
+        <button type="button" role="radio" class="seg is-active" data-preset="pun" aria-checked="true">
+          <span class="seg-name">ダジャレ</span><span class="seg-note">音韻全体 + 一般性</span>
+        </button>
+        <button type="button" role="radio" class="seg" data-preset="rhyme" aria-checked="false">
+          <span class="seg-name">韻</span><span class="seg-note">語尾 + 母音列</span>
+        </button>
+        <button type="button" role="radio" class="seg" data-preset="mishearing" aria-checked="false">
+          <span class="seg-name">聞き間違い</span><span class="seg-note">音韻 + リズム</span>
+        </button>
+      </div>
+    </div>
+    <button class="run" type="submit">検索</button>
+  </form>
+
+  <details class="advanced">
+    <summary>絞り込みと候補数</summary>
+    <div class="advanced-body">
+      <fieldset class="cats">
+        <legend class="field-label">カテゴリ</legend>
+        <div id="cat-group" class="chips"></div>
+        <p class="hint">未選択のときは人名・地名を除いて検索する。地名 49 万・人名 24 万は音韻的に密集するため既定では引かない。</p>
+      </fieldset>
+      <div class="knobs">
+        <label class="knob">
+          <span class="field-label">件数</span>
+          <input id="limit" type="number" value="20" min="1" max="200">
+        </label>
+        <label class="knob">
+          <span class="field-label">ANN 候補数</span>
+          <input id="candidates" type="number" value="5000" min="1" max="50000" step="500">
+          <span class="hint">増やすと再現率が上がり遅くなる</span>
+        </label>
+        <label class="knob">
+          <span class="field-label">スコア下限</span>
+          <input id="min-score" type="number" value="0" min="0" max="1" step="0.05">
+        </label>
+      </div>
+    </div>
+  </details>
+
+  <div id="search-status" class="status" role="status"></div>
+
+  <!-- クエリの音韻表現。結果の前に置くのは、何を検索したかは -->
+  <!-- 入力文字列ではなく「読み」で決まるため。 -->
+  <div id="query-readout" class="readout" hidden>
+    <div class="readout-row">
+      <span class="readout-label">読み</span>
+      <span class="readout-value" id="rq-reading"></span>
+      <span class="readout-label">モーラ</span>
+      <span class="readout-value" id="rq-mora"></span>
+    </div>
+    <div class="readout-row">
+      <span class="readout-label">音素</span>
+      <div class="phonemes" id="rq-phonemes"></div>
+    </div>
+  </div>
+
+  <ol class="results" id="results"></ol>
+</section>
+
+<!-- ============ 読み ============ -->
+<section class="view" id="view-pronounce" role="tabpanel">
+  <form class="query" id="pronounce-form">
+    <div class="query-main">
+      <label class="field-label" for="ptext">テキスト</label>
+      <input id="ptext" type="text" placeholder="価格改定のお知らせ" autocomplete="off" spellcheck="false" required>
+    </div>
+    <button class="run" type="submit">解析</button>
+  </form>
+  <div id="pronounce-status" class="status" role="status"></div>
+  <div id="pronounce-out" class="analysis" hidden>
+    <div class="analysis-head">
+      <span class="analysis-surface" id="pa-text"></span>
+      <span class="analysis-arrow" aria-hidden="true">→</span>
+      <span class="analysis-reading" id="pa-reading"></span>
+      <span class="analysis-count" id="pa-count"></span>
+    </div>
+    <div class="analysis-grid">
+      <div class="analysis-cell">
+        <h3>モーラ</h3>
+        <div class="moras" id="pa-moras"></div>
+      </div>
+      <div class="analysis-cell">
+        <h3>音素</h3>
+        <div class="phonemes" id="pa-phonemes"></div>
+      </div>
+      <div class="analysis-cell">
+        <h3>母音の骨格<span class="cell-note">韻の判定に使う列</span></h3>
+        <div class="phonemes" id="pa-skeleton"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 索引 ============ -->
+<section class="view" id="view-info" role="tabpanel">
+  <div id="info-status" class="status" role="status"></div>
+  <div id="info-out" hidden>
+    <dl class="meta" id="info-meta"></dl>
+    <div class="analysis-grid">
+      <div class="analysis-cell">
+        <h3>埋め込み空間</h3>
+        <table class="table" id="info-spaces"></table>
+        <p class="hint">ANN 索引を張るのは候補生成に使う空間のみ。1 空間で 1.2GB かかるため、rerank だけに使う空間はベクトル行列で足りる。</p>
+      </div>
+      <div class="analysis-cell">
+        <h3>カテゴリ</h3>
+        <div class="bars" id="info-cats"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="legend">
+  <span class="legend-title">音素の色 = 調音位置</span>
+  <div class="legend-items" id="legend-places"></div>
+  <span class="legend-sep" aria-hidden="true"></span>
+  <span class="legend-title">母音 = 舌の位置</span>
+  <div class="legend-items" id="legend-vowels"></div>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

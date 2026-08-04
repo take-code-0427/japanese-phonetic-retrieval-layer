@@ -345,6 +345,54 @@ def similarity_normalizer(len_a: int, len_b: int, worst: float = -1.0) -> float:
     return shorter * worst + (longer - shorter) * _INDEL_COST
 
 
+#: アライメント 1 対。`op` は "match" (同一) / "sub" (置換) / "del" (a 側のみ)
+#: / "ins" (b 側のみ)。存在しない側は None。
+AlignedPair = tuple[str | None, str | None, float, str]
+
+
+def align_phonemes(a: tuple[str, ...], b: tuple[str, ...]) -> list[AlignedPair]:
+    """音素列を `weighted_edit_distance` と同じコストで対応付ける。
+
+    距離が返すのはスカラー 1 つだが、「どこがどう違うのか」を示すには
+    どの音素がどれに対応したかが必要になる。同じ DP を回して経路を復元する。
+    コスト定義を共有しているので、対の距離の総和は編集距離に一致する。
+    """
+    n, m = len(a), len(b)
+    # dp[i][j] = a[:i] と b[:j] の距離。
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    for i, pa in enumerate(a, start=1):
+        dp[i][0] = dp[i - 1][0] + _indel_cost(pa)
+    for j, pb in enumerate(b, start=1):
+        dp[0][j] = dp[0][j - 1] + _indel_cost(pb)
+    for i, pa in enumerate(a, start=1):
+        for j, pb in enumerate(b, start=1):
+            dp[i][j] = min(
+                dp[i - 1][j - 1] + phoneme_distance(pa, pb),
+                dp[i - 1][j] + _indel_cost(pa),
+                dp[i][j - 1] + _indel_cost(pb),
+            )
+
+    pairs: list[AlignedPair] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            cost = phoneme_distance(a[i - 1], b[j - 1])
+            if abs(dp[i][j] - (dp[i - 1][j - 1] + cost)) < 1e-9:
+                op = "match" if a[i - 1] == b[j - 1] else "sub"
+                pairs.append((a[i - 1], b[j - 1], cost, op))
+                i, j = i - 1, j - 1
+                continue
+        if i > 0 and abs(dp[i][j] - (dp[i - 1][j] + _indel_cost(a[i - 1]))) < 1e-9:
+            pairs.append((a[i - 1], None, _indel_cost(a[i - 1]), "del"))
+            i -= 1
+            continue
+        pairs.append((None, b[j - 1], _indel_cost(b[j - 1]), "ins"))
+        j -= 1
+
+    pairs.reverse()
+    return pairs
+
+
 def phonetic_similarity(a: Pronunciation, b: Pronunciation) -> float:
     """音韻類似度を 0.0〜1.0 で返す。"""
     pa, pb = a.phonemes, b.phonemes

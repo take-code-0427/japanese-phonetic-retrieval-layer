@@ -8,12 +8,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.141.1",
     "hnswlib>=0.8.0",
     "mcp>=2.0.0",
     "numpy>=2.5.1",
     "sudachidict-core>=20260723",
     "sudachidict-full>=20260723",
     "sudachipy>=0.6.11",
+    "uvicorn[standard]>=0.52.1",
 ]
 
 [project.scripts]
@@ -25,6 +27,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.0",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.6",

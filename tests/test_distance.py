@@ -6,6 +6,7 @@ import pytest
 
 from jpr.distance import (
     WORST_SUBSTITUTION_COST,
+    align_phonemes,
     phoneme_distance,
     phonetic_similarity,
     weighted_edit_distance,
@@ -92,3 +93,40 @@ def test_edit_distance_respects_max_distance_cutoff() -> None:
 
 def test_worst_substitution_cost_is_bounded() -> None:
     assert 0.0 < WORST_SUBSTITUTION_COST <= 1.0
+
+
+#: アライメントは編集距離の内訳を見せるためのものなので、対ごとのコストの
+#: 総和が距離と一致しなければ表示が嘘になる。距離の重みを変えたときに
+#: 両者が食い違わないことをここで担保する。
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("チクビ", "テクビ"),
+        ("チクビ", "チョコビ"),
+        ("カガク", "カカク"),
+        ("サカナ", "アカ"),
+        ("ラーメン", "ローメン"),
+        ("マツタケ", "ソラ"),
+        ("", "アイ"),
+        ("ア", ""),
+    ],
+)
+def test_alignment_costs_sum_to_edit_distance(a: str, b: str) -> None:
+    pa = analyze_reading(a).phonemes
+    pb = analyze_reading(b).phonemes
+    pairs = align_phonemes(pa, pb)
+    assert sum(cost for _, _, cost, _ in pairs) == pytest.approx(weighted_edit_distance(pa, pb))
+
+
+def test_alignment_preserves_both_sequences() -> None:
+    """対応付けから両方の音素列を復元できる (取りこぼし・重複がない)。"""
+    pa = analyze_reading("チクビ").phonemes
+    pb = analyze_reading("チョコビ").phonemes
+    pairs = align_phonemes(pa, pb)
+    assert tuple(x for x, _, _, _ in pairs if x is not None) == pa
+    assert tuple(y for _, y, _, _ in pairs if y is not None) == pb
+
+
+def test_alignment_labels_operations() -> None:
+    pairs = align_phonemes(("ch", "i", "k", "u"), ("t", "i", "k", "u"))
+    assert [op for _, _, _, op in pairs] == ["sub", "match", "match", "match"]

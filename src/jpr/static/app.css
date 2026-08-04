@@ -1,0 +1,589 @@
+/* jpr の Web フロント。
+ *
+ * 色の根拠は音声学の座標系に置いている。音素チップの色相は調音位置 (唇 → 喉)
+ * に対応し、母音は舌の前後で色が決まる。恣意的なアクセント色を足さないことで、
+ * 画面上の色そのものが「どこで発音するか」を表すようにしている。 */
+
+:root {
+  --bg: #0b1020;
+  --bg-raised: #121a2f;
+  --bg-sunken: #080c17;
+  --line: #1e2a45;
+  --line-bright: #2d3d61;
+  --ink: #e8ecf6;
+  --ink-dim: #94a1bd;
+  --ink-faint: #5b688a;
+
+  /* 調音位置。唇 (前) から喉 (奥) へ色相が回る。 */
+  --p-bilabial:    #ff9d6e;
+  --p-labiodental: #ffbe63;
+  --p-alveolar:    #7de0b0;
+  --p-postalveolar:#4fd1d9;
+  --p-palatal:     #6fb2ff;
+  --p-velar:       #a892ff;
+  --p-glottal:     #e07ac4;
+
+  /* 母音。前舌 = 明るい寒色、後舌 = 暖色。 */
+  --v-i: #8fd9ff;
+  --v-e: #6fb2ff;
+  --v-a: #ffd166;
+  --v-o: #ff9d6e;
+  --v-u: #ffb3d1;
+
+  --special: #8794b3;
+
+  --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  --sans: "Hiragino Sans", "Yu Gothic UI", "Noto Sans JP", system-ui, sans-serif;
+
+  --r: 3px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 背景に等間隔の縦線を敷く。モーラが等時間で刻まれるという日本語の
+ * 音韻構造を、画面のリズムそのものとして持たせる。 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: repeating-linear-gradient(
+    to right, var(--line) 0 1px, transparent 1px 88px
+  );
+  opacity: 0.28;
+  pointer-events: none;
+  z-index: 0;
+}
+
+body > * { position: relative; z-index: 1; }
+
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.01em; }
+
+/* ---------- masthead ---------- */
+
+.masthead {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 18px;
+  align-items: center;
+  padding: 26px 32px 0;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+.mark { width: 42px; height: 42px; display: block; }
+.mark-grid { stroke: var(--line-bright); stroke-width: 1; fill: none; }
+
+.masthead h1 {
+  font-size: 21px;
+  font-feature-settings: "palt" 1;
+}
+
+.masthead-sub {
+  margin: 2px 0 0;
+  color: var(--ink-dim);
+  font-size: 13px;
+}
+.masthead-sub em { color: var(--ink); font-style: normal; font-weight: 600; }
+
+.tabs {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 2px;
+  margin-top: 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 13px;
+  padding: 9px 16px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.tab:hover { color: var(--ink-dim); }
+.tab.is-active { color: var(--ink); border-bottom-color: var(--p-alveolar); }
+.tab:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: -2px; }
+
+/* ---------- layout ---------- */
+
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 26px 32px 64px;
+}
+
+.view { display: none; }
+.view.is-active { display: block; }
+
+.field-label {
+  display: block;
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 6px;
+}
+
+.hint {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  line-height: 1.5;
+}
+
+/* ---------- query form ---------- */
+
+.query {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 18px;
+  align-items: end;
+}
+
+.query-main input {
+  width: 100%;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  color: var(--ink);
+  font: inherit;
+  font-size: 22px;
+  padding: 10px 14px;
+}
+.query-main input::placeholder { color: var(--ink-faint); }
+.query-main input:focus-visible {
+  outline: none;
+  border-color: var(--p-alveolar);
+  box-shadow: 0 0 0 3px rgb(125 224 176 / 0.15);
+}
+
+.segmented { display: flex; border: 1px solid var(--line-bright); border-radius: var(--r); overflow: hidden; }
+
+.seg {
+  appearance: none;
+  background: var(--bg-sunken);
+  border: 0;
+  border-right: 1px solid var(--line-bright);
+  color: var(--ink-dim);
+  font: inherit;
+  padding: 7px 14px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, color 0.15s;
+}
+.seg:last-child { border-right: 0; }
+.seg:hover { background: var(--bg-raised); }
+.seg.is-active { background: var(--bg-raised); color: var(--ink); box-shadow: inset 0 -2px 0 var(--p-alveolar); }
+.seg:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: -2px; }
+.seg-name { display: block; font-size: 13px; font-weight: 600; }
+.seg-note { display: block; font-size: 10.5px; color: var(--ink-faint); }
+
+.run {
+  appearance: none;
+  background: var(--ink);
+  color: var(--bg);
+  border: 0;
+  border-radius: var(--r);
+  font: inherit;
+  font-weight: 700;
+  font-size: 14px;
+  padding: 12px 26px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.run:hover { opacity: 0.86; }
+.run:disabled { opacity: 0.4; cursor: default; }
+.run:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: 2px; }
+
+/* ---------- advanced ---------- */
+
+.advanced { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+
+.advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-faint);
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.advanced summary::marker, .advanced summary::-webkit-details-marker { display: none; }
+.advanced summary::before { content: "+"; font-family: var(--mono); }
+.advanced[open] summary::before { content: "−"; }
+.advanced summary:hover { color: var(--ink-dim); }
+.advanced summary:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: 2px; }
+
+.advanced-body {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr);
+  gap: 26px;
+  padding: 16px 0 4px;
+}
+
+.cats { border: 0; margin: 0; padding: 0; }
+.cats legend { padding: 0; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.chip {
+  appearance: none;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-bright);
+  border-radius: 100px;
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 11px;
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--ink-faint); }
+.chip.is-on { background: var(--ink); border-color: var(--ink); color: var(--bg); font-weight: 600; }
+.chip:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: 2px; }
+.chip-count { opacity: 0.6; font-family: var(--mono); font-size: 11px; margin-left: 4px; }
+
+.knobs { display: flex; flex-wrap: wrap; gap: 18px; align-items: start; }
+.knob { display: block; }
+.knob input {
+  width: 96px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 6px 9px;
+}
+.knob input:focus-visible { outline: none; border-color: var(--p-alveolar); }
+
+/* ---------- status ---------- */
+
+.status { margin-top: 20px; font-size: 13px; color: var(--ink-dim); min-height: 20px; font-family: var(--mono); }
+.status.is-error { color: var(--p-bilabial); }
+
+/* ---------- phoneme chips ---------- */
+
+.phonemes { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
+.ph {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1;
+  padding: 5px 7px;
+  border-radius: var(--r);
+  border: 1px solid currentColor;
+  color: var(--special);
+  background: color-mix(in oklab, currentColor 14%, transparent);
+  white-space: nowrap;
+}
+/* 有声音は塗りを強める。無声/有声は音素対の最頻の差なので、
+ * 記号ではなく明度で読めるようにする。 */
+.ph.is-voiced { background: color-mix(in oklab, currentColor 30%, transparent); }
+.ph.is-gap { color: var(--ink-faint); border-style: dashed; background: none; }
+
+/* ---------- query readout ---------- */
+
+.readout {
+  margin-top: 20px;
+  padding: 14px 18px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--p-alveolar);
+  border-radius: var(--r);
+  display: grid;
+  gap: 10px;
+}
+.readout-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+.readout-label {
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.readout-value { font-family: var(--mono); font-size: 15px; }
+
+/* ---------- results ---------- */
+
+.results { list-style: none; margin: 22px 0 0; padding: 0; }
+
+.result {
+  border-top: 1px solid var(--line);
+  display: grid;
+  /* 語とタグを隣に置く。タグを右端まで飛ばすと、どの行の属性なのか
+   * 目で追わなければならなくなる。 */
+  grid-template-columns: 62px minmax(0, auto) auto 1fr;
+  gap: 0 16px;
+  align-items: center;
+  padding: 0;
+}
+.results .result:last-child { border-bottom: 1px solid var(--line); }
+
+.result-open {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  appearance: none;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 13px 4px;
+  cursor: pointer;
+  align-items: center;
+  gap: 0 16px;
+  transition: background 0.12s;
+}
+.result-open:hover { background: var(--bg-raised); }
+.result-open:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: -2px; }
+
+/* スコアは数値と横棒の二重表現。並んだときの差は棒で読み、
+ * 絶対値は数値で読む。 */
+.score { font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums; }
+.score-bar {
+  display: block;
+  height: 2px;
+  margin-top: 4px;
+  background: var(--p-alveolar);
+  border-radius: 1px;
+}
+
+.result-word { min-width: 0; }
+.word { font-size: 18px; font-weight: 600; }
+.word-reading { font-family: var(--mono); font-size: 12.5px; color: var(--ink-dim); margin-left: 9px; }
+.result-phonemes { margin-top: 6px; }
+
+.result-tags { display: flex; gap: 8px; align-items: center; }
+
+.tag {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border: 1px solid var(--line-bright);
+  border-radius: 100px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.tag-mora { font-family: var(--mono); }
+
+/* 一般性は 4 段の塊で示す。Sudachi のコスト由来の弱い指標なので
+ * 連続値のバーにすると精度を偽ることになる。 */
+.fam { display: flex; gap: 2px; align-items: center; }
+.fam-step { width: 4px; height: 11px; border-radius: 1px; background: var(--line-bright); }
+.fam-step.is-on { background: var(--ink-dim); }
+
+/* ---------- 署名: アライメント帯 ---------- */
+
+.align {
+  grid-column: 1 / -1;
+  padding: 4px 4px 22px 78px;
+  background: var(--bg-sunken);
+  border-top: 1px dashed var(--line);
+}
+
+.align-title {
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 14px 0 12px;
+}
+
+/* 音素の対応を縦 2 段で並べる。列の幅は等分で、対応しない音素は
+ * 破線の空きになる。編集距離が「どの音素をどう読み替えたか」まで
+ * 見えるようにするための表示。 */
+.align-track { display: flex; align-items: stretch; overflow-x: auto; padding-bottom: 4px; }
+
+.align-col {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 30px auto auto;
+  gap: 4px;
+  justify-items: center;
+  min-width: 44px;
+  padding: 0 3px;
+}
+
+/* 同じモーラに属する音素 (子音 + 母音) を一括りに見せる。日本語の
+ * 音韻単位はモーラなので、音素を等間隔に流すだけでは構造が読めない。
+ * 区切りは擬似要素で引く。border-left にすると基線 (border-top) と
+ * 交差点で 1px 競合して基線が途切れる。 */
+.align-col.is-mora-start:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+
+/* 対の距離は基線から下に垂れる棒で示す。基線は列の padding ぶんまで
+ * 広げて隣と繋ぎ、1 本の目盛りとして読めるようにする。列の実幅で
+ * 止めると線が分断されて長さの比較ができない。 */
+.align-gauge {
+  position: relative;
+  /* 列の左右 padding (3px) ぶん外に伸ばして隣の基線と繋ぐ。 */
+  width: calc(100% + 6px);
+  border-top: 1px solid var(--line-bright);
+}
+.align-gauge span {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 3px;
+  border-radius: 0 0 2px 2px;
+  background: var(--p-bilabial);
+}
+/* 一致した対は基線だけ。棒が無いこと自体が「差がない」の表示。 */
+.align-col.is-match .align-gauge span { display: none; }
+.align-col.is-gap .align-gauge span { background: var(--ink-faint); }
+
+.align-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+.align-col.is-match .align-num { opacity: 0.35; }
+
+.align-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin-top: 14px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-dim);
+}
+.align-foot b { color: var(--ink); font-weight: 600; }
+
+/* ---------- 読み ---------- */
+
+.analysis { margin-top: 24px; }
+
+.analysis-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: baseline;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.analysis-surface { font-size: 26px; font-weight: 600; }
+.analysis-arrow { color: var(--ink-faint); }
+.analysis-reading { font-family: var(--mono); font-size: 22px; color: var(--p-alveolar); }
+.analysis-count { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+
+.analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 26px;
+  margin-top: 22px;
+}
+.analysis-cell h3 { font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 12px; }
+.cell-note { text-transform: none; letter-spacing: 0; margin-left: 8px; color: var(--ink-faint); opacity: 0.75; font-weight: 400; }
+
+/* モーラは等間隔の区画として見せる。長さがそのまま時間の目安になる。 */
+.moras { display: flex; flex-wrap: wrap; gap: 3px; }
+.mora {
+  font-family: var(--mono);
+  font-size: 15px;
+  min-width: 34px;
+  text-align: center;
+  padding: 7px 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-bottom: 2px solid var(--line-bright);
+  border-radius: var(--r);
+}
+.mora.is-special { color: var(--ink-dim); border-bottom-color: var(--special); }
+
+/* ---------- 索引 ---------- */
+
+.meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 18px;
+  margin: 0 0 8px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+}
+.meta div { min-width: 0; }
+.meta dt { font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-faint); }
+.meta dd { margin: 4px 0 0; font-family: var(--mono); font-size: 19px; overflow-wrap: anywhere; }
+
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.table th { font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 400; }
+.table td:nth-child(2) { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.table td:last-child { color: var(--ink-dim); font-size: 12px; }
+
+.bars { display: grid; gap: 10px; }
+.bar-row { display: grid; grid-template-columns: 92px 1fr auto; gap: 10px; align-items: center; font-size: 13px; }
+.bar-track { height: 8px; background: var(--bg-sunken); border-radius: 1px; overflow: hidden; }
+/* span を block にしないと height: 100% が効かず、バーが背景色のまま消える。 */
+.bar-fill { display: block; height: 100%; background: var(--p-palatal); }
+.bar-row.is-excluded .bar-fill { background: var(--line-bright); }
+.bar-num { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; color: var(--ink-dim); }
+
+/* ---------- legend ---------- */
+
+.legend {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 18px 32px 40px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: center;
+}
+.legend-title { font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-faint); }
+.legend-items { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
+.legend-sep { width: 1px; height: 20px; background: var(--line); }
+.legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--ink-dim); }
+.legend-dot { width: 8px; height: 8px; border-radius: 2px; }
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 860px) {
+  .query { grid-template-columns: 1fr; }
+  /* プリセットは縦積みにせず 3 等分で残す。縦に積むとファーストビューを
+   * 占領して結果が画面外に出る。 */
+  .segmented { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .seg { padding: 7px 10px; }
+  .seg-note { font-size: 10px; }
+  .advanced-body { grid-template-columns: 1fr; }
+  .align { padding-left: 4px; }
+}
+
+@media (max-width: 620px) {
+  .masthead, main, .legend { padding-left: 18px; padding-right: 18px; }
+  body::before { background-size: 44px 100%; }
+  .result, .result-open { grid-template-columns: 54px minmax(0, 1fr); }
+  .result-tags { grid-column: 2; margin-top: 8px; flex-wrap: wrap; }
+  .query-main input { font-size: 18px; }
+}
+
+/* 光の演出に頼らないので、動きを止めても情報は失われない。 */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

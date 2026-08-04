@@ -234,6 +234,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_web(args: argparse.Namespace) -> int:
+    from .web import serve_web
+
+    print(f"http://{args.host}:{args.port}  (索引: {args.index})")
+    serve_web(args.index, host=args.host, port=args.port)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jpr",
@@ -295,6 +303,14 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="MCP サーバとして起動する")
     _add_store_argument(serve)
     serve.set_defaults(func=cmd_serve)
+
+    serve_web = subparsers.add_parser("serve-web", help="Web フロントを起動する")
+    serve_web.add_argument(
+        "--host", default="127.0.0.1", help="待ち受けアドレス (既定: %(default)s)"
+    )
+    serve_web.add_argument("--port", type=int, default=8000, help="ポート (既定: %(default)s)")
+    _add_store_argument(serve_web)
+    serve_web.set_defaults(func=cmd_serve_web)
 
     return parser
 

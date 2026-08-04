@@ -11,7 +11,7 @@ from pathlib import Path
 from .index import Category
 from .phonology import analyze_reading
 from .search import DEFAULT_CANDIDATES, DEFAULT_PRESET, PRESETS, PhoneticSearcher
-from .store import PhoneticStore, default_store_path
+from .store import INNER_PRODUCT_SPACES, PhoneticStore, default_store_path
 
 
 def _add_store_argument(parser: argparse.ArgumentParser) -> None:
@@ -216,15 +216,14 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"語数: {len(store):,}")
     print("\n埋め込み空間:")
     for name, dim in store.meta.dims.items():
-        ann = "ANN あり" if store.has_ann(name) else "ANN なし"
-        print(f"  {name:<10} {dim:>4} 次元  ({ann})")
+        # 候補生成に使う空間のみ ANN を張る。他は rerank でベクトルを直接引く。
+        role = "ANN + rerank" if name in INNER_PRODUCT_SPACES else "rerank のみ"
+        print(f"  {name:<10} {dim:>4} 次元  ({role})")
 
-    import numpy as np
-
-    categories, counts = np.unique(store.categories, return_counts=True)
     print("\nカテゴリ:")
-    for name, count in sorted(zip(categories, counts, strict=True), key=lambda x: -x[1]):
-        print(f"  {name!s:<10} {count:>10,}")
+    counts = store.category_counts()
+    for category, count in sorted(counts.items(), key=lambda item: -item[1]):
+        print(f"  {category.value:<10} {count:>10,}")
     return 0
 
 

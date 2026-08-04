@@ -100,9 +100,16 @@ PHONEME_IDS: Final[dict[str, int]] = dict(PHONEME_INDEX)
 
 # --- 位置エンコーディング --------------------------------------------------
 
-#: 音素列を畳み込む際の位置ビン数。語頭・語中・語尾の情報を残すために
-#: 系列を等間隔のビンに分け、それぞれで素性を平均する。
-POSITION_BINS: Final = 4
+#: 音素列を畳み込む際の位置ビンの分割数。系列を等間隔のビンに分けて素性を平均し、
+#: 複数の粒度を連結する (マルチスケールプーリング)。
+#:
+#: 単一の粗い粒度 (1 ビン = 全体平均) では語順が消え、アナグラムが同一視される。
+#: 逆に細かい粒度だけ (4 ビン) にすると語頭の 1 音素の差でビンが丸ごと外れ、
+#: 「チクビ」と「テクビ」の類似度が 0.68 まで落ちて ANN の候補にすら入らなかった。
+#: 全体 (1) と前後半 (2) を併せ持つことで、語順を保ちながら局所的な差に頑健になる。
+#: 細かい位置合わせは rerank 段の編集距離が担う。
+POSITION_SCALES: Final = (1, 2)
+POSITION_BINS: Final = sum(POSITION_SCALES)
 
 #: 語尾ベクトルで見るモーラ数。
 CODA_MORAS: Final = 2
@@ -131,11 +138,15 @@ def _pooling_matrix(length: int, bins: int) -> np.ndarray:
     return matrix
 
 
-def _build_pooling_cache(bins: int) -> tuple[np.ndarray | None, ...]:
-    return (None, *(_pooling_matrix(length, bins) for length in range(1, _MAX_POOL_LENGTH + 1)))
+def _multiscale_matrix(length: int) -> np.ndarray:
+    """複数の粒度のプーリング行列を縦に積んだ (POSITION_BINS, length) 行列。"""
+    return np.vstack([_pooling_matrix(length, bins) for bins in POSITION_SCALES])
 
 
-_POOLING_CACHE: Final = _build_pooling_cache(POSITION_BINS)
+_POOLING_CACHE: Final = (
+    None,
+    *(_multiscale_matrix(length) for length in range(1, _MAX_POOL_LENGTH + 1)),
+)
 
 
 def _compute_bin_ranges(length: int, bins: int) -> tuple[tuple[int, int], ...]:
@@ -151,35 +162,37 @@ def _compute_bin_ranges(length: int, bins: int) -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
+#: リズムベクトルで特殊モーラの位置分布を見る区間数。ここは位置の細かさが
+#: 意味を持つので、プーリングのマルチスケールとは独立に固定粒度で分ける。
+RHYTHM_BINS: Final = 4
+
 _BIN_RANGE_CACHE: Final = (
     (),
-    *(_compute_bin_ranges(length, POSITION_BINS) for length in range(1, _MAX_POOL_LENGTH + 1)),
+    *(_compute_bin_ranges(length, RHYTHM_BINS) for length in range(1, _MAX_POOL_LENGTH + 1)),
 )
 
 
 def _bin_ranges(length: int) -> tuple[tuple[int, int], ...]:
     if length <= _MAX_POOL_LENGTH:
         return _BIN_RANGE_CACHE[length]
-    return _compute_bin_ranges(length, POSITION_BINS)
+    return _compute_bin_ranges(length, RHYTHM_BINS)
 
 
-def _bin_pool(features: np.ndarray, bins: int) -> np.ndarray:
-    """(L, D) の素性列を (bins, D) に畳み込む。
+def _bin_pool(features: np.ndarray) -> np.ndarray:
+    """(L, D) の素性列を (POSITION_BINS, D) に畳み込む。
 
     単純な総和では語順が消え、「チクビ」と「ビクチ」が同一になる。系列を
     等間隔のビンに分けて平均することで、おおよその位置情報を残す。
+    複数の粒度を積むことで語順の保持と局所差への頑健さを両立させる。
 
     ビンごとに `.mean()` を呼ぶと微小配列に対する NumPy 呼び出しが支配的に
     なるため、事前計算したプーリング行列との 1 回の積で済ませる。
     """
     length = features.shape[0]
     if length == 0:
-        return np.zeros((bins, features.shape[1]), dtype=np.float32)
+        return np.zeros((POSITION_BINS, features.shape[1]), dtype=np.float32)
 
-    if bins == POSITION_BINS and length <= _MAX_POOL_LENGTH:
-        matrix = _POOLING_CACHE[length]
-    else:
-        matrix = _pooling_matrix(length, bins)
+    matrix = _POOLING_CACHE[length] if length <= _MAX_POOL_LENGTH else _multiscale_matrix(length)
     return matrix @ features
 
 
@@ -205,7 +218,7 @@ CONSONANT_DIM: Final = _CONSONANT_DIM * POSITION_BINS
 VOWEL_DIM: Final = _VOWEL_DIM * POSITION_BINS
 CODA_DIM: Final = PHONEME_DIM * CODA_MORAS
 # リズム: モーラ数 (連続) + 特殊モーラの比率 3 種 + 位置ごとの特殊モーラ有無
-RHYTHM_DIM: Final = 1 + 3 + POSITION_BINS
+RHYTHM_DIM: Final = 1 + 3 + RHYTHM_BINS
 
 #: リズムベクトルでモーラ数を正規化する上限。これを超える語は飽和させる。
 _MAX_MORA_SCALE: Final = 12.0
@@ -214,7 +227,7 @@ _MAX_MORA_SCALE: Final = 12.0
 def phonetic_vector(phonemes: tuple[str, ...]) -> np.ndarray:
     """全体の音韻を表すベクトル。"""
     features = _feature_matrix(phonemes)
-    return _normalize(_bin_pool(features, POSITION_BINS).reshape(-1))
+    return _normalize(_bin_pool(features).reshape(-1))
 
 
 def consonant_vector(phonemes: tuple[str, ...]) -> np.ndarray:
@@ -223,7 +236,7 @@ def consonant_vector(phonemes: tuple[str, ...]) -> np.ndarray:
     if not rows:
         return np.zeros(CONSONANT_DIM, dtype=np.float32)
     features = PHONEME_FEATURES[rows][:, :_CONSONANT_DIM]
-    return _normalize(_bin_pool(features, POSITION_BINS).reshape(-1))
+    return _normalize(_bin_pool(features).reshape(-1))
 
 
 def vowel_vector(pronunciation: Pronunciation) -> np.ndarray:
@@ -238,7 +251,7 @@ def vowel_vector(pronunciation: Pronunciation) -> np.ndarray:
         return np.zeros(VOWEL_DIM, dtype=np.float32)
     start = _CONSONANT_DIM
     features = PHONEME_FEATURES[rows][:, start : start + _VOWEL_DIM]
-    return _normalize(_bin_pool(features, POSITION_BINS).reshape(-1))
+    return _normalize(_bin_pool(features).reshape(-1))
 
 
 def coda_vector(pronunciation: Pronunciation) -> np.ndarray:
@@ -299,13 +312,13 @@ def embed(pronunciation: Pronunciation) -> dict[str, np.ndarray]:
     rows = [PHONEME_INDEX[p] for p in phonemes if p in PHONEME_INDEX]
     features = PHONEME_FEATURES[rows] if rows else np.zeros((0, PHONEME_DIM), dtype=np.float32)
 
-    phonetic = _normalize(_bin_pool(features, POSITION_BINS).reshape(-1))
+    phonetic = _normalize(_bin_pool(features).reshape(-1))
 
     # 子音空間は素性行列の子音ブロックだけを、子音の行に限って畳み込む。
     consonant_rows = [PHONEME_INDEX[p] for p in phonemes if p in CONSONANTS]
     if consonant_rows:
         consonant_features = PHONEME_FEATURES[consonant_rows][:, :_CONSONANT_DIM]
-        consonant = _normalize(_bin_pool(consonant_features, POSITION_BINS).reshape(-1))
+        consonant = _normalize(_bin_pool(consonant_features).reshape(-1))
     else:
         consonant = np.zeros(CONSONANT_DIM, dtype=np.float32)
 
@@ -337,6 +350,8 @@ __all__ = [
     "CODA_MORAS",
     "PHONEME_DIM",
     "POSITION_BINS",
+    "POSITION_SCALES",
+    "RHYTHM_BINS",
     "SPACES",
     "coda_vector",
     "consonant_vector",

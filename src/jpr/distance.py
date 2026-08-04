@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cache
 
+import numpy as np
+
 from .phonology import GEMINATE, LONG, MORAIC_N, Pronunciation
 
 # --- 素性の定義 -------------------------------------------------------------
@@ -248,6 +250,86 @@ def weighted_edit_distance(
         prev = cur
 
     return prev[-1]
+
+
+# --- ID ベースの高速経路 ---------------------------------------------------
+#
+# 検索の rerank では 1 クエリあたり数千の候補に編集距離を掛ける。音素記号を
+# そのまま扱うと `phoneme_distance` と `_indel_cost` の Python 呼び出しが
+# 支配的になる (実測でクエリ時間の半分以上)。音素を整数 ID に落とし、
+# 置換コストを (P, P) 行列、挿入削除コストを (P,) 配列に事前計算しておけば
+# DP の内側ループが NumPy のベクトル演算 1 回で済む。
+
+_ALL_PHONEMES: tuple[str, ...] = (*CONSONANTS, *VOWELS, LONG, GEMINATE, MORAIC_N)
+
+#: 音素記号 -> ID。未知音素は含まない。
+PHONEME_TO_ID: dict[str, int] = {symbol: index for index, symbol in enumerate(_ALL_PHONEMES)}
+
+#: 未知音素に割り当てる ID。どの音素との置換も最大コストになる。
+UNKNOWN_PHONEME_ID: int = len(_ALL_PHONEMES)
+
+_PHONEME_COUNT = len(_ALL_PHONEMES) + 1
+
+
+def _build_cost_tables() -> tuple[np.ndarray, np.ndarray]:
+    substitution = np.full((_PHONEME_COUNT, _PHONEME_COUNT), _CROSS_CLASS_COST, dtype=np.float64)
+    for i, a in enumerate(_ALL_PHONEMES):
+        for j, b in enumerate(_ALL_PHONEMES):
+            substitution[i, j] = phoneme_distance(a, b)
+    # 未知音素は自分自身とだけ距離 0。
+    substitution[UNKNOWN_PHONEME_ID, UNKNOWN_PHONEME_ID] = 0.0
+
+    indel = np.full(_PHONEME_COUNT, _INDEL_COST, dtype=np.float64)
+    for symbol in (LONG, GEMINATE, MORAIC_N):
+        indel[PHONEME_TO_ID[symbol]] = _SPECIAL_INDEL_COST
+    return substitution, indel
+
+
+SUBSTITUTION_COSTS, INDEL_COSTS = _build_cost_tables()
+
+
+def phoneme_ids(phonemes: tuple[str, ...]) -> np.ndarray:
+    """音素列を ID 配列にする。未知音素は UNKNOWN_PHONEME_ID になる。"""
+    return np.fromiter(
+        (PHONEME_TO_ID.get(p, UNKNOWN_PHONEME_ID) for p in phonemes),
+        dtype=np.int32,
+        count=len(phonemes),
+    )
+
+
+def edit_distance_ids(a: np.ndarray, b: np.ndarray) -> float:
+    """ID 配列間の重み付き編集距離。
+
+    `weighted_edit_distance` と同じ値を返すが、行ごとに NumPy のベクトル演算で
+    処理する。挿入方向の依存 (cur[j] が cur[j-1] を参照する) だけは逐次なので、
+    そこは行内の走査で解く。
+    """
+    if a.size == 0:
+        return float(INDEL_COSTS[b].sum())
+    if b.size == 0:
+        return float(INDEL_COSTS[a].sum())
+
+    b_indel = INDEL_COSTS[b]
+    prev = np.empty(b.size + 1, dtype=np.float64)
+    prev[0] = 0.0
+    np.cumsum(b_indel, out=prev[1:])
+
+    substitution_rows = SUBSTITUTION_COSTS[a][:, b]
+    a_indel = INDEL_COSTS[a]
+
+    cur = np.empty_like(prev)
+    for row in range(a.size):
+        cur[0] = prev[0] + a_indel[row]
+        # 置換と削除は前の行だけに依存するのでまとめて計算できる。
+        np.minimum(prev[:-1] + substitution_rows[row], prev[1:] + a_indel[row], out=cur[1:])
+        # 挿入は同じ行の左隣に依存するため逐次に解く。
+        for column in range(1, cur.size):
+            candidate = cur[column - 1] + b_indel[column - 1]
+            if candidate < cur[column]:
+                cur[column] = candidate
+        prev, cur = cur, prev
+
+    return float(prev[-1])
 
 
 def similarity_normalizer(len_a: int, len_b: int, worst: float = -1.0) -> float:

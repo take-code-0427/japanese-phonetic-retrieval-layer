@@ -18,8 +18,8 @@ _KATAKANA = frozenset(chr(code) for code in range(0x30A1, 0x30FB)) | {"ー"}
 # Sudachi のコストを一般性に写すための境界。full 辞書の実測分布 (中央値 11000、
 # 第 1 十分位 5000) をもとに、下位 1 割以下を「よく知られた語」、
 # 上位 1/4 以上を「稀な語」とみなす。
-_COST_FAMILIAR = 5000
-_COST_RARE = 15000
+COST_FAMILIAR = 5000
+COST_RARE = 15000
 
 
 class Category(StrEnum):
@@ -88,11 +88,11 @@ class IndexEntry:
 
 def familiarity_of(cost: int) -> float:
     """Sudachi のコストを 0.0〜1.0 の一般性に写す。"""
-    if cost <= _COST_FAMILIAR:
+    if cost <= COST_FAMILIAR:
         return 1.0
-    if cost >= _COST_RARE:
+    if cost >= COST_RARE:
         return 0.0
-    return 1.0 - (cost - _COST_FAMILIAR) / (_COST_RARE - _COST_FAMILIAR)
+    return 1.0 - (cost - COST_FAMILIAR) / (COST_RARE - COST_FAMILIAR)
 
 
 def has_pronounceable_reading(reading: str) -> bool:
@@ -113,6 +113,8 @@ def is_searchable_surface(surface: str) -> bool:
 
 
 __all__ = [
+    "COST_FAMILIAR",
+    "COST_RARE",
     "DEFAULT_CATEGORIES",
     "EXCLUDED_POS",
     "Category",

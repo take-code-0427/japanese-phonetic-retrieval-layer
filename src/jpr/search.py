@@ -16,6 +16,7 @@ embedding だけに任せないのは、「なぜ近いのか」が曖昧にな�
 
 from __future__ import annotations
 
+import heapq
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -23,12 +24,20 @@ import numpy as np
 
 from .distance import (
     WORST_SUBSTITUTION_COST,
+    edit_distance_ids,
+    phoneme_ids,
     phonetic_similarity,
     similarity_normalizer,
     weighted_edit_distance,
 )
 from .embedding import embed
-from .index import DEFAULT_CATEGORIES, Category, IndexEntry, familiarity_of
+from .index import (
+    COST_FAMILIAR,
+    COST_RARE,
+    DEFAULT_CATEGORIES,
+    Category,
+    IndexEntry,
+)
 from .phonology import Pronunciation, analyze_reading
 from .reading import ReadingExtractor
 from .store import PhoneticStore
@@ -85,8 +94,18 @@ PRESETS: dict[str, ScoreWeights] = {
 
 DEFAULT_PRESET = "pun"
 
-#: ANN から取る候補数の既定値。rerank 対象なので Top-N より十分大きく取る。
-DEFAULT_CANDIDATES = 400
+#: ANN から取る候補数の既定値。
+#:
+#: 202 万語では 3 モーラ語のクエリに対しコサイン 0.91 以上の候補が 400 件を超える。
+#: k=400 では「乳首」に対する「手首」のような明らかな近傍が候補にすら入らず、
+#: 稀語ばかりが並んだ。実測では k=5000 で「手首」が 1 位に来る。
+#: 候補数を増やすと rerank のコストが線形に増えるので、品質が飽和する手前で止める。
+DEFAULT_CANDIDATES = 5000
+
+#: 打ち切り線を決めるために確定させる件数の、limit に対する倍率。
+#: 同音の異表記が後段で 1 件に畳まれるため、limit ぴったりで打ち切ると
+#: 畳んだ後に件数が足りなくなる。
+_RERANK_MARGIN = 8
 
 
 @dataclass(frozen=True)
@@ -223,6 +242,7 @@ class PhoneticSearcher:
             exclude_same_reading=exclude_same_reading,
             candidate_filter=candidate_filter,
             min_score=min_score,
+            limit=limit,
         )
 
         if dedupe_by_reading:
@@ -282,43 +302,67 @@ class PhoneticSearcher:
         exclude_same_reading: bool,
         candidate_filter: Callable[[IndexEntry], bool] | None,
         min_score: float,
+        limit: int,
     ) -> list[SearchResult]:
-        query_phonemes = pronunciation.phonemes
+        store = self.store
+        query_ids = phoneme_ids(pronunciation.phonemes)
+        query_length = len(pronunciation.phonemes)
         query_moras = pronunciation.mora_count
         normalized_query = self.extractor.normalize(query)
 
-        coda_matrix = self.store.vectors("coda")
-        vowel_matrix = self.store.vectors("vowel")
-        query_coda = query_vectors["coda"]
-        query_vowel = query_vectors["vowel"]
+        # ベクトルの内積とモーラ数・一般性は配列演算でまとめて出す。
+        coda = np.clip(query_vectors["coda"] @ store.vectors("coda")[rows].T, 0.0, None)
+        vowel = np.clip(query_vectors["vowel"] @ store.vectors("vowel")[rows].T, 0.0, None)
+        embedding = np.clip(embedding_scores, 0.0, None)
+        candidate_moras = store.mora_counts[rows].astype(np.int32)
+        mora = _mora_similarity_array(query_moras, candidate_moras)
+        familiarity = _familiarity_array(store.costs[rows])
 
+        # 編集距離を除いた部分の上限を先に出し、これだけで min_score に届かない
+        # 候補は距離を計算せずに捨てる。
+        partial = (
+            weights.embedding * embedding
+            + weights.mora * mora
+            + weights.coda * coda
+            + weights.vowel * vowel
+            + weights.familiarity * familiarity
+        )
+        reachable = partial + weights.phoneme
+        order = np.argsort(-reachable)
+
+        # 上限の高い順に見て、確定した上位の最低スコアを打ち切り線に使う。
+        # 語尾・母音・一般性で既に見込みが低い候補には編集距離を掛けない。
+        # 同音の異表記が畳まれることを考えて、必要数より多めに確定させる。
+        keep = max(limit * _RERANK_MARGIN, limit)
+        confirmed: list[float] = []
         results: list[SearchResult] = []
-        for row, embedding_score in zip(rows.tolist(), embedding_scores.tolist(), strict=True):
-            entry = self.store.entry(row)
+        threshold = min_score
+        for position in order.tolist():
+            if reachable[position] < threshold:
+                # 以降はさらに上限が低いので、これ以上見る必要がない。
+                break
 
-            if exclude_same_reading and entry.reading == pronunciation.reading:
+            row = int(rows[position])
+            reading = store.reading(row)
+            if exclude_same_reading and reading == pronunciation.reading:
                 continue
-            if entry.surface == query or entry.surface == normalized_query:
-                continue
-            if candidate_filter is not None and not candidate_filter(entry):
+            surface = store.surface(row)
+            if surface in (query, normalized_query):
                 continue
 
-            phonetic = _edit_similarity(query_phonemes, entry.phonemes)
-            coda = float(query_coda @ coda_matrix[row])
-            vowel = float(query_vowel @ vowel_matrix[row])
-            mora = _mora_similarity(query_moras, entry.mora_count)
-            familiarity = familiarity_of(entry.cost)
+            entry: IndexEntry | None = None
+            if candidate_filter is not None:
+                entry = store.entry(row)
+                if not candidate_filter(entry):
+                    continue
 
-            score = (
-                weights.phoneme * phonetic
-                + weights.embedding * max(0.0, embedding_score)
-                + weights.mora * mora
-                + weights.coda * max(0.0, coda)
-                + weights.vowel * max(0.0, vowel)
-                + weights.familiarity * familiarity
-            )
+            phonetic = _edit_similarity_ids(query_ids, store.phoneme_id_array(row), query_length)
+            score = float(partial[position]) + weights.phoneme * phonetic
             if score < min_score:
                 continue
+
+            if entry is None:
+                entry = store.entry(row)
 
             results.append(
                 SearchResult(
@@ -326,16 +370,22 @@ class PhoneticSearcher:
                     reading=entry.reading,
                     score=round(score, 4),
                     phonetic_similarity=round(phonetic, 4),
-                    embedding_similarity=round(max(0.0, embedding_score), 4),
-                    coda_similarity=round(max(0.0, coda), 4),
-                    vowel_similarity=round(max(0.0, vowel), 4),
+                    embedding_similarity=round(float(embedding[position]), 4),
+                    coda_similarity=round(float(coda[position]), 4),
+                    vowel_similarity=round(float(vowel[position]), 4),
                     mora_count=entry.mora_count,
                     pos=entry.pos,
                     category=entry.category,
                     phonemes=entry.phonemes,
-                    familiarity=round(familiarity, 3),
+                    familiarity=round(float(familiarity[position]), 3),
                 )
             )
+
+            heapq.heappush(confirmed, score)
+            if len(confirmed) > keep:
+                heapq.heappop(confirmed)
+            if len(confirmed) == keep:
+                threshold = max(threshold, confirmed[0])
 
         return results
 
@@ -397,6 +447,17 @@ def _edit_similarity(a: tuple[str, ...], b: tuple[str, ...]) -> float:
     return max(0.0, 1.0 - distance / denominator)
 
 
+def _edit_similarity_ids(a: np.ndarray, b: np.ndarray, len_a: int) -> float:
+    """`_edit_similarity` の ID 配列版。rerank の内側で使う。"""
+    if len_a == 0 or b.size == 0:
+        return 0.0
+    distance = edit_distance_ids(a, b)
+    denominator = similarity_normalizer(len_a, int(b.size), WORST_SUBSTITUTION_COST)
+    if denominator <= 0.0:
+        return 1.0
+    return max(0.0, 1.0 - distance / denominator)
+
+
 def _mora_similarity(a: int, b: int) -> float:
     """モーラ数の近さ。同数なら 1.0、離れるにつれ線形に下がる。"""
     if a == b:
@@ -404,19 +465,56 @@ def _mora_similarity(a: int, b: int) -> float:
     return max(0.0, 1.0 - abs(a - b) / max(a, b, 1))
 
 
+def _mora_similarity_array(query_moras: int, candidates: np.ndarray) -> np.ndarray:
+    """`_mora_similarity` を候補全体にまとめて適用する。"""
+    gap = np.abs(candidates - query_moras).astype(np.float64)
+    scale = np.maximum(np.maximum(candidates, query_moras), 1).astype(np.float64)
+    return np.clip(1.0 - gap / scale, 0.0, 1.0)
+
+
+def _familiarity_array(costs: np.ndarray) -> np.ndarray:
+    """`familiarity_of` を候補全体にまとめて適用する。"""
+    span = COST_RARE - COST_FAMILIAR
+    return np.clip(1.0 - (costs.astype(np.float64) - COST_FAMILIAR) / span, 0.0, 1.0)
+
+
+def _representative_rank(result: SearchResult) -> tuple[float, float, float]:
+    """同音異表記の中で代表として残す優先度。大きいほど優先。
+
+    SudachiDict では読みをそのまま書いたカタカナ見出し (「カカク」) が
+    漢字表記 (「価格」) より低コストなことがある。コストだけで選ぶと
+    「科学」の近傍が「カカク」になり、語として何を指すのかが読み取れない。
+    見出しの情報量を優先し、コストは同程度の表記を選ぶときの手がかりに使う。
+
+    同じ読みの候補は音韻類似度が等しいので、スコアの差は一般性の重みぶんしか
+    生じない。だから情報量をスコアより先に見る。
+    """
+    return (_surface_informativeness(result), result.score, result.familiarity)
+
+
+def _surface_informativeness(result: SearchResult) -> float:
+    """表層が語を特定できる度合い。
+
+    読みと同じカタカナ列をそのまま並べた見出しは、音は合っていても
+    どの語なのかを伝えないので最も低く見る。
+    """
+    if result.surface == result.reading:
+        return 0.0
+    if any("一" <= ch <= "鿿" for ch in result.surface):
+        return 1.0
+    return 0.5
+
+
 def _dedupe_by_reading(results: list[SearchResult]) -> list[SearchResult]:
     """同音の異表記 (「仕組」「仕組み」「し組み」…) を 1 件に畳む。
 
     音韻検索では同じ音を何度返しても情報量が増えないため、読みごとに
-    最もスコアが高く、同点なら一般的な表記を残す。
+    代表を 1 つだけ残す。
     """
     best: dict[str, SearchResult] = {}
     for result in results:
         current = best.get(result.reading)
-        if current is None or (result.score, result.familiarity) > (
-            current.score,
-            current.familiarity,
-        ):
+        if current is None or _representative_rank(result) > _representative_rank(current):
             best[result.reading] = result
     return list(best.values())
 

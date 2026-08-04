@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .distance import PHONEME_TO_ID, UNKNOWN_PHONEME_ID
 from .embedding import SPACES
 from .index import Category, IndexEntry
 
@@ -164,6 +165,12 @@ class PhoneticStore:
         self._pos_vocabulary = [str(v) for v in self._data["pos_vocabulary"]]
         self._category_vocabulary = [Category(str(v)) for v in self._data["category_vocabulary"]]
         self._phoneme_vocabulary = [str(v) for v in self._data["phoneme_vocabulary"]]
+        # 索引内の音素 ID から距離テーブルの ID への写像。索引の語彙順は構築時に
+        # 出現した順なので、距離テーブルの順番とは一致しない。
+        self._distance_ids = np.array(
+            [PHONEME_TO_ID.get(symbol, UNKNOWN_PHONEME_ID) for symbol in self._phoneme_vocabulary],
+            dtype=np.int32,
+        )
 
         self._vectors: dict[str, np.ndarray] = {}
         self._ann: dict[str, object] = {}
@@ -185,6 +192,16 @@ class PhoneticStore:
         vocabulary = self._phoneme_vocabulary
         return tuple(vocabulary[i] for i in self._data["phoneme_ids"][start:end])
 
+    def phoneme_id_array(self, row: int) -> np.ndarray:
+        """音素列を距離計算用の ID 配列として返す。
+
+        索引が持つ ID は語彙内で振ったものなので、距離テーブルの ID に写し直す。
+        記号のタプルを経由しないので rerank の内側で使える。
+        """
+        bounds = self._data["phoneme_bounds"]
+        start, end = int(bounds[row]), int(bounds[row + 1])
+        return self._distance_ids[self._data["phoneme_ids"][start:end]]
+
     def entry(self, row: int) -> IndexEntry:
         return IndexEntry(
             surface=self.surface(row),
@@ -203,6 +220,14 @@ class PhoneticStore:
     def category_ids(self) -> np.ndarray:
         """行ごとのカテゴリ ID。フィルタをベクトル化するのに使う。"""
         return self._data["category_ids"]
+
+    def category_counts(self) -> dict[Category, int]:
+        """カテゴリごとの語数。"""
+        ids, counts = np.unique(self._data["category_ids"], return_counts=True)
+        return {
+            self._category_vocabulary[int(index)]: int(count)
+            for index, count in zip(ids, counts, strict=True)
+        }
 
     def category_id(self, category: Category) -> int:
         """カテゴリに対応する ID。索引に存在しない場合は -1。"""

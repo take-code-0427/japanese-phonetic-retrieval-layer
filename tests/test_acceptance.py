@@ -143,8 +143,13 @@ def test_expected_neighbours_appear(
 def test_mishearing_preset_finds_asr_style_confusions(
     real_searcher: PhoneticSearcher,
 ) -> None:
-    """ASR 補正用途。「地球日」から「地球儀」が引ける。"""
-    _, results = real_searcher.search("地球日", preset="mishearing", limit=20)
+    """ASR 補正用途。誤認識された読みから正しい語を引き戻せる。
+
+    「チキュウビ」のように 1 音素だけ崩れた入力から「地球儀 (チキュウギ)」に
+    戻す。コンセプトにある「地球日」は Sudachi が「地球 + 日」と解析して
+    チキュウニチ (6 モーラ) になるので、音の崩れとしては別物になる。
+    """
+    _, results = real_searcher.search("チキュウビ", preset="mishearing", limit=20)
     assert any(r.surface == "地球儀" for r in results)
 
 

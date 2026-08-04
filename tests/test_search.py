@@ -115,19 +115,33 @@ def test_rhyme_preset_prefers_matching_tail_and_vowels(
 def test_rhyme_preset_weights_tail_over_overall_sound(
     sample_searcher: PhoneticSearcher,
 ) -> None:
-    """語尾が一致する語と、全体の音が近い語のスコア差がプリセットで逆転する。
+    """韻のプリセットでは語尾の一致が最終スコアを大きく動かす。
 
-    「テクビ」は語尾が一致するが語頭が違い、「チクワ」は語頭から一致するが
-    語尾が違う。ダジャレでは後者、韻では前者が有利になる。
+    「テクビ」は語頭が違うが語尾 2 モーラが完全一致し、「チクワ」は語頭から
+    一致するが語尾が違う。プリセットの重みが実際に効いていることを、
+    語尾成分の寄与差で確かめる。
     """
+    from jpr.search import PRESETS
 
-    def score_of(preset: str, reading: str) -> float:
+    def result_for(preset: str, reading: str):
         _, results = sample_searcher.search("チクビ", preset=preset, limit=20)
-        return next(r.score for r in results if r.reading == reading)
+        return next(r for r in results if r.reading == reading)
 
-    pun_gap = score_of("pun", "チクワ") - score_of("pun", "テクビ")
-    rhyme_gap = score_of("rhyme", "チクワ") - score_of("rhyme", "テクビ")
-    assert pun_gap > rhyme_gap
+    tail_match = result_for("rhyme", "テクビ")
+    head_match = result_for("rhyme", "チクワ")
+
+    # 語尾の一致度自体は「テクビ」が上。
+    assert tail_match.coda_similarity > head_match.coda_similarity
+
+    # 韻のプリセットは語尾に、ダジャレのプリセットは音韻全体に重みを置く。
+    rhyme, pun = PRESETS["rhyme"].normalized(), PRESETS["pun"].normalized()
+    assert rhyme.coda > pun.coda
+    assert pun.phoneme > rhyme.phoneme
+
+    # その結果、語尾一致の語は韻のプリセットの方が相対的に有利になる。
+    rhyme_gap = rhyme.coda * tail_match.coda_similarity - rhyme.coda * head_match.coda_similarity
+    pun_gap = pun.coda * tail_match.coda_similarity - pun.coda * head_match.coda_similarity
+    assert rhyme_gap > pun_gap
 
 
 def test_custom_weights_override_preset(sample_searcher: PhoneticSearcher) -> None:

@@ -49,7 +49,21 @@ def test_identical_readings_are_identical_vectors() -> None:
 def test_phonetic_space_ranks_flagship_pair_high() -> None:
     """ANN の候補生成が成立する前提。編集距離では埋もれる語を拾える。"""
     assert cosine("チクビ", "チョコビ", "phonetic") > 0.85
-    assert cosine("チクビ", "デンシャ", "phonetic") < 0.5
+
+
+def test_phonetic_space_separates_related_from_unrelated() -> None:
+    """音が近い語と無関係な語の間に十分な差がある。
+
+    この空間は候補生成に使うので、絞り込みの厳しさより「近い語を落とさない」
+    ことを優先している。絶対値は高めに出るため、差で識別力を見る。
+    """
+    related = cosine("チクビ", "チョコビ", "phonetic")
+    tail_match = cosine("チクビ", "テクビ", "phonetic")
+    unrelated = cosine("チクビ", "デンシャ", "phonetic")
+
+    # 語頭が違っても語尾が揃う語は候補に残る (ANN の再現率に直結する)。
+    assert tail_match > 0.85
+    assert min(related, tail_match) - unrelated > 0.25
 
 
 def test_consonant_space_ignores_vowels() -> None:

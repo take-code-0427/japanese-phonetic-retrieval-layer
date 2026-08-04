@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Rust のビルド成果物。Cargo.lock は再現性のため追跡する。
+rust/target/

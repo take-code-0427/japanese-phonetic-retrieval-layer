@@ -6,11 +6,13 @@ import numpy as np
 import pytest
 
 from jpr.distance import (
+    _ALL_PHONEMES,
     PAD_ID,
+    SUBSTITUTION_COSTS,
     WORST_SUBSTITUTION_COST,
     align_phonemes,
     edit_distance_batch,
-    edit_distance_ids,
+    edit_distance_csr,
     phoneme_distance,
     phoneme_ids,
     phonetic_similarity,
@@ -100,10 +102,10 @@ def test_worst_substitution_cost_is_bounded() -> None:
     assert 0.0 < WORST_SUBSTITUTION_COST <= 1.0
 
 
-#: 同じ距離関数に 3 つの実装がある。記号ベース (可読性優先)、ID ベース
-#: (rerank の 1 件経路)、バッチ (rerank の全件経路)。速度のために別実装を
-#: 持っているだけなので、値が食い違えば検索結果が実装依存になる。
-#: 素性表や重みを変えたときに 3 者が揃っていることをここで担保する。
+#: 同じ距離関数に 2 つの実装がある。記号ベース (`weighted_edit_distance`、
+#: 可読性優先で `compare` と `align_phonemes` が使う) と Rust (rerank の本線)。
+#: 速度のために別実装を持っているだけなので、値が食い違えば検索結果が実装依存に
+#: なる。素性表や重みを変えたときに両者が揃っていることをここで担保する。
 #:
 #: 下のアライメントのテストと前半の対が重なっているが、意図的に別に持つ。
 #: あちらは空文字列の対を含み (こちらは空入力を専用のテストで見る)、
@@ -124,12 +126,14 @@ _DISTANCE_PAIRS = [
 
 
 @pytest.mark.parametrize(("a", "b"), _DISTANCE_PAIRS)
-def test_id_implementation_matches_symbolic(a: str, b: str) -> None:
+def test_batch_matches_symbolic_per_pair(a: str, b: str) -> None:
+    """対ごとに記号版と一致する。1 件だけの行列で境界も見る。"""
     pa = analyze_reading(a).phonemes
     pb = analyze_reading(b).phonemes
-    expected = weighted_edit_distance(pa, pb)
-    actual = edit_distance_ids(phoneme_ids(pa), phoneme_ids(pb))
-    assert actual == pytest.approx(expected)
+    matrix = phoneme_ids(pb).reshape(1, -1).astype(np.int64)
+    lengths = np.array([len(pb)], dtype=np.int64)
+    actual = edit_distance_batch(phoneme_ids(pa), matrix, lengths)
+    assert actual == pytest.approx([weighted_edit_distance(pa, pb)])
 
 
 def test_batch_implementation_matches_symbolic() -> None:
@@ -150,6 +154,67 @@ def test_batch_implementation_matches_symbolic() -> None:
     actual = edit_distance_batch(phoneme_ids(query), matrix, lengths)
     expected = [weighted_edit_distance(query, p) for p in candidates]
     assert actual == pytest.approx(expected)
+
+
+def test_batch_matches_symbolic_on_random_inputs() -> None:
+    """ランダムな長さ・内容でも記号版と一致する。
+
+    手で選んだ対ではパディングと長さの組み合わせを網羅できない。バッチ版の
+    壊れ方は「長さの違う候補だけが静かに狂う」形で出るので、長短が混ざった
+    行列を大量に投げる。空クエリと長さ 0 の候補も範囲に含めている。
+    """
+    rng = np.random.default_rng(20260804)
+    symbols = list(_ALL_PHONEMES)
+
+    for _ in range(200):
+        query = tuple(rng.choice(symbols, size=int(rng.integers(0, 12))))
+        count = int(rng.integers(1, 40))
+        candidates = [
+            tuple(rng.choice(symbols, size=int(rng.integers(0, 25)))) for _ in range(count)
+        ]
+
+        lengths = np.array([len(c) for c in candidates], dtype=np.int64)
+        width = max(1, int(lengths.max()))
+        matrix = np.full((count, width), PAD_ID, dtype=np.int64)
+        for row, phonemes in enumerate(candidates):
+            if phonemes:
+                matrix[row, : len(phonemes)] = phoneme_ids(phonemes)
+
+        actual = edit_distance_batch(phoneme_ids(query), matrix, lengths)
+        expected = [weighted_edit_distance(query, c) for c in candidates]
+        assert actual == pytest.approx(expected, abs=1e-5)
+
+
+def test_csr_matches_padded_path() -> None:
+    """CSR 経路とパディング行列経路が一致する。
+
+    検索は CSR 経路を使うが、他のテストが検証しているのはパディング経路なので
+    両者が揃っていることを明示的に見る。CSR 側は索引の音素 ID を距離テーブルの
+    ID に写す段を余分に持つので、そこがずれると全候補が静かに狂う。
+    """
+    words = ["チクビ", "テクビ", "チョコビ", "カガク", "サカナ", "ア", "アイウエオ"]
+    candidates = [analyze_reading(w).phonemes for w in words]
+    query = phoneme_ids(analyze_reading("チクビ").phonemes)
+
+    # 索引と同じ CSR を手で組む。ここでは索引 ID = 距離 ID にしておく。
+    blob: list[int] = []
+    bounds = np.zeros(len(candidates) + 1, dtype=np.int64)
+    for row, phonemes in enumerate(candidates):
+        blob.extend(int(i) for i in phoneme_ids(phonemes))
+        bounds[row + 1] = len(blob)
+    identity = np.arange(SUBSTITUTION_COSTS.shape[0], dtype=np.int32)
+
+    actual = edit_distance_csr(
+        query,
+        np.arange(len(candidates), dtype=np.int64),
+        np.array(blob, dtype=np.uint8),
+        bounds,
+        identity,
+    )
+    expected = [
+        weighted_edit_distance(analyze_reading("チクビ").phonemes, p) for p in candidates
+    ]
+    assert actual == pytest.approx(expected, abs=1e-5)
 
 
 def test_batch_handles_empty_query_and_no_candidates() -> None:

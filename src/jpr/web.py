@@ -31,9 +31,16 @@ from .store import INNER_PRODUCT_SPACES, PhoneticStore, default_store_path
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-#: 1 リクエストで返す件数の上限。索引には音が近い語が数百件あるため、
-#: limit を無制限にすると rerank の打ち切り線が効かず素直に遅くなる。
+#: 1 リクエストで返す件数の上限。件数に比例して `store.entry()` の呼び出しと
+#: JSON のシリアライズが増える (2000 件で 40ms)。limit=0 で無制限にでき、
+#: そのときは MAX_UNLIMITED で切る。
 MAX_LIMIT = 200
+
+#: limit=0 (無制限) のときに実際に返す件数の上限。5 モーラの全走査は
+#: 30 万語が母集団になるので、min_score を付けずに無制限を要求されると
+#: レスポンスが数百 MB になる。ブラウザが受け取れる量で切り、切ったことは
+#: `truncated` で伝える。本当に全件が要るなら CLI を使う。
+MAX_UNLIMITED = 5_000
 
 #: ANN から取る候補数の上限。ここを大きくすると再現率と引き換えに
 #: rerank のコストが線形に増える (DEFAULT_CANDIDATES の項も参照)。
@@ -88,11 +95,13 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
     @app.get("/api/similar")
     def api_similar(
         q: str = Query(..., min_length=1, description="検索語 (漢字・かな・カタカナ)"),
-        limit: int = Query(20, ge=1, le=MAX_LIMIT),
+        limit: int = Query(20, ge=0, le=MAX_LIMIT, description="0 で無制限"),
         preset: str = Query(DEFAULT_PRESET),
         candidates: int = Query(DEFAULT_CANDIDATES, ge=1, le=MAX_CANDIDATES),
         min_score: float = Query(0.0, ge=0.0, le=1.0),
         categories: str | None = Query(None, description="カンマ区切り"),
+        min_mora: int | None = Query(None, ge=1, le=32, description="モーラ数の下限"),
+        max_mora: int | None = Query(None, ge=1, le=32, description="モーラ数の上限"),
     ) -> dict[str, Any]:
         """音が近い語を返す。"""
         if preset not in PRESETS:
@@ -102,20 +111,38 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             )
 
         engine = searcher()
+        # モーラ範囲を指定すると ANN を迂回して全走査するので、母集団の
+        # 規模をレスポンスに含めて「なぜ遅いのか」を画面から読めるようにする。
+        scanned: int | None = None
+        if min_mora is not None or max_mora is not None:
+            try:
+                scanned = engine.mora_range_size(min_mora, max_mora)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+
         pronunciation, results = engine.search(
             q,
-            limit=limit,
+            limit=None if limit == 0 else limit,
             preset=preset,
             candidates=candidates,
             min_score=min_score,
             categories=_parse_categories(categories),
+            min_mora=min_mora,
+            max_mora=max_mora,
         )
+        total = len(results)
+        truncated = total > MAX_UNLIMITED
+        if truncated:
+            results = results[:MAX_UNLIMITED]
         return {
             "query": q,
             "reading": pronunciation.reading,
             "phonemes": list(pronunciation.phonemes),
             "mora_count": pronunciation.mora_count,
             "preset": preset,
+            "scanned": scanned,
+            "total": total,
+            "truncated": truncated,
             "results": [
                 {
                     "word": r.surface,

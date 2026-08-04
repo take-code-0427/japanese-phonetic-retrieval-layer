@@ -298,6 +298,9 @@ async function runSearch(event) {
       candidates: $("candidates").value,
       min_score: $("min-score").value,
       categories: [...activeCategories].join(","),
+      // getJSON は空文字列を落とすので、未入力のモーラ範囲は送られない。
+      min_mora: $("min-mora").value,
+      max_mora: $("max-mora").value,
     });
     const elapsed = Math.round(performance.now() - started);
 
@@ -314,11 +317,27 @@ async function runSearch(event) {
     );
 
     if (!data.results.length) {
-      setStatus(status, `該当なし (${elapsed}ms) — 候補数を増やすか、カテゴリの絞り込みを外す`);
+      // 全走査では候補数を増やしても何も変わらないので、助言を変える。
+      const advice = data.scanned == null
+        ? "候補数を増やすか、カテゴリの絞り込みを外す"
+        : "モーラ範囲かスコア下限をゆるめる";
+      setStatus(status, `該当なし (${elapsed}ms) — ${advice}`);
     } else {
-      setStatus(status, `${data.results.length} 件 / ${elapsed}ms — 行をクリックすると音素の対応が開く`);
+      const parts = [`${data.results.length} 件`, `${elapsed}ms`];
+      if (data.scanned != null) {
+        parts.push(`${data.scanned.toLocaleString("ja-JP")} 語を全走査`);
+      }
+      if (data.truncated) {
+        parts.push(`全 ${data.total.toLocaleString("ja-JP")} 件中の先頭のみ`);
+      }
+      setStatus(status, `${parts.join(" / ")} — 行をクリックすると音素の対応が開く`);
     }
-    history.replaceState(null, "", `?q=${encodeURIComponent(query)}&preset=${activePreset}`);
+
+    // モーラ範囲も URL に載せて、絞り込んだ結果を共有できるようにする。
+    const shared = new URLSearchParams({ q: query, preset: activePreset });
+    if ($("min-mora").value) shared.set("min_mora", $("min-mora").value);
+    if ($("max-mora").value) shared.set("max_mora", $("max-mora").value);
+    history.replaceState(null, "", `?${shared}`);
   } catch (error) {
     setStatus(status, error.message, true);
     $("results").replaceChildren();
@@ -560,6 +579,13 @@ async function main() {
     const seg = document.querySelector(`.seg[data-preset="${CSS.escape(preset)}"]`);
     if (seg) seg.click();
   }
+  const minMora = params.get("min_mora");
+  const maxMora = params.get("max_mora");
+  if (minMora) $("min-mora").value = minMora;
+  if (maxMora) $("max-mora").value = maxMora;
+  // 共有された URL でモーラ範囲が効いているなら、絞り込みを開いて見せる。
+  if (minMora || maxMora) document.querySelector(".advanced")?.setAttribute("open", "");
+
   const query = params.get("q");
   if (query) {
     $("q").value = query;

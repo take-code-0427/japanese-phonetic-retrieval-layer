@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "jpr-distance"
+version = "0.1.0"
+description = "jpr の音素編集距離を Rust で計算する省略可能な拡張"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.maturin]
+# 拡張モジュール 1 つだけを配るので、Python 側のソースツリーは持たない。
+module-name = "jpr_distance"
+manifest-path = "Cargo.toml"

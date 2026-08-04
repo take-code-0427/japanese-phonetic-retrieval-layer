@@ -271,6 +271,11 @@ main {
 }
 .knob input:focus-visible { outline: none; border-color: var(--p-alveolar); }
 
+/* 下限と上限は 1 つの範囲なので、横に並べて 1 つの入力に見せる。 */
+.mora-range { display: flex; align-items: center; gap: 6px; }
+.mora-range input { width: 64px; }
+.mora-range > span { opacity: 0.5; }
+
 /* ---------- status ---------- */
 
 .status { margin-top: 20px; font-size: 13px; color: var(--ink-dim); min-height: 20px; font-family: var(--mono); }

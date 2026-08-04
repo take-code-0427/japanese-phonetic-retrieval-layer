@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cache
 
+import jpr_distance as _rust
 import numpy as np
 
 from .phonology import GEMINATE, LONG, MORAIC_N, Pronunciation
@@ -289,6 +290,36 @@ def _build_cost_tables() -> tuple[np.ndarray, np.ndarray]:
 
 SUBSTITUTION_COSTS, INDEL_COSTS = _build_cost_tables()
 
+#: バッチ版が使う float32 のコスト表。
+#:
+#: バッチ DP は (候補数, 音素長) の行列を音素列の長さぶん更新するので、要素あたり
+#: のバイト数がそのまま帯域に効く。float64 から float32 に落とすと 53 万候補で
+#: 2034ms -> 761ms (2.7 倍) になった。支配的なのは演算ではなくメモリ転送で、
+#: とくに置換コストの (クエリ長, 候補数, 音素長) テンソルが float64 では 306MB に
+#: なりキャッシュに全く乗らない。
+#:
+#: 精度の心配は要らない。コストは 0.0〜1.0 の値を音素長 (最大 24) ぶん足すだけなので
+#: 絶対値は 25 未満に収まり、float32 の仮数 24 bit に対して桁落ちの余地がない。
+#: 実測の最大誤差は 9e-07 で、検索スコアの丸め (小数 4 桁) には届かない。
+#: 一致性は `tests/test_distance.py` が float64 の実装との比較で担保する。
+SUBSTITUTION_COSTS32 = SUBSTITUTION_COSTS.astype(np.float32)
+INDEL_COSTS32 = INDEL_COSTS.astype(np.float32)
+
+# --- Rust 拡張 (必須) -------------------------------------------------------
+#
+# 編集距離は Rust で計算する (`rust/`、ビルド手順は README)。
+#
+# NumPy 実装は持たない。53 万候補で 1097ms 対 41ms (26.5 倍) と差が大きく、
+# 両者を揃えて維持する手間に見合わなかった。NumPy では「候補方向をベクトル化して
+# DP の 1 行を全候補ぶん進める」形しか取れず、(クエリ長 x 候補数 x 音素長) の
+# 置換コストテンソルを実体化してしまう (53 万候補で float32 でも 153MB)。Rust なら
+# 1 候補ずつ DP を回して候補方向を並列化できるので、作業配列が L1 に収まり帯域を
+# 使わない — 構造的に追いつけない。
+
+# Rust に渡すコスト表。(P, P) を行優先で平坦化したものを毎回作り直さずに持つ。
+_SUB_FLAT32 = np.ascontiguousarray(SUBSTITUTION_COSTS32).reshape(-1)
+_INDEL_FLAT32 = np.ascontiguousarray(INDEL_COSTS32)
+
 
 def phoneme_ids(phonemes: tuple[str, ...]) -> np.ndarray:
     """音素列を ID 配列にする。未知音素は UNKNOWN_PHONEME_ID になる。"""
@@ -297,41 +328,6 @@ def phoneme_ids(phonemes: tuple[str, ...]) -> np.ndarray:
         dtype=np.int32,
         count=len(phonemes),
     )
-
-
-def edit_distance_ids(a: np.ndarray, b: np.ndarray) -> float:
-    """ID 配列間の重み付き編集距離。
-
-    `weighted_edit_distance` と同じ値を返すが、行ごとに NumPy のベクトル演算で
-    処理する。挿入方向の依存 (cur[j] が cur[j-1] を参照する) だけは逐次なので、
-    そこは行内の走査で解く。
-    """
-    if a.size == 0:
-        return float(INDEL_COSTS[b].sum())
-    if b.size == 0:
-        return float(INDEL_COSTS[a].sum())
-
-    b_indel = INDEL_COSTS[b]
-    prev = np.empty(b.size + 1, dtype=np.float64)
-    prev[0] = 0.0
-    np.cumsum(b_indel, out=prev[1:])
-
-    substitution_rows = SUBSTITUTION_COSTS[a][:, b]
-    a_indel = INDEL_COSTS[a]
-
-    cur = np.empty_like(prev)
-    for row in range(a.size):
-        cur[0] = prev[0] + a_indel[row]
-        # 置換と削除は前の行だけに依存するのでまとめて計算できる。
-        np.minimum(prev[:-1] + substitution_rows[row], prev[1:] + a_indel[row], out=cur[1:])
-        # 挿入は同じ行の左隣に依存するため逐次に解く。
-        for column in range(1, cur.size):
-            candidate = cur[column - 1] + b_indel[column - 1]
-            if candidate < cur[column]:
-                cur[column] = candidate
-        prev, cur = cur, prev
-
-    return float(prev[-1])
 
 
 #: パディング行列で「音素なし」を表す値。
@@ -345,59 +341,51 @@ def edit_distance_batch(
 ) -> np.ndarray:
     """1 つのクエリと複数候補の編集距離をまとめて計算する。
 
-    `edit_distance_ids` を候補ごとに呼ぶと、音素列が 3〜24 要素しかないため
-    NumPy の呼び出しオーバーヘッドが実計算を上回る (実測で 1 件あたり 80μs、
-    2000 件で 190ms)。候補をバッチ軸に取り、DP の 1 行を全候補について同時に
-    進めれば同じ 2000 件が 9ms で終わる (実測 22 倍)。
-
     `candidates` は (C, L) のパディング済み ID 行列で、余りは `PAD_ID`。
     `lengths` は候補ごとの実際の音素数。戻り値は (C,) の距離。
 
-    `edit_distance_ids` と同じ値を返さなければならない
+    検索が使うのは `edit_distance_csr` のほうで、こちらは索引を用意せずに
+    任意の音素列を渡せる経路として残してある。記号版との一致を検証する足場が
+    ここにしかない (CSR 版は索引の持ち方に縛られる)。
+
+    計算は float32 で行う (`SUBSTITUTION_COSTS32` の説明を参照)。
+    `weighted_edit_distance` と同じ値を返さなければならない
     (`tests/test_distance.py` が対応を検証する)。
     """
-    count, width = candidates.shape
-    if count == 0:
-        return np.zeros(0, dtype=np.float64)
-    if query_ids.size == 0:
-        # クエリが空なら候補を全削除するコスト。
-        safe = np.where(candidates >= 0, candidates, 0)
-        valid = np.arange(1, width + 1)[None, :] <= lengths[:, None]
-        return np.where(valid, INDEL_COSTS[safe], 0.0).sum(axis=1)
+    return _rust.edit_distance_batch(
+        np.ascontiguousarray(query_ids, dtype=np.int32),
+        np.ascontiguousarray(candidates, dtype=np.int64),
+        np.ascontiguousarray(lengths, dtype=np.int64),
+        _SUB_FLAT32,
+        _INDEL_FLAT32,
+        _PHONEME_COUNT,
+    )
 
-    # パディング位置は参照されないが、添字として使うので 0 に潰しておく。
-    safe = np.where(candidates >= 0, candidates, 0)
-    # 列 j (1..L) が候補ごとに実在するか。長さの違いはここで吸収する。
-    valid = np.arange(1, width + 1)[None, :] <= lengths[:, None]
 
-    candidate_indel = np.where(valid, INDEL_COSTS[safe], 0.0)
-    previous = np.zeros((count, width + 1), dtype=np.float64)
-    np.cumsum(candidate_indel, axis=1, out=previous[:, 1:])
+def edit_distance_csr(
+    query_ids: np.ndarray,
+    rows: np.ndarray,
+    phoneme_ids_blob: np.ndarray,
+    phoneme_bounds: np.ndarray,
+    distance_ids: np.ndarray,
+) -> np.ndarray:
+    """索引の CSR から直接、候補行の編集距離をまとめて計算する。**検索の本線。**
 
-    query_indel = INDEL_COSTS[query_ids]
-    # (n, C, L) — クエリの各音素 x 候補 x 位置 の置換コストを先に引く。
-    substitution = SUBSTITUTION_COSTS[query_ids][:, safe]
-
-    current = np.empty_like(previous)
-    for row in range(query_ids.size):
-        current[:, 0] = previous[:, 0] + query_indel[row]
-        # 置換と削除は前の行だけに依存するので全候補まとめて計算できる。
-        np.minimum(
-            previous[:, :-1] + substitution[row],
-            previous[:, 1:] + query_indel[row],
-            out=current[:, 1:],
-        )
-        # 挿入は同じ行の左隣に依存するため列方向は逐次。候補方向は並列のまま。
-        for column in range(1, width + 1):
-            np.minimum(
-                current[:, column],
-                current[:, column - 1] + candidate_indel[:, column - 1],
-                out=current[:, column],
-            )
-        previous, current = current, previous
-
-    # 候補ごとに長さの違う終端セルを引く。
-    return previous[np.arange(count), lengths]
+    索引は音素列を連結した 1 本の配列と境界インデックスで持っているので
+    (`store.py` の `_encode_entries`)、それを Rust にそのまま渡せば
+    (候補数, 音素長) の行列を Python 側で組む必要がなくなる。実測で 53 万候補の
+    行列作成に 102ms かかっていた分がまるごと消える。
+    """
+    return _rust.edit_distance_csr(
+        np.ascontiguousarray(query_ids, dtype=np.int32),
+        np.ascontiguousarray(rows, dtype=np.int64),
+        np.ascontiguousarray(phoneme_ids_blob, dtype=np.uint8),
+        np.ascontiguousarray(phoneme_bounds, dtype=np.int64),
+        np.ascontiguousarray(distance_ids, dtype=np.int32),
+        _SUB_FLAT32,
+        _INDEL_FLAT32,
+        _PHONEME_COUNT,
+    )
 
 
 def similarity_normalizer(len_a: int, len_b: int, worst: float = -1.0) -> float:

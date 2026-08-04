@@ -73,6 +73,38 @@ async def test_search_accepts_categories(server) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_accepts_a_mora_range(server) -> None:
+    payload = await call(
+        server,
+        "search_phonetically",
+        {"query": "チョコビ", "min_mora": 4, "max_mora": 5, "limit": 20},
+    )
+    assert payload["results"]
+    assert all(4 <= r["mora_count"] <= 5 for r in payload["results"])
+    # 全走査したことを LLM が報告できるよう、母集団の規模も返す。
+    assert payload["scanned"] > 0
+    assert payload["min_mora"] == 4
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_an_inverted_mora_range(server) -> None:
+    payload = await call(
+        server, "search_phonetically", {"query": "チョコビ", "min_mora": 6, "max_mora": 3}
+    )
+    assert "モーラ範囲" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_search_caps_limit_for_the_context_window(server) -> None:
+    """MCP は無制限を露出しない。LLM のコンテキストを溢れさせないため。"""
+    payload = await call(server, "search_phonetically", {"query": "チョコビ", "limit": 100_000})
+    assert len(payload["results"]) <= 200
+    # 0 や負の件数を渡されても 1 件以上は返す (0 件を無制限と誤解させない)。
+    zero = await call(server, "search_phonetically", {"query": "チョコビ", "limit": 0})
+    assert zero["results"]
+
+
+@pytest.mark.asyncio
 async def test_compare_separates_axes(server) -> None:
     payload = await call(server, "compare_phonetically", {"a": "乳首", "b": "チョコビ"})
     assert payload["a"]["reading"] == "チクビ"

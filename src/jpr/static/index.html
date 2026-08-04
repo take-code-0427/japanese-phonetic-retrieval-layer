@@ -70,7 +70,8 @@
       <div class="knobs">
         <label class="knob">
           <span class="field-label">件数</span>
-          <input id="limit" type="number" value="20" min="1" max="200">
+          <input id="limit" type="number" value="20" min="0" max="200">
+          <span class="hint">0 で無制限。スコア下限と併せて使う</span>
         </label>
         <label class="knob">
           <span class="field-label">ANN 候補数</span>
@@ -80,6 +81,15 @@
         <label class="knob">
           <span class="field-label">スコア下限</span>
           <input id="min-score" type="number" value="0" min="0" max="1" step="0.05">
+        </label>
+        <label class="knob">
+          <span class="field-label">モーラ範囲</span>
+          <span class="mora-range">
+            <input id="min-mora" type="number" min="1" max="32" placeholder="下限" aria-label="モーラ数の下限">
+            <span aria-hidden="true">–</span>
+            <input id="max-mora" type="number" min="1" max="32" placeholder="上限" aria-label="モーラ数の上限">
+          </span>
+          <span class="hint">指定すると ANN を使わず全走査する。モーラ数の違う語 (「乳首」に対する「筑前煮」) は音韻空間の近傍に入らないため。数秒かかる</span>
         </label>
       </div>
     </div>

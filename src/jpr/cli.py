@@ -57,15 +57,35 @@ def _parse_categories(value: str | None) -> list[Category] | None:
 
 def cmd_similar(args: argparse.Namespace) -> int:
     searcher = _open_searcher(args.index)
+    limit = None if args.limit == 0 else args.limit
+
+    # モーラ範囲を指定すると ANN を使わず全走査する。実測で 1 モーラ長あたり
+    # 1 秒以上かかるので、待たせる前に規模を伝える。
+    scanned: int | None = None
+    if args.min_mora is not None or args.max_mora is not None:
+        try:
+            scanned = searcher.mora_range_size(args.min_mora, args.max_mora)
+        except ValueError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 1
+        if not args.json:
+            print(f"モーラ範囲を指定 — {scanned:,} 語を全走査します", file=sys.stderr)
+
     started = time.perf_counter()
-    pronunciation, results = searcher.search(
-        args.query,
-        limit=args.limit,
-        preset=args.preset,
-        candidates=args.candidates,
-        min_score=args.min_score,
-        categories=_parse_categories(args.categories),
-    )
+    try:
+        pronunciation, results = searcher.search(
+            args.query,
+            limit=limit,
+            preset=args.preset,
+            candidates=args.candidates,
+            min_score=args.min_score,
+            categories=_parse_categories(args.categories),
+            min_mora=args.min_mora,
+            max_mora=args.max_mora,
+        )
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
     elapsed = (time.perf_counter() - started) * 1000
 
     if args.json:
@@ -77,6 +97,9 @@ def cmd_similar(args: argparse.Namespace) -> int:
                 "mora_count": pronunciation.mora_count,
                 "preset": args.preset,
                 "elapsed_ms": round(elapsed, 1),
+                # 全走査したときだけ、母集団の規模を添える。
+                "scanned": scanned,
+                "result_count": len(results),
                 "results": [
                     {
                         "word": r.surface,
@@ -107,12 +130,15 @@ def cmd_similar(args: argparse.Namespace) -> int:
         print("該当なし")
         return 0
 
-    print(f"\n{'score':>6}  {'音韻':>5}  {'語尾':>5}  {'語':<16} {'読み':<14} カテゴリ")
+    # モーラ範囲で絞った結果を読むにはモーラ数が要る。既定の検索でも
+    # 候補がどの長さに寄っているかが見えるので、常に出す。
+    print(f"\n{'score':>6}  {'音韻':>5}  {'語尾':>5}  {'拍':>3}  {'語':<16} {'読み':<14} カテゴリ")
     for result in results:
         print(
             f"{result.score:6.3f}  "
             f"{result.phonetic_similarity:5.3f}  "
             f"{result.coda_similarity:5.3f}  "
+            f"{result.mora_count:3d}  "
             f"{result.surface:<16} {result.reading:<14} {result.category.value}"
         )
     return 0
@@ -251,7 +277,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     similar = subparsers.add_parser("similar", help="音が近い語を検索する")
     similar.add_argument("query", help="検索語 (漢字・かな・カタカナ)")
-    similar.add_argument("-n", "--limit", type=int, default=10, help="結果数 (既定: %(default)s)")
+    similar.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        help="結果数。0 で無制限 (--min-score と併せて使う) (既定: %(default)s)",
+    )
     similar.add_argument(
         "-p",
         "--preset",
@@ -271,6 +303,16 @@ def build_parser() -> argparse.ArgumentParser:
         "-c",
         "--categories",
         help="カテゴリを絞る (カンマ区切り: common,product,person,place,other)",
+    )
+    similar.add_argument(
+        "--min-mora",
+        type=int,
+        help="検索するモーラ数の下限。指定すると ANN を使わず全走査する (数秒かかる)",
+    )
+    similar.add_argument(
+        "--max-mora",
+        type=int,
+        help="検索するモーラ数の上限。指定すると ANN を使わず全走査する (数秒かかる)",
     )
     similar.add_argument("--json", action="store_true", help="JSON で出力する")
     _add_store_argument(similar)

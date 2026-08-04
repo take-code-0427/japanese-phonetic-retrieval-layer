@@ -64,8 +64,40 @@ def test_similar_requires_query(client: TestClient) -> None:
 
 
 def test_similar_caps_limit(client: TestClient) -> None:
-    """件数の上限を超える要求は弾く。rerank の打ち切りが効かなくなるため。"""
+    """件数の上限を超える要求は弾く。件数に比例して復号とシリアライズが増えるため。"""
     assert client.get("/api/similar", params={"q": "乳首", "limit": 10_000}).status_code == 422
+    # 負の件数は依然として弾く (0 だけを無制限の合図にする)。
+    assert client.get("/api/similar", params={"q": "乳首", "limit": -1}).status_code == 422
+
+
+def test_similar_limit_zero_is_unlimited(client: TestClient) -> None:
+    """limit=0 は上限なし。切り詰めていないことを truncated で確かめる。"""
+    payload = client.get("/api/similar", params={"q": "チョコビ", "limit": 0}).json()
+    assert payload["results"]
+    assert payload["truncated"] is False
+    assert payload["total"] == len(payload["results"])
+
+
+def test_similar_accepts_a_mora_range(client: TestClient) -> None:
+    payload = client.get(
+        "/api/similar", params={"q": "チョコビ", "min_mora": 4, "max_mora": 5, "limit": 20}
+    ).json()
+    assert payload["results"]
+    assert all(4 <= r["mora_count"] <= 5 for r in payload["results"])
+    # 全走査したことと、その母集団の規模を返す。
+    assert payload["scanned"] > 0
+
+
+def test_similar_reports_no_scan_without_a_mora_range(client: TestClient) -> None:
+    """範囲を指定しなければ ANN 経路なので、走査件数は報告しない。"""
+    payload = client.get("/api/similar", params={"q": "チョコビ"}).json()
+    assert payload["scanned"] is None
+
+
+def test_similar_rejects_an_inverted_mora_range(client: TestClient) -> None:
+    response = client.get("/api/similar", params={"q": "チョコビ", "min_mora": 6, "max_mora": 3})
+    assert response.status_code == 400
+    assert "モーラ範囲" in response.json()["detail"]
 
 
 def test_pronounce_returns_mora_structure(client: TestClient) -> None:

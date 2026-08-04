@@ -363,6 +363,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "hnswlib" },
+    { name = "jpr-distance" },
     { name = "mcp" },
     { name = "numpy" },
     { name = "sudachidict-core" },
@@ -383,6 +384,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "hnswlib", specifier = ">=0.8.0" },
+    { name = "jpr-distance", directory = "rust" },
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "sudachidict-core", specifier = ">=20260723" },
@@ -398,6 +400,11 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "ruff", specifier = ">=0.6" },
 ]
+
+[[package]]
+name = "jpr-distance"
+version = "0.1.0"
+source = { directory = "rust" }
 
 [[package]]
 name = "jsonschema"

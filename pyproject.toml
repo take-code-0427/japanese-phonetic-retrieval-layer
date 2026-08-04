@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "hnswlib>=0.8.0",
+    "jpr-distance",
     "mcp>=2.0.0",
     "numpy>=2.5.1",
     "sudachidict-core>=20260723",
@@ -32,6 +33,11 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.6",
 ]
+
+[tool.uv.sources]
+# 編集距離の Rust 実装 (`rust/`)。`jpr.distance` が import するので必須。
+# maturin でビルドされるため、`uv sync` には Rust ツールチェインが必要になる。
+jpr-distance = { path = "rust" }
 
 [tool.ruff]
 line-length = 100

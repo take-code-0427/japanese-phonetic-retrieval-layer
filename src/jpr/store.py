@@ -225,6 +225,24 @@ class PhoneticStore:
         matrix = np.where(valid, self._distance_ids[self._data["phoneme_ids"][flat]], PAD_ID)
         return matrix, lengths
 
+    def phoneme_lengths(self, rows: np.ndarray) -> np.ndarray:
+        """指定した行の音素数。類似度の正規化に使う。
+
+        境界インデックスの差だけなので、音素列そのものを起こさずに済む。
+        """
+        bounds = self._data["phoneme_bounds"]
+        return (bounds[rows + 1] - bounds[rows]).astype(np.int64)
+
+    @property
+    def phoneme_csr(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """音素列の CSR 表現 (連結 ID, 境界, 距離テーブルへの写像)。
+
+        `distance.edit_distance_csr` に渡してパディング行列を経由せずに
+        編集距離を計算するための入口。行列を組む処理 (`phoneme_id_matrix`) は
+        53 万候補で 102ms かかるので、Rust 側で CSR を直接読めるならその分が消える。
+        """
+        return self._data["phoneme_ids"], self._data["phoneme_bounds"], self._distance_ids
+
     def entry(self, row: int) -> IndexEntry:
         return IndexEntry(
             surface=self.surface(row),

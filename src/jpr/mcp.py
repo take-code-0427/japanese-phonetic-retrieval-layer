@@ -29,7 +29,11 @@ _SEARCH_DESCRIPTION = """\
 
 意味的な絞り込みが必要な場合 (「お菓子の中から」など) は、音韻的に近い語が
 数百件あるため、まず limit を大きめにして候補を取り、意味の判断は呼び出し側で
-行うこと。"""
+行うこと。
+
+「もっと長い語で」「4 モーラ以上で」のようにモーラ数 (拍) を指定された場合は
+min_mora / max_mora を使う。通常の検索は音韻空間の近傍を引くので、モーラ数の
+違う語は近傍に入らず出てこない。"""
 
 _COMPARE_DESCRIPTION = """\
 2 つの日本語表現の音韻類似度を計算する。
@@ -39,6 +43,10 @@ _COMPARE_DESCRIPTION = """\
 
 _PRONOUNCE_DESCRIPTION = """\
 日本語テキストの読み・音素列・モーラ構造を返す。索引を引かずに音韻表現だけを得る。"""
+
+#: MCP が 1 回に返す件数の上限。LLM のコンテキストを溢れさせないため、
+#: CLI や Web と違って無制限は露出しない。
+_MAX_LIMIT = 200
 
 
 _INSTRUCTIONS = """\
@@ -70,6 +78,8 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
         preset: str = "pun",
         categories: list[str] | None = None,
         candidates: int = DEFAULT_CANDIDATES,
+        min_mora: int | None = None,
+        max_mora: int | None = None,
     ) -> str:
         """音が近い語を検索する。
 
@@ -80,6 +90,12 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
             categories: 絞り込むカテゴリ。common (一般語) / product (商品名・作品名)
                 / person (人名) / place (地名)。省略すると人名と地名を除いて検索する。
             candidates: ANN から取る候補数。増やすと再現率が上がる。
+            min_mora: 結果のモーラ数 (拍) の下限。
+            max_mora: 結果のモーラ数 (拍) の上限。min_mora と併せて範囲を切る。
+                **指定すると通常の近傍検索とは別の経路になり、その範囲の語を
+                全件走査する。** 通常の検索は音韻空間の近傍を引くので、モーラ数の
+                違う語 (「乳首」3 モーラに対する「筑前煮」5 モーラ) は近傍に
+                入らず出てこない。数秒かかる。
         """
         if preset not in PRESETS:
             return json.dumps(
@@ -97,12 +113,24 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                     ensure_ascii=False,
                 )
 
-        pronunciation, results = searcher().search(
+        engine = searcher()
+        scanned: int | None = None
+        if min_mora is not None or max_mora is not None:
+            try:
+                scanned = engine.mora_range_size(min_mora, max_mora)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+        pronunciation, results = engine.search(
             query,
-            limit=limit,
+            # 上限は必ず掛ける。無制限を許すと数万件が JSON-RPC に載り、
+            # LLM のコンテキストを溢れさせる。全件が要るなら CLI か Web を使う。
+            limit=min(max(limit, 1), _MAX_LIMIT),
             preset=preset,
             categories=parsed,
             candidates=candidates,
+            min_mora=min_mora,
+            max_mora=max_mora,
         )
         payload: dict[str, Any] = {
             "query": query,
@@ -110,6 +138,9 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
             "phonemes": list(pronunciation.phonemes),
             "mora_count": pronunciation.mora_count,
             "preset": preset,
+            "min_mora": min_mora,
+            "max_mora": max_mora,
+            "scanned": scanned,
             "note": (
                 "score は音韻的な近さのみを表し、意味は考慮していない。"
                 "意味的な制約がある問いでは、この候補から意味で選び直すこと。"

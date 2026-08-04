@@ -7,11 +7,12 @@ Sudachi の形態素解析を使い、複合語やフレーズも語ごとの読
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 from sudachipy import Dictionary, SplitMode
 
 from .phonology import to_katakana
+
+#: 読み・正規化形のキャッシュ上限。
+_CACHE_LIMIT = 4096
 
 
 class ReadingExtractor:
@@ -25,13 +26,26 @@ class ReadingExtractor:
         self._split_mode = split_mode
         self._dictionary = Dictionary(dict=dict_type)
         self._tokenizer = self._dictionary.create()
+        # 解析結果はプロセス内で不変なのでキャッシュする。メソッドに lru_cache を
+        # 付けるとクラス単位のキャッシュが self を握り続けインスタンスが解放され
+        # なくなるため、インスタンスごとに持つ。
+        self._reading_cache: dict[str, str] = {}
+        self._normalized_cache: dict[str, str] = {}
 
-    @lru_cache(maxsize=4096)  # noqa: B019 - 解析結果はプロセス内で不変
     def reading_of(self, text: str) -> str:
         """テキスト全体の読みをカタカナで返す。
 
         入力が既にかなだけなら形態素解析を経ずにカタカナ化する。
         """
+        cached = self._reading_cache.get(text)
+        if cached is not None:
+            return cached
+
+        reading = self._compute_reading(text)
+        self._remember(self._reading_cache, text, reading)
+        return reading
+
+    def _compute_reading(self, text: str) -> str:
         stripped = text.strip()
         if not stripped:
             return ""
@@ -47,14 +61,31 @@ class ReadingExtractor:
             parts.append(to_katakana(reading or morpheme.surface()))
         return "".join(parts)
 
-    @lru_cache(maxsize=4096)  # noqa: B019 - 同上
     def normalize(self, text: str) -> str:
         """正規化表記を返す。表層の揺れを吸収して自己一致を判定するのに使う。"""
+        cached = self._normalized_cache.get(text)
+        if cached is not None:
+            return cached
+
         stripped = text.strip()
         if not stripped:
-            return ""
-        morphemes = self._tokenizer.tokenize(stripped, self._split_mode)
-        return "".join(m.normalized_form() for m in morphemes)
+            normalized = ""
+        else:
+            morphemes = self._tokenizer.tokenize(stripped, self._split_mode)
+            normalized = "".join(m.normalized_form() for m in morphemes)
+
+        self._remember(self._normalized_cache, text, normalized)
+        return normalized
+
+    @staticmethod
+    def _remember(cache: dict[str, str], key: str, value: str) -> None:
+        """上限付きでキャッシュに入れる。上限に達したら丸ごと捨てる。
+
+        検索のクエリは繰り返し現れるので、厳密な LRU は要らない。
+        """
+        if len(cache) >= _CACHE_LIMIT:
+            cache.clear()
+        cache[key] = value
 
 
 _KANA_RANGES = (

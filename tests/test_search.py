@@ -204,6 +204,110 @@ def test_unpronounceable_query_returns_nothing(sample_searcher: PhoneticSearcher
     assert results == []
 
 
+# --- モーラ範囲での絞り込み --------------------------------------------------
+
+
+def test_mora_range_restricts_results(sample_searcher: PhoneticSearcher) -> None:
+    """範囲を指定すると、その長さの語だけが返る。"""
+    _, results = sample_searcher.search("チョコビ", min_mora=4, max_mora=5, limit=20)
+    assert results
+    assert all(4 <= r.mora_count <= 5 for r in results)
+
+
+def test_mora_range_accepts_an_open_end(sample_searcher: PhoneticSearcher) -> None:
+    """下限だけ・上限だけの指定も範囲として扱う。"""
+    _, lower = sample_searcher.search("チョコビ", min_mora=5, limit=20)
+    assert [r.surface for r in lower] == ["チョコボール"]
+
+    _, upper = sample_searcher.search("チョコビ", max_mora=2, limit=20)
+    assert [r.surface for r in upper] == ["空"]
+
+
+def test_mora_range_reaches_past_the_ann_neighbourhood(
+    sample_searcher: PhoneticSearcher,
+) -> None:
+    """範囲指定は音韻空間の近傍に入らない語も候補にする。
+
+    「チョコビ」(3 モーラ) の近傍は同じ長さの語で埋まるので、既定の検索で
+    5 モーラの「チョコボール」は上位に来ない。範囲を切ると母集団が
+    その長さだけになるので必ず土俵に載る。実索引ではこの差がもっと極端で、
+    「筑前煮」は 5 モーラ内に限っても 23823/301551 位に沈む。
+    """
+    _, ranged = sample_searcher.search("チョコビ", min_mora=5, max_mora=5, limit=20)
+    assert [r.surface for r in ranged] == ["チョコボール"]
+
+
+def test_mora_range_ignores_the_max_gap_guard(sample_searcher: PhoneticSearcher) -> None:
+    """範囲を明示したら `_MAX_MORA_GAP` は適用しない。
+
+    ギャップ 3 の安全網は ANN 候補の粗さを補うためのもの。範囲を指定した
+    検索では呼び出し側が意図を持っているので、そこに従わないと短いクエリから
+    長い語を要求したときに全件落ちてしまう。「ソラ」(2) と
+    「チョコボール」(5) はギャップ 3 を超える。
+    """
+    _, results = sample_searcher.search("ソラ", min_mora=5, max_mora=5, limit=20)
+    assert [r.surface for r in results] == ["チョコボール"]
+
+
+def test_mora_range_still_excludes_person_and_place(
+    sample_searcher: PhoneticSearcher,
+) -> None:
+    """全走査経路でもカテゴリの既定 (人名・地名を除く) は効く。"""
+    _, results = sample_searcher.search("チョコビ", min_mora=2, max_mora=12, limit=50)
+    assert results
+    assert all(r.category not in (Category.PERSON, Category.PLACE) for r in results)
+
+
+def test_inverted_mora_range_is_rejected(sample_searcher: PhoneticSearcher) -> None:
+    with pytest.raises(ValueError, match="モーラ範囲"):
+        sample_searcher.search("チョコビ", min_mora=6, max_mora=3)
+
+
+def test_mora_range_size_counts_the_population(sample_searcher: PhoneticSearcher) -> None:
+    """全走査のコストの目安。範囲を指定しなければ索引全体。"""
+    assert sample_searcher.mora_range_size(5, 5) == 1
+    assert sample_searcher.mora_range_size(None, None) == len(sample_searcher.store)
+
+
+def test_default_search_keeps_the_ann_path(sample_searcher: PhoneticSearcher) -> None:
+    """範囲を指定しない検索は従来どおり ANN 経路を通る。
+
+    経路の取り違えを捕まえるために、上位の並びを固定する。1 位が「仕組」でなく
+    「仕組み」なのは代表選びの同点解消による (`_representative_rank` 参照)。
+    どちらも `familiarity` が 1.0 に飽和して分けられないので、表層の符号順で
+    決まる。以前はここに到着順の偶然で「仕組」が入っていた。
+    """
+    assert surfaces(sample_searcher, "乳首", limit=3) == ["仕組み", "手首", "竹輪"]
+
+
+# --- 件数の上限 --------------------------------------------------------------
+
+
+def test_unlimited_limit_returns_more_than_a_capped_one(
+    sample_searcher: PhoneticSearcher,
+) -> None:
+    """`limit=None` は上限なし。"""
+    _, capped = sample_searcher.search("チョコビ", limit=3)
+    _, everything = sample_searcher.search("チョコビ", limit=None)
+    assert len(capped) == 3
+    assert len(everything) > len(capped)
+    # 同音異表記は畳まれたまま。
+    assert len({r.reading for r in everything}) == len(everything)
+
+
+def test_unlimited_respects_min_score(sample_searcher: PhoneticSearcher) -> None:
+    """閾値で母集団を切って全件取る、という使い方が成り立つ。"""
+    _, results = sample_searcher.search("チョコビ", limit=None, min_score=0.7)
+    assert results
+    assert all(r.score >= 0.7 for r in results)
+
+
+def test_unlimited_combines_with_a_mora_range(sample_searcher: PhoneticSearcher) -> None:
+    _, results = sample_searcher.search("チョコビ", limit=None, min_mora=4, max_mora=5)
+    assert results
+    assert all(4 <= r.mora_count <= 5 for r in results)
+
+
 # --- compare ---------------------------------------------------------------
 
 

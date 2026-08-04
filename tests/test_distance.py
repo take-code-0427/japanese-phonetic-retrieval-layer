@@ -211,9 +211,7 @@ def test_csr_matches_padded_path() -> None:
         bounds,
         identity,
     )
-    expected = [
-        weighted_edit_distance(analyze_reading("チクビ").phonemes, p) for p in candidates
-    ]
+    expected = [weighted_edit_distance(analyze_reading("チクビ").phonemes, p) for p in candidates]
     assert actual == pytest.approx(expected, abs=1e-5)
 
 

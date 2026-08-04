@@ -10,8 +10,10 @@ import time
 
 import pytest
 
+from jpr import search as search_module
 from jpr.index import Category
 from jpr.search import PhoneticSearcher
+from jpr.store import PhoneticStore
 
 # なぞなぞ「乳首みたいなお菓子ってなんだ？」の答えを引くための意味的制約。
 # LLM が「お菓子である」という知識を与える想定。
@@ -90,6 +92,65 @@ def test_search_is_fast(real_searcher: PhoneticSearcher) -> None:
     # 退行 (バッチ化を戻すと 440ms) を捕まえるには 150ms で十分なので、
     # 偶発的な失敗を避けてここに置く。
     assert elapsed < 0.15, f"1 クエリ {elapsed * 1000:.0f}ms は遅すぎる"
+
+
+def test_mora_range_reaches_words_the_ann_cannot(real_searcher: PhoneticSearcher) -> None:
+    """モーラ範囲の指定が ANN の近傍の外に届く。
+
+    この経路が存在する理由そのもの。ANN の候補生成は phonetic 空間の Top-K
+    なので、モーラ数の違う語は近傍に入らない。「乳首」(3 モーラ) に対して
+    5 モーラの語は、候補数を 20000 に増やしても 1 件も上位に来なかった。
+    """
+    _, plain = real_searcher.search("乳首", limit=100, candidates=20_000)
+    assert not any(r.mora_count == 5 for r in plain), (
+        "ANN 経路で 5 モーラ語が届くなら、この機能の前提が変わっている"
+    )
+
+    _, ranged = real_searcher.search("乳首", min_mora=5, max_mora=5, limit=50)
+    assert ranged
+    assert all(r.mora_count == 5 for r in ranged)
+
+
+def test_mora_range_returns_only_the_requested_lengths(
+    real_searcher: PhoneticSearcher,
+) -> None:
+    _, results = real_searcher.search("乳首", min_mora=4, max_mora=6, limit=100)
+    assert results
+    assert all(4 <= r.mora_count <= 6 for r in results)
+    # 既定の検索では上位が 3 モーラで埋まる。範囲指定はそれを 1 件も通さない。
+    assert not any(r.mora_count == 3 for r in results)
+
+
+def test_mora_range_scan_is_tolerable(real_searcher: PhoneticSearcher) -> None:
+    """全走査は ANN より桁違いに遅いが、常駐サーバで使える範囲に収まる。
+
+    実測 (暖まった状態): 5 モーラ単独 (30 万語) で約 1.0 秒、4〜6 モーラ
+    (97 万語) で約 3.8 秒。初回は mmap のページフォールトを含むのでもっと
+    かかる。行選択をやめて 202 万行すべてに内積を取るような退行を捕まえる
+    ための上限として 20 秒を置く。
+    """
+    real_searcher.search("乳首", min_mora=5, max_mora=5, limit=10)
+
+    started = time.perf_counter()
+    real_searcher.search("乳首", min_mora=5, max_mora=5, limit=50)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 20.0, f"5 モーラの全走査に {elapsed:.1f} 秒は遅すぎる"
+
+
+def test_threshold_then_take_everything(real_searcher: PhoneticSearcher) -> None:
+    """閾値で母集団を切って全件取る、という使い方が成り立つ。
+
+    `limit` の上限で切られると「スコア 0.9 以上を全部見る」ができない。
+    """
+    _, results = real_searcher.search("ラーメン", limit=None, min_score=0.8)
+    assert all(r.score >= 0.8 for r in results)
+    # 既定の limit (10) や選抜幅 (limit * _RERANK_MARGIN = 80) で
+    # 頭打ちになっていない。実測で 95 件返る。
+    assert len(results) > 80, f"{len(results)} 件では上限で切られている疑いがある"
+
+    # 閾値を上げれば件数は減る。上限ではなくスコアが件数を決めている。
+    _, stricter = real_searcher.search("ラーメン", limit=None, min_score=0.9)
+    assert 0 < len(stricter) < len(results)
 
 
 def test_limit_is_filled_when_candidates_allow(real_searcher: PhoneticSearcher) -> None:
@@ -183,3 +244,72 @@ def test_scores_stay_in_range(real_searcher: PhoneticSearcher) -> None:
     for result in results:
         assert 0.0 <= result.score <= 1.0
         assert 0.0 <= result.phonetic_similarity <= 1.0
+
+
+#: 速度のために持っている「素朴でない経路」が結果を変えていないことを見る。
+#:
+#: 内積の取り方には 2 通りある (`_space_scores`)。候補行だけを mmap から引く
+#: 素朴な形と、全行と内積を取ってからマスクする形で、後者は 97 万行の選抜で
+#: 14 倍速いが触るデータが違う。速いほうだけが使われる状況 (数十万件の全走査)
+#: と遅いほうだけが使われる状況 (ANN の 2000 件) が実際に両方あるので、
+#: **どちらを通っても同じ順位・同じスコアになる**ことを固定する。
+#:
+#: 索引が小さいと `_FULL_SCAN_RATIO` の片側しか踏めないので、実辞書のテストに置く。
+_EQUIVALENCE_QUERIES = ["乳首", "科学", "コンピュータ", "図書館", "ありがとう"]
+
+
+def _fingerprint(searcher: PhoneticSearcher, query: str, **kwargs: object) -> list[tuple]:
+    """順位とスコアの内訳をまとめて、経路の違いを検出できる形にする。"""
+    _, results = searcher.search(query, limit=30, **kwargs)  # type: ignore[arg-type]
+    return [
+        (
+            r.surface,
+            r.reading,
+            r.score,
+            r.phonetic_similarity,
+            r.coda_similarity,
+            r.vowel_similarity,
+        )
+        for r in results
+    ]
+
+
+@pytest.mark.parametrize("query", _EQUIVALENCE_QUERIES)
+def test_full_scan_dot_product_matches_row_selection(real_store: PhoneticStore, query: str) -> None:
+    """全行内積と行選抜が、ANN 経路でも全走査でも同じ結果を返す。"""
+    always_full = PhoneticSearcher(real_store)
+    always_full._FULL_SCAN_RATIO = 0.0
+    always_rows = PhoneticSearcher(real_store)
+    always_rows._FULL_SCAN_RATIO = float("inf")
+
+    assert _fingerprint(always_full, query) == _fingerprint(always_rows, query)
+    assert _fingerprint(always_full, query, min_mora=5, max_mora=5) == _fingerprint(
+        always_rows, query, min_mora=5, max_mora=5
+    )
+
+
+@pytest.mark.parametrize("query", _EQUIVALENCE_QUERIES)
+@pytest.mark.parametrize("preset", ["pun", "rhyme", "mishearing"])
+def test_edit_distance_pruning_does_not_change_ranking(
+    real_store: PhoneticStore,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    preset: str,
+) -> None:
+    """編集距離の打ち切りが順位とスコアを変えない。
+
+    `_survivors` は「上位 N 件は全件計算と一致する」ことだけを保証する厳密な
+    打ち切りで、近似ではない。効き方は `weights.phoneme` に依存する
+    (実測の生存率は rhyme 0.2% / pun 18.7% / mishearing 97.0%) ので、
+    プリセットを変えて両端を踏む。
+
+    候補が数十万件になる全走査経路でしか枝刈りは起きないため、実辞書に置く。
+    """
+    pruned = PhoneticSearcher(real_store)
+    reference = PhoneticSearcher(real_store)
+
+    baseline = _fingerprint(pruned, query, min_mora=4, max_mora=6, preset=preset)
+
+    # 標本が候補数を上回ると `_survivors` は全件計算に落ちる。これを対照にする。
+    monkeypatch.setattr(search_module, "_PROBE_CANDIDATES", 1 << 30)
+    assert baseline == _fingerprint(reference, query, min_mora=4, max_mora=6, preset=preset)

@@ -269,6 +269,31 @@ def test_mora_range_size_counts_the_population(sample_searcher: PhoneticSearcher
     assert sample_searcher.mora_range_size(None, None) == len(sample_searcher.store)
 
 
+def test_group_dedupe_matches_per_row_edit_distance(
+    sample_searcher: PhoneticSearcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同音異表記の編集距離の畳み込みが順位もスコアも変えない。
+
+    「仕組み」「仕組」「し組み」は同じ音素列なので距離は代表 1 件の計算で
+    済むはずで、配り間違えれば別の行の距離が混ざってここで割れる。
+    実辞書の候補数では常に畳む側を通るので、畳まない側を対照にできるのは
+    しきい値を動かせる小さな索引だけ。
+    """
+    from jpr import search as search_module
+
+    def fingerprint() -> list[tuple]:
+        _, results = sample_searcher.search(
+            "チクビ", min_mora=2, max_mora=12, limit=None, exclude_same_reading=False
+        )
+        return [(r.surface, r.reading, r.score, r.phonetic_similarity) for r in results]
+
+    monkeypatch.setattr(search_module, "_GROUP_DEDUPE_MIN_CANDIDATES", 1 << 30)
+    baseline = fingerprint()
+
+    monkeypatch.setattr(search_module, "_GROUP_DEDUPE_MIN_CANDIDATES", 0)
+    assert fingerprint() == baseline
+
+
 def test_default_search_keeps_the_ann_path(sample_searcher: PhoneticSearcher) -> None:
     """範囲を指定しない検索は従来どおり ANN 経路を通る。
 

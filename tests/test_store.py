@@ -48,7 +48,7 @@ def test_metadata_roundtrip(roundtrip: PhoneticStore) -> None:
 
 def test_entries_roundtrip_exactly(roundtrip: PhoneticStore) -> None:
     """可変長エンコードを経ても全フィールドが復元される。"""
-    entry = roundtrip.entry(2)
+    entry = roundtrip.entry(3)
     assert entry.surface == "東京特許許可局"
     assert entry.reading == "トウキョウトッキョキョカキョク"
     assert entry.phonemes == analyze_reading(entry.reading).phonemes
@@ -57,8 +57,49 @@ def test_entries_roundtrip_exactly(roundtrip: PhoneticStore) -> None:
 
 
 def test_all_rows_are_readable(roundtrip: PhoneticStore) -> None:
+    """行は入力順ではなく (モーラ数, 音素列) 順で格納される。"""
     surfaces = [roundtrip.surface(row) for row in range(len(roundtrip))]
-    assert surfaces == ["乳首", "チョコビ", "東京特許許可局", "ラーメン"]
+    assert surfaces == ["乳首", "チョコビ", "ラーメン", "東京特許許可局"]
+
+
+def test_rows_are_sorted_by_mora_count(roundtrip: PhoneticStore) -> None:
+    """モーラ数昇順の格納は `mora_range` のスライスが依存する不変条件。"""
+    moras = roundtrip.mora_counts
+    assert (np.diff(moras) >= 0).all()
+
+
+def test_mora_range_selects_contiguous_rows(roundtrip: PhoneticStore) -> None:
+    """`mora_range` の区間はマスクで選んだ場合と同じ行を指す。"""
+    moras = roundtrip.mora_counts
+    for low, high in [(None, None), (3, 3), (4, None), (None, 3), (2, 4), (99, 99)]:
+        start, end = roundtrip.mora_range(low, high)
+        mask = np.ones(moras.size, dtype=bool)
+        if low is not None:
+            mask &= moras >= low
+        if high is not None:
+            mask &= moras <= high
+        assert np.array_equal(np.arange(start, end), np.flatnonzero(mask)), (low, high)
+
+
+def test_group_ids_fold_identical_phonemes(tmp_path: Path) -> None:
+    """同じ音素列の行は同じグループ ID を持ち、隣接して格納される。"""
+    entries = [
+        make_entry("科学", "カガク", cost=2000),
+        make_entry("価格", "カカク", cost=2000),
+        make_entry("下顎", "カガク", cost=8000),
+        make_entry("化学", "カガク", cost=3000),
+    ]
+    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    store = PhoneticStore(tmp_path)
+
+    groups: dict[tuple[str, ...], set[int]] = {}
+    for row in range(len(store)):
+        groups.setdefault(store.phonemes(row), set()).add(int(store.group_ids[row]))
+    # 音素列とグループが 1 対 1 に対応する。
+    assert all(len(ids) == 1 for ids in groups.values())
+    assert len({next(iter(ids)) for ids in groups.values()}) == len(groups)
+    # 同じグループの行は隣接する (単調非減少)。
+    assert (np.diff(store.group_ids) >= 0).all()
 
 
 def test_phoneme_id_matrix_matches_row_by_row(roundtrip: PhoneticStore) -> None:

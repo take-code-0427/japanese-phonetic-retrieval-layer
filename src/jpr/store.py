@@ -25,7 +25,7 @@ from .distance import PAD_ID, PHONEME_TO_ID, UNKNOWN_PHONEME_ID
 from .embedding import SPACES
 from .index import Category, IndexEntry
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 #: ANN 索引を作る空間。
 #:
@@ -93,11 +93,32 @@ def _decode_string(blob: np.ndarray, boundaries: np.ndarray, row: int) -> str:
     return bytes(blob[start:end]).decode("utf-8")
 
 
+def _locality_order(entries: Sequence[IndexEntry]) -> list[int]:
+    """行の格納順。(モーラ数, 音素列) の昇順に並べる。
+
+    モーラ数で揃えるのは、モーラ範囲の全走査 (`search.py` の `_scan_candidates`)
+    を連続スライスにするため。散らばった行のマスク + fancy indexing は行数に
+    対してコストが急伸する一方 (97 万行の選抜で 191ms)、連続読みなら範囲の
+    行数ぶんの帯域で済む。
+
+    音素列を第 2 キーにするのは、同じ音素列 (同音異表記) を隣接させるため。
+    rerank の編集距離は音素列が同じなら同じ値になるので、隣接していれば
+    先頭行だけ計算して残りへ配れる (`search.py` の `_group_representatives`)。
+    4〜6 モーラ帯の候補 53 万件のうちユニークな音素列は 58.8% しかない。
+
+    stable sort なので同一キー内は入力順が保たれ、構築が決定的になる。
+    """
+    return sorted(range(len(entries)), key=lambda i: (entries[i].mora_count, entries[i].phonemes))
+
+
 def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     """語彙メタデータを NumPy 配列に落とす。
 
     可変長のもの (表層・読み・音素列) は連結した 1 本の配列と各語の終端位置で
     表す (CSR のような持ち方)。音素は記号ではなく ID で持つ。
+
+    entries は `_locality_order` で並んでいる前提。`group_ids` (同じ音素列の
+    連番) は隣接比較で振るので、並んでいなければ同音異表記が別グループに散る。
     """
     surface_blob, surface_bounds = _encode_strings([e.surface for e in entries])
     reading_blob, reading_bounds = _encode_strings([e.reading for e in entries])
@@ -108,14 +129,23 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     category_values = sorted({e.category.value for e in entries})
     category_ids = {value: index for index, value in enumerate(category_values)}
 
-    # 音素列も同様に ID 化して連結する。
+    # 音素列も同様に ID 化して連結する。同時に、同じ (モーラ数, 音素列) が
+    # 続く区間へ同じグループ ID を振る (ソート済みなので隣接比較で足りる)。
     phoneme_ids: list[int] = []
     phoneme_bounds = np.zeros(len(entries) + 1, dtype=np.int64)
+    group_ids = np.zeros(len(entries), dtype=np.int32)
     symbols: dict[str, int] = {}
+    group = -1
+    previous_key: tuple[int, tuple[str, ...]] | None = None
     for row, entry in enumerate(entries):
         for symbol in entry.phonemes:
             phoneme_ids.append(symbols.setdefault(symbol, len(symbols)))
         phoneme_bounds[row + 1] = len(phoneme_ids)
+        key = (entry.mora_count, entry.phonemes)
+        if key != previous_key:
+            group += 1
+            previous_key = key
+        group_ids[row] = group
 
     phoneme_vocabulary = [""] * len(symbols)
     for symbol, index in symbols.items():
@@ -135,6 +165,7 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
         "phoneme_vocabulary": np.array(phoneme_vocabulary, dtype=np.str_),
         "phoneme_ids": np.array(phoneme_ids, dtype=np.uint8),
         "phoneme_bounds": phoneme_bounds,
+        "group_ids": group_ids,
     }
 
 
@@ -161,6 +192,16 @@ class PhoneticStore:
 
         with np.load(self.path / _ENTRIES_FILE, allow_pickle=False) as archive:
             self._data = {name: archive[name] for name in archive.files}
+
+        # 行がモーラ数順であることは v3 の不変条件で、モーラ範囲の連続スライス
+        # (`mora_range`) がこれに依存する。壊れた索引が黙って誤った母集団を
+        # 返すより、開いた時点で落ちるほうがいい。検証は 2ms 程度。
+        moras = self._data["mora_counts"]
+        if moras.size > 1 and np.any(np.diff(moras) < 0):
+            raise ValueError(
+                f"索引の行がモーラ数順に並んでいません: {self.path}\n"
+                "`jpr build-index --force` で再構築してください。"
+            )
 
         self._pos_vocabulary = [str(v) for v in self._data["pos_vocabulary"]]
         self._category_vocabulary = [Category(str(v)) for v in self._data["category_vocabulary"]]
@@ -285,6 +326,30 @@ class PhoneticStore:
     def mora_counts(self) -> np.ndarray:
         return self._data["mora_counts"]
 
+    @property
+    def group_ids(self) -> np.ndarray:
+        """行ごとの音素列グループ ID。同じ (モーラ数, 音素列) の行が同じ値を持つ。
+
+        行は構築時にグループが隣接するよう並べてあるので (`_locality_order`)、
+        この配列は全体で単調非減少。rerank が同音異表記の編集距離を代表 1 件に
+        畳むのに使う。
+        """
+        return self._data["group_ids"]
+
+    def mora_range(self, min_mora: int | None, max_mora: int | None) -> tuple[int, int]:
+        """モーラ数が範囲に入る行の連続区間 [start, end) を返す。
+
+        行はモーラ数の昇順に並んでいるので (`_locality_order`)、範囲の切り出しは
+        二分探索で済み、該当行は必ず連続する。マスク + fancy indexing で選抜する
+        必要がなく、ベクトル行列や列配列をスライスで直接読める。
+        """
+        moras = self._data["mora_counts"]
+        start = 0 if min_mora is None else int(np.searchsorted(moras, min_mora, side="left"))
+        end = (
+            moras.size if max_mora is None else int(np.searchsorted(moras, max_mora, side="right"))
+        )
+        return start, max(start, end)
+
     # --- ベクトルと ANN ---------------------------------------------------
 
     def vectors(self, space: str) -> np.ndarray:
@@ -324,13 +389,25 @@ def write_store(
     m: int = 24,
     progress: object = None,
 ) -> None:
-    """索引をディスクに書く。ANN 索引の構築もここで行う。"""
+    """索引をディスクに書く。ANN 索引の構築もここで行う。
+
+    行は入力順ではなく `_locality_order` (モーラ数, 音素列) で格納する。
+    検索側のモーラ範囲スライスと同音異表記の畳み込みがこの並びに依存する。
+    ベクトル行列も同じ順に並べ替えるので、呼び出し側は entries と vectors の
+    行対応だけ揃えればよい。
+    """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
     def report(message: str) -> None:
         if callable(progress):
             progress(message)
+
+    report("行をモーラ数順に並べ替え中")
+    order = _locality_order(entries)
+    entries = [entries[i] for i in order]
+    permutation = np.asarray(order, dtype=np.int64)
+    vectors = {name: matrix[permutation] for name, matrix in vectors.items()}
 
     report("語彙メタデータを書き出し中")
     np.savez(path / _ENTRIES_FILE, **_encode_entries(entries))

@@ -147,6 +147,15 @@ _PROBE_CANDIDATES = 32768
 #: (実測 -20%〜+14% とばらつき、平均すると得がない)。
 _MAX_PHONEME_WEIGHT_FOR_PRUNING = 0.45
 
+#: 同音異表記の編集距離を代表 1 件に畳む処理 (`_group_representatives`) を
+#: 試みる最小候補数。
+#:
+#: 畳み込み自体のコストは `group_ids` の gather と累積和で候補数に線形。
+#: ANN 経路 (数千件) では距離計算が 1ms 未満しかなく判定のほうが高くつくので、
+#: 全走査経路の規模でだけ効かせる。値そのものに敏感さはない — 損益分岐は
+#: 数千件のどこかで、全走査の候補 (数十万件) とは 2 桁離れている。
+_GROUP_DEDUPE_MIN_CANDIDATES = 8192
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -305,11 +314,11 @@ class PhoneticSearcher:
 
         # 候補生成には 2 つの経路がある。モーラ範囲を指定したときだけ
         # ANN を迂回して母集団を全走査する (`_scan_candidates` 参照)。
-        selection = self._selection_mask(min_mora=min_mora, max_mora=max_mora)
-        if selection is None:
+        bounds = self._mora_bounds(min_mora=min_mora, max_mora=max_mora)
+        if bounds is None:
             rows, embedding_scores = self._ann_candidates(query_vectors, candidates)
         else:
-            rows, embedding_scores = self._scan_candidates(query_vectors, selection)
+            rows, embedding_scores = self._scan_candidates(query_vectors, bounds)
         if rows.size == 0:
             return pronunciation, []
 
@@ -318,7 +327,7 @@ class PhoneticSearcher:
             embedding_scores,
             pronunciation,
             categories,
-            apply_mora_gap=selection is None,
+            bounds=bounds,
         )
         if rows.size == 0:
             return pronunciation, []
@@ -347,6 +356,7 @@ class PhoneticSearcher:
             query_vectors=query_vectors,
             weights=active_weights,
             needed=needed,
+            bounds=bounds,
         )
 
         materialize = partial(
@@ -397,40 +407,36 @@ class PhoneticSearcher:
         Web はレスポンスに含める、MCP は stdio を壊せない) ので、
         `search` から副作用として出さずに問い合わせられるようにしている。
         """
-        mask = self._selection_mask(min_mora=min_mora, max_mora=max_mora)
-        return len(self.store) if mask is None else int(mask.sum())
+        bounds = self._mora_bounds(min_mora=min_mora, max_mora=max_mora)
+        return len(self.store) if bounds is None else bounds[1] - bounds[0]
 
     # --- 段 1: 候補生成 ----------------------------------------------------
 
-    def _selection_mask(
+    def _mora_bounds(
         self,
         *,
         min_mora: int | None,
         max_mora: int | None,
-    ) -> np.ndarray | None:
-        """索引全体から候補生成の母集団を切り出す真偽マスク。
+    ) -> tuple[int, int] | None:
+        """候補生成の母集団になる行の連続区間 [start, end)。
 
         `None` は「絞り込みが指定されていない」= ANN 経路でよい、を表す。
 
-        ここに積める条件は store が列配列で持っている軸に限る
-        (`mora_counts` / `costs` / `category_ids`)。行を Python オブジェクト
-        に起こさずにマスクを立てられるので、ANN を通さずに母集団を決められる。
-        モーラ範囲以外の軸を足すときも、同じように `&=` で条件を積む。
-        カテゴリだけは絞り込みの有無に関わらず常に効くので
-        `_apply_cheap_filters` 側に置いたままにしてある。
+        索引の行はモーラ数の昇順に並んでいるので (`store._locality_order`)、
+        範囲は必ず連続区間になり二分探索で切り出せる (`store.mora_range`)。
+        以前はここで全行の真偽マスクを立てていたが、マスク経由だと下流の
+        すべてが fancy indexing になり、97 万行の選抜で連続読みの 8 倍
+        (48ms 対 6ms) を払っていた。
+
+        モーラ以外の軸で母集団を切りたくなったら、その軸が連続区間に
+        できるか (格納順に含められるか) をまず考える。できない軸は
+        `_apply_cheap_filters` 側でマスクとして積む。
         """
         if min_mora is None and max_mora is None:
             return None
         if min_mora is not None and max_mora is not None and min_mora > max_mora:
             raise ValueError(f"モーラ範囲が逆転しています: {min_mora} > {max_mora}")
-
-        moras = self._mora_counts
-        mask = np.ones(moras.size, dtype=bool)
-        if min_mora is not None:
-            mask &= moras >= min_mora
-        if max_mora is not None:
-            mask &= moras <= max_mora
-        return mask
+        return self.store.mora_range(min_mora, max_mora)
 
     def _ann_candidates(
         self,
@@ -449,34 +455,28 @@ class PhoneticSearcher:
     def _scan_candidates(
         self,
         query_vectors: dict[str, np.ndarray],
-        selection: np.ndarray,
+        bounds: tuple[int, int],
     ) -> tuple[np.ndarray, np.ndarray]:
-        """マスクが立った行を全走査し、内積を直接求める。
+        """モーラ範囲の連続区間を全走査し、内積を直接求める。
 
         ANN を使わない経路。HNSW は phonetic 空間の Top-K しか返さないので、
         モーラ数の違う語は近傍の外に沈んで候補にすら入らない (`search` の
         docstring 参照)。ここでは母集団の全行に対して内積を取るので、
         近傍順位に関わらず rerank の土俵に載る。
 
-        **選んだ行だけを引くのではなく、全行と内積を取ってからマスクする。**
-        直感に反するが実測でこちらが 14 倍速い (97 万行の選抜で 228ms -> 16ms)。
-        `vectors[rows]` の内訳は fancy indexing が 191ms、内積が 7ms で、
-        コストは演算ではなく mmap から飛び飛びに読んだ行を新しい配列へ
-        実体化する部分にある。全行走査は連続読みなので、対象が 2 倍の
-        202 万行あっても順次アクセスの帯域で押し切れる。
-
-        (以前はここで `vectors[rows]` を実体化していた。「全行と内積を取る案は
-        5 倍遅い」と判断していたが、それは編集距離が支配的で内積の差が埋もれて
-        いた頃の測定。編集距離を Rust に移して 26 倍速くなった結果、内積が
-        全走査の中で最大の項目になり、力関係が入れ替わった。)
+        行がモーラ数順に並んでいるので、母集団はスライス 1 本で読める。
+        並べ替える前は「散らばった行の fancy indexing (97 万行で 191ms) を
+        避けるために全 202 万行と内積を取ってからマスクする」という迂回を
+        していたが (48ms)、連続区間なら範囲の行だけの連続読みで済む (6ms)。
         """
-        rows = np.flatnonzero(selection).astype(np.int64)
+        start, end = bounds
+        rows = np.arange(start, end, dtype=np.int64)
         if rows.size == 0:
             return rows, np.zeros(0, dtype=np.float32)
         vectors = self.store.vectors(self.ann_space)
         # 正規化済みベクトルなので内積がそのままコサイン類似度になり、
         # ANN 経路が返すスコアと同じ尺度で揃う。
-        scores = (vectors @ query_vectors[self.ann_space])[rows]
+        scores = vectors[start:end] @ query_vectors[self.ann_space]
         return rows, scores
 
     def _apply_cheap_filters(
@@ -486,21 +486,35 @@ class PhoneticSearcher:
         pronunciation: Pronunciation,
         categories: Iterable[Category] | None,
         *,
-        apply_mora_gap: bool = True,
+        bounds: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """編集距離の前に、配列演算で済む条件で候補を削る。"""
+        """編集距離の前に、配列演算で済む条件で候補を削る。
+
+        `bounds` は全走査経路の連続区間。渡されたときは `rows` がその区間の
+        `arange` そのものなので、列配列をスライスで読める (97 万行の
+        fancy indexing を 1 回省く)。
+        """
         wanted = tuple(categories) if categories is not None else tuple(DEFAULT_CATEGORIES)
         wanted_ids = [self.store.category_id(c) for c in wanted]
         wanted_ids = [i for i in wanted_ids if i >= 0]
         if not wanted_ids:
             return rows[:0], embedding_scores[:0]
-        keep = np.isin(self._category_ids[rows], np.array(wanted_ids, dtype=np.int8))
+
+        if bounds is not None:
+            candidate_categories = self._category_ids[bounds[0] : bounds[1]]
+        else:
+            candidate_categories = self._category_ids[rows]
+        # ID の種類は数個しかないので、`isin` (ソート + 二分探索) ではなく
+        # 真偽表を引く。97 万行で 6.3ms -> 1ms 未満。
+        lookup = np.zeros(max(candidate_categories.max(initial=0), max(wanted_ids)) + 1, dtype=bool)
+        lookup[wanted_ids] = True
+        keep = lookup[candidate_categories]
 
         # モーラ数が大きく離れた語は音韻的な近さとして意味がないので落とす。
         # ただしこれは ANN の候補生成が粗いことを補う安全網なので、呼び出し側が
-        # モーラ範囲を明示したときは適用しない。3 モーラのクエリに 7 モーラを
-        # 要求すると、ギャップ 4 で全件落ちてしまう。
-        if apply_mora_gap:
+        # モーラ範囲を明示したとき (`bounds` あり) は適用しない。3 モーラの
+        # クエリに 7 モーラを要求すると、ギャップ 4 で全件落ちてしまう。
+        if bounds is None:
             gap = np.abs(self._mora_counts[rows].astype(np.int32) - pronunciation.mora_count)
             keep &= gap <= self._MAX_MORA_GAP
 
@@ -517,20 +531,22 @@ class PhoneticSearcher:
         query_vectors: dict[str, np.ndarray],
         weights: ScoreWeights,
         needed: int,
+        bounds: tuple[int, int] | None = None,
     ) -> _ScoredCandidates:
         """候補のスコアと内訳を配列で求める。
 
         `needed` は後段が必要とする件数。これを使って編集距離を計算する候補を
         削るが (`_survivors`)、**上位 `needed` 件の順位とスコアは全件計算した
-        場合と一致する**。
+        場合と一致する**。`bounds` は全走査経路の母集団の連続区間で、
+        rerank 用空間の内積をスライス読みにするために回す (`_space_scores`)。
         """
         store = self.store
         query_ids = phoneme_ids(pronunciation.phonemes)
 
         # ベクトルの内積とモーラ数・一般性は配列演算でまとめて出す。
         # 編集距離より 2 桁安いので、絞り込む前に全候補ぶん出しておく。
-        coda = np.clip(self._space_scores("coda", rows, query_vectors), 0.0, None)
-        vowel = np.clip(self._space_scores("vowel", rows, query_vectors), 0.0, None)
+        coda = np.clip(self._space_scores("coda", rows, query_vectors, bounds), 0.0, None)
+        vowel = np.clip(self._space_scores("vowel", rows, query_vectors, bounds), 0.0, None)
         embedding = np.clip(embedding_scores, 0.0, None)
         candidate_moras = store.mora_counts[rows].astype(np.int32)
         mora = _mora_similarity_array(pronunciation.mora_count, candidate_moras)
@@ -631,6 +647,10 @@ class PhoneticSearcher:
 
         # 上限の高い順に標本を取り、その中で needed 位のスコアを打ち切り線にする。
         probe = np.argpartition(upper, count - _PROBE_CANDIDATES)[count - _PROBE_CANDIDATES :]
+        # 打ち切り線は標本のスコア分布だけから決まるので標本の並び順に意味はない。
+        # 昇順に直しておくと標本の距離計算でも同音異表記の畳み込みが効く
+        # (`_group_representatives` は行の昇順を要求する)。
+        probe.sort()
         probe_phonetic = self._phonetic_scores(rows[probe], query_ids)
         probe_scores = partial[probe] + weights.phoneme * probe_phonetic
         index = max(probe_scores.size - needed, 0)
@@ -650,31 +670,75 @@ class PhoneticSearcher:
         return survivors, phonetic
 
     def _phonetic_scores(self, rows: np.ndarray, query_ids: np.ndarray) -> np.ndarray:
-        """候補行の編集距離ベースの類似度。索引の CSR をそのまま Rust に渡す。"""
+        """候補行の編集距離ベースの類似度。索引の CSR をそのまま Rust に渡す。
+
+        同じ音素列の行 (同音異表記) には同じ距離しか出ないので、代表 1 行だけ
+        計算して残りへ配る (`_group_representatives`)。4〜6 モーラ帯の候補では
+        ユニークな音素列が 58.8% しかなく、距離計算が 4 割減る。
+        """
         blob, bounds, distance_ids = self.store.phoneme_csr
-        distances = edit_distance_csr(query_ids, rows, blob, bounds, distance_ids)
+        representatives = self._group_representatives(rows)
+        if representatives is None:
+            distances = edit_distance_csr(query_ids, rows, blob, bounds, distance_ids)
+        else:
+            leaders, inverse = representatives
+            distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
         return _edit_similarity_array(distances, query_ids.size, self.store.phoneme_lengths(rows))
+
+    def _group_representatives(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """候補行を音素列グループの代表行に畳む。
+
+        戻り値は (代表行, 各候補の代表位置)。代表行の距離を `[inverse]` で
+        gather すれば全候補の距離になる。畳めない・畳む価値がないときは `None`。
+
+        索引の行は同じ音素列が隣接するよう並んでいるので (`store.group_ids`
+        は単調非減少)、`rows` が昇順なら代表判定は隣接比較 1 回で済む。
+        昇順でないのは ANN 経路と `_survivors` の標本抽出だが、前者は
+        `_GROUP_DEDUPE_MIN_CANDIDATES` に届かず、後者は抽出後にソートして
+        渡してくる。ここで昇順を確かめるのは、その前提が崩れたときに
+        黙って違う候補の距離を配らないため (確認は候補数に線形で軽い)。
+        """
+        if rows.size < max(_GROUP_DEDUPE_MIN_CANDIDATES, 2):
+            return None
+        groups = self.store.group_ids[rows]
+        deltas = np.diff(groups)
+        if np.any(deltas < 0):
+            # rows が昇順でない (グループの隣接が保証できない)。
+            return None
+        first = np.empty(rows.size, dtype=bool)
+        first[0] = True
+        np.not_equal(deltas, 0, out=first[1:])
+        leaders = rows[first]
+        if leaders.size == rows.size:
+            return None
+        return leaders, np.cumsum(first) - 1
 
     def _space_scores(
         self,
         space: str,
         rows: np.ndarray,
         query_vectors: dict[str, np.ndarray],
+        bounds: tuple[int, int] | None = None,
     ) -> np.ndarray:
         """指定した空間で候補行のコサイン類似度を出す。
 
-        候補が多いときは **全行と内積を取ってからマスクする**。mmap から行を
-        飛び飛びに引く実体化 (`vectors[rows]`) はコストが行数に対して急に伸びる
-        一方、全行走査は連続読みなので一定で済む。実測の分岐点は候補が全体の
-        1〜2% あたり (coda 48 次元で全行 10ms、5% の 10 万行を引くと 20ms)。
+        候補が多いときは **母集団の連続区間ぜんぶと内積を取ってから選ぶ**。
+        mmap から行を飛び飛びに引く実体化 (`vectors[rows]`) はコストが行数に
+        対して急に伸びる一方、連続読みは帯域で押し切れる。実測の分岐点は
+        候補が母集団の 1〜2% あたり (coda 48 次元で全行 10ms、5% の 10 万行を
+        引くと 20ms)。
 
-        ANN 経路は候補 2000 件 (0.1%) なので分岐点の下、モーラ範囲の全走査は
-        数十万件で上。どちらも通る経路なので件数で切り替える。
+        `bounds` は全走査経路の母集団 (モーラ範囲の連続区間)。カテゴリフィルタ
+        後の候補は区間の 5 割強を占めるので分岐点のはるか上、ANN 経路
+        (`bounds=None`, 候補 2000 件 = 全体の 0.1%) は下。どちらも通るので
+        件数で切り替える。
         """
         vectors = self.store.vectors(space)
         query = query_vectors[space]
-        if rows.size >= self._FULL_SCAN_RATIO * len(self.store):
-            return (vectors @ query)[rows]
+        start, end = bounds if bounds is not None else (0, len(self.store))
+        if rows.size >= self._FULL_SCAN_RATIO * (end - start):
+            positions = rows if start == 0 else rows - start
+            return (vectors[start:end] @ query)[positions]
         return vectors[rows] @ query
 
     def _materialize(

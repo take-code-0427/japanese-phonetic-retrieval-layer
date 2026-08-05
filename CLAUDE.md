@@ -13,14 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                                    # Rust 拡張もここでビルドされる
-uv run pytest                              # テスト
-uv run pytest tests/test_search.py -k dedupe  # 単体テスト 1 つ
-uv run ruff check .                        # lint (line-length 100, RUF001-003 は無効)
 uv run jpr build-index                     # 索引構築。full 辞書で約 10 分 / 2.6GB
 uv run jpr build-index --dict core --force # 小さい辞書で素早く作り直す
-uv run jpr info                            # 索引の語数・空間・カテゴリ内訳
-uv run jpr serve                           # MCP サーバ (stdio)
-uv run jpr serve-web                       # Web フロント (http://127.0.0.1:8000)
 ```
 
 **Rust ツールチェインが必要。** 編集距離は `rust/` の拡張が計算するので
@@ -41,14 +35,6 @@ Rust 側を編集したら `uv sync --reinstall-package jpr-distance` で入れ�
 
 オフライン (索引構築) とオンライン (検索) の 2 経路があり、両者は `store.py` の
 ファイル形式と `embedding.py` の `SPACES` 定義だけで繋がる。
-
-```
-オフライン: dictionary.py → build.py → embedding.py → store.py(write_store)
-            system.dic を直接パース  語彙選別   5 空間ベクトル  npz + npy + HNSW
-
-オンライン: reading.py → phonology.py → embedding.py → search.py
-            Sudachi で読み  音素/モーラ列  クエリを埋め込み  ANN → rerank
-```
 
 検索エンジンには 3 つの窓がある。いずれも `PhoneticSearcher` を呼ぶだけで、
 検索のロジックは持たない。

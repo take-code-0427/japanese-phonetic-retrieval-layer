@@ -36,6 +36,12 @@
   --sans: "Hiragino Sans", "Yu Gothic UI", "Noto Sans JP", system-ui, sans-serif;
 
   --r: 3px;
+
+  /* 画面幅をそのまま使う。モーラ数ごとに列を立てる表示では列数が可変なので、
+   * 中央に固定幅の柱を立てるより横を使い切るほうが列が潰れない。読み物では
+   * ないので行長の上限 (可読性の 70〜80 字) は制約にならない。 */
+  --shell: 100%;
+  --gutter: 32px;
 }
 
 * { box-sizing: border-box; }
@@ -75,8 +81,8 @@ h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.01em; }
   grid-template-columns: auto 1fr;
   gap: 0 18px;
   align-items: center;
-  padding: 26px 32px 0;
-  max-width: 1180px;
+  padding: 26px var(--gutter) 0;
+  max-width: var(--shell);
   margin: 0 auto;
 }
 
@@ -122,9 +128,9 @@ h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.01em; }
 /* ---------- layout ---------- */
 
 main {
-  max-width: 1180px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 26px 32px 64px;
+  padding: 26px var(--gutter) 64px;
 }
 
 .view { display: none; }
@@ -148,11 +154,14 @@ main {
 
 /* ---------- query form ---------- */
 
+/* 幅を使い切るのは結果の列だけ。入力欄まで画面幅に伸ばすと、検索語 3〜4 字に
+ * 対して 2000px の枠ができて的が絞れなくなるので、フォームだけは上限を掛ける。 */
 .query {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto;
+  grid-template-columns: minmax(220px, 520px) auto auto;
   gap: 18px;
   align-items: end;
+  justify-content: start;
 }
 
 .query-main input {
@@ -229,11 +238,13 @@ main {
 .advanced summary:hover { color: var(--ink-dim); }
 .advanced summary:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: 2px; }
 
+/* 絞り込みも入力の一部なので、フォームと同じく画面幅までは伸ばさない。 */
 .advanced-body {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr);
+  grid-template-columns: minmax(260px, 420px) minmax(260px, 520px);
   gap: 26px;
   padding: 16px 0 4px;
+  justify-content: start;
 }
 
 .cats { border: 0; margin: 0; padding: 0; }
@@ -305,6 +316,8 @@ main {
 
 .readout {
   margin-top: 20px;
+  /* クエリ 1 件の情報しか無いので、結果の列と違って横は要らない。 */
+  max-width: 720px;
   padding: 14px 18px;
   background: var(--bg-raised);
   border: 1px solid var(--line);
@@ -322,58 +335,139 @@ main {
 }
 .readout-value { font-family: var(--mono); font-size: 15px; }
 
+/* ---------- モーラ列 ---------- */
+
+/* 幅 SLOT_PX の「枠」を単位に敷き、列は自分の持つ枠数ぶんを span する。
+ * 枠の配り方は JS 側 (`allocateSlots`) — モーラ数ごとに 1 枠、余りは
+ * ヒット数の多いモーラ数へ。auto-fit ではなく実数の repeat を使うのは、
+ * 列が 2 本しかないときに画面幅を分け合わせたいため (auto-fit だと
+ * 最小幅で左に寄る)。
+ *
+ * 枠が全モーラ数に行き渡らない狭い画面では JS が 1 枠ずつに落とすので、
+ * このとき minmax の下限が効いて横スクロールになる。列を潰して詰めるより
+ * スクロールを取るのは、音素チップの並びが折り返すと音の連なりとして
+ * 読めなくなるうえ、行の高さが不揃いになって列をまたいだ順位の
+ * 読み比べができなくなるため。 */
+.mora-columns {
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: repeat(var(--slots, 1), minmax(250px, 1fr));
+  gap: 0 1px;
+  background: var(--line);
+  overflow-x: auto;
+}
+
+.mora-column {
+  grid-column: span var(--span, 1);
+  background: var(--bg);
+  min-width: 0;
+  padding: 0 14px 8px;
+}
+
+/* クエリと同じモーラ数の列を沈めた背景で示す。枠線や色で囲むと
+ * 「そこだけ見ればよい」に読めてしまうが、狙いは逆で、違うモーラ数の列を
+ * 見せるための表示。地の色を変える程度に留める。 */
+.mora-column.is-query-mora { background: var(--bg-raised); }
+
+.mora-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 0 8px;
+  background: inherit;
+  border-bottom: 1px solid var(--line-bright);
+  font-size: 13px;
+}
+.mora-head-count { font-family: var(--mono); font-weight: 600; }
+.mora-column.is-query-mora .mora-head { border-bottom-color: var(--p-alveolar); }
+
+/* 入力との差を符号付きで出す。列の見出しがモーラ数の絶対値しか持たないと、
+ * 入力が何モーラだったかを読み出しまで目を戻して数えることになる。 */
+.mora-head-mark {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--p-alveolar);
+}
+.mora-head-diff {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+.mora-head-num {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+}
+
 /* ---------- results ---------- */
 
-.results { list-style: none; margin: 22px 0 0; padding: 0; }
-
-.result {
-  border-top: 1px solid var(--line);
-  display: grid;
-  /* 語とタグを隣に置く。タグを右端まで飛ばすと、どの行の属性なのか
-   * 目で追わなければならなくなる。 */
-  grid-template-columns: 62px minmax(0, auto) auto 1fr;
-  gap: 0 16px;
-  align-items: center;
+/* 2 枠以上を持つ列は中身を段に割る (--cols は JS が枠数と揃える)。
+ *
+ * 段の区切りは点線。列の境界 (`.mora-columns` の背景から抜ける実線) と
+ * 見た目を変えないと「隣の段は別のモーラ数」と読み違える。同じ実線で
+ * 太さだけ変える案も試したが、1px 対 1px では階層差として読めなかった —
+ * 実線と点線なら「またいでよい区切り」だと一目で分かる。 */
+.results {
+  list-style: none;
+  margin: 0;
   padding: 0;
+  columns: var(--cols, 1);
+  column-gap: 26px;
+  column-rule: 1px dashed var(--line-bright);
 }
-.results .result:last-child { border-bottom: 1px solid var(--line); }
 
+/* 行を段の境界でまたがせない。アライメント帯を開くと行の高さが変わるので、
+ * これが無いと開いた行の続きが次の段の頭に飛んで読めなくなる。 */
+.result { border-bottom: 1px solid var(--line); break-inside: avoid; }
+
+/* 列の中では横幅を当てにできないので縦積み。スコアと語を同じ行に置き、
+ * 読み・音素・タグを下に垂らす。 */
 .result-open {
-  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: subgrid;
+  gap: 5px 0;
+  width: 100%;
   appearance: none;
   background: none;
   border: 0;
   color: inherit;
   font: inherit;
   text-align: left;
-  padding: 13px 4px;
+  padding: 11px 4px;
   cursor: pointer;
-  align-items: center;
-  gap: 0 16px;
   transition: background 0.12s;
 }
-.result-open:hover { background: var(--bg-raised); }
+.result-open:hover { background: var(--bg-sunken); }
 .result-open:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: -2px; }
+
+.result-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
 
 /* スコアは数値と横棒の二重表現。並んだときの差は棒で読み、
  * 絶対値は数値で読む。 */
-.score { font-family: var(--mono); font-size: 15px; font-variant-numeric: tabular-nums; }
+.score {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-dim);
+  flex: none;
+}
 .score-bar {
   display: block;
   height: 2px;
-  margin-top: 4px;
   background: var(--p-alveolar);
   border-radius: 1px;
 }
 
 .result-word { min-width: 0; }
-.word { font-size: 18px; font-weight: 600; }
-.word-reading { font-family: var(--mono); font-size: 12.5px; color: var(--ink-dim); margin-left: 9px; }
-.result-phonemes { margin-top: 6px; }
+.word { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.word-reading { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+.result-phonemes { margin-top: 5px; }
 
-.result-tags { display: flex; gap: 8px; align-items: center; }
+.result-tags { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 .tag {
   font-size: 10.5px;
@@ -395,9 +489,9 @@ main {
 
 /* ---------- 署名: アライメント帯 ---------- */
 
+/* 列の中に開くので、行のグリッドに桁を合わせる必要はなくなった。 */
 .align {
-  grid-column: 1 / -1;
-  padding: 4px 4px 22px 78px;
+  padding: 4px 4px 18px;
   background: var(--bg-sunken);
   border-top: 1px dashed var(--line);
 }
@@ -552,9 +646,9 @@ main {
 /* ---------- legend ---------- */
 
 .legend {
-  max-width: 1180px;
+  max-width: var(--shell);
   margin: 0 auto;
-  padding: 18px 32px 40px;
+  padding: 18px var(--gutter) 40px;
   border-top: 1px solid var(--line);
   display: flex;
   flex-wrap: wrap;
@@ -570,6 +664,7 @@ main {
 /* ---------- responsive ---------- */
 
 @media (max-width: 860px) {
+  :root { --gutter: 24px; }
   .query { grid-template-columns: 1fr; }
   /* プリセットは縦積みにせず 3 等分で残す。縦に積むとファーストビューを
    * 占領して結果が画面外に出る。 */
@@ -581,11 +676,16 @@ main {
 }
 
 @media (max-width: 620px) {
-  .masthead, main, .legend { padding-left: 18px; padding-right: 18px; }
+  :root { --gutter: 18px; }
   body::before { background-size: 44px 100%; }
-  .result, .result-open { grid-template-columns: 54px minmax(0, 1fr); }
-  .result-tags { grid-column: 2; margin-top: 8px; flex-wrap: wrap; }
   .query-main input { font-size: 18px; }
+  /* 列を並べる幅がないので 1 列に落とし、モーラ数ごとに縦に積む。
+   * 見出しが sticky なので、スクロール中もどのモーラ数を見ているか残る。 */
+  .mora-columns { grid-template-columns: 1fr; gap: 1px 0; }
+  /* JS が付けた枠数を打ち消す。段組も 1 段に戻す — 幅が無いので
+   * 段に割ると 1 段あたりが SLOT_PX を大きく下回る。 */
+  .mora-column { grid-column: auto; padding: 0 0 8px; }
+  .results { columns: 1; }
 }
 
 /* 光の演出に頼らないので、動きを止めても情報は失われない。 */

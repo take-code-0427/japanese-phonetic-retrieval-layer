@@ -128,7 +128,10 @@ function scoreBarWidth(score, min, max) {
   return 8 + ((score - min) / (max - min)) * 92;
 }
 
-/** 結果 1 件。クリックで音素アライメントを開く。 */
+/** 結果 1 件。クリックで音素アライメントを開く。
+ *
+ * モーラ列の中に入るので横幅を当てにできない。スコア・語・タグを縦に積み、
+ * モーラ数のタグは持たせない (列の見出しがそれを担う)。 */
 function resultRow(result, queryPhonemes, rank, range) {
   const li = document.createElement("li");
   li.className = "result";
@@ -138,41 +141,39 @@ function resultRow(result, queryPhonemes, rank, range) {
   button.type = "button";
   button.setAttribute("aria-expanded", "false");
 
-  const scoreCell = document.createElement("div");
+  const head = document.createElement("div");
+  head.className = "result-head";
   const score = document.createElement("span");
   score.className = "score";
   score.textContent = result.score.toFixed(3);
+  const word = document.createElement("span");
+  word.className = "word";
+  word.textContent = result.word;
+  head.append(score, word);
+
   const bar = document.createElement("span");
   bar.className = "score-bar";
   bar.style.width = `${scoreBarWidth(result.score, range.min, range.max)}%`;
   bar.title = "棒はこの結果内での相対差。絶対値は数値で読む";
-  scoreCell.append(score, bar);
 
   const wordCell = document.createElement("div");
   wordCell.className = "result-word";
-  const word = document.createElement("span");
-  word.className = "word";
-  word.textContent = result.word;
   const reading = document.createElement("span");
   reading.className = "word-reading";
   reading.textContent = result.reading;
   const phonemes = document.createElement("div");
   phonemes.className = "phonemes result-phonemes";
   renderPhonemes(phonemes, result.phonemes);
-  wordCell.append(word, reading, phonemes);
+  wordCell.append(reading, phonemes);
 
   const tags = document.createElement("div");
   tags.className = "result-tags";
-  const mora = document.createElement("span");
-  mora.className = "tag tag-mora";
-  mora.textContent = `${result.mora_count} モーラ`;
   const category = document.createElement("span");
   category.className = "tag";
   category.textContent = CATEGORY_LABELS[result.category] || result.category;
-  tags.append(mora, category, familiarityMeter(result.familiarity));
+  tags.append(category, familiarityMeter(result.familiarity));
 
-  // 4 列目は余白。タグを右端まで飛ばさず語の隣に留めるための受け皿。
-  button.append(scoreCell, wordCell, tags, document.createElement("span"));
+  button.append(head, bar, wordCell, tags);
   li.append(button);
 
   let panel = null;
@@ -279,6 +280,147 @@ function alignmentNodes(data, result) {
   return [title, track, foot];
 }
 
+/** 1 枠の幅。結果行の中身 (スコア + 語 + 音素チップ列 + タグ) が折り返さずに
+ * 読める最小値を実測で決めた値。これより狭めると音素チップが 2 行に落ちて
+ * 行の高さが不揃いになり、列をまたいだ順位の読み比べができなくなる。 */
+const SLOT_PX = 250;
+
+/** モーラ列に枠を配る。
+ *
+ * 枠は「幅 SLOT_PX の縦 1 本」で、1 モーラ数 = 最低 1 枠。まずモーラ数ごとに
+ * 1 枠ずつ配り、余った枠をヒット数の多いモーラ数から順に 1 枠ずつ足す。
+ * 2 枠以上を持つ列は中身を CSS multi-column で段に割るので、列の見出しは
+ * 1 つのままモーラ数あたりの表示件数が増える。
+ *
+ * 枠が全モーラ数に行き渡らない狭い画面では 1 枠ずつのまま返す
+ * (総枠数が列数を下回る)。この場合は列が SLOT_PX を保って横スクロールになる —
+ * 列を潰して詰めると行が折り返して読めなくなるため。 */
+function allocateSlots(counts, groups, totalSlots) {
+  const slots = new Map(counts.map((count) => [count, 1]));
+  let spare = totalSlots - counts.length;
+  if (spare <= 0) return slots;
+
+  // ヒット数の多い順。同数はモーラ数の小さい順で決定的に (counts は昇順)。
+  const byHits = [...counts].sort((a, b) => groups.get(b).length - groups.get(a).length);
+
+  // 1 周に 1 枠ずつ配る。多い列に一気に寄せると 3 枠目・4 枠目が
+  // 段あたり数件しかない痩せた段になるので、幅は広く分け合わせる。
+  while (spare > 0) {
+    let placed = false;
+    for (const count of byHits) {
+      if (spare === 0) break;
+      // 1 段あたり最低 4 件は入れる。件数の少ない列に枠を足しても
+      // 空白が伸びるだけで、他の列から幅を奪う損のほうが大きい。
+      if (groups.get(count).length < (slots.get(count) + 1) * 4) continue;
+      slots.set(count, slots.get(count) + 1);
+      spare -= 1;
+      placed = true;
+    }
+    // どの列も枠を受け取れないなら余りは捨てる (全列が短い場合)。
+    if (!placed) break;
+  }
+  return slots;
+}
+
+/** 結果をモーラ数ごとの列に分けて描く。
+ *
+ * モーラ数の違う語は phonetic 空間の近傍に入らない (「乳首」3 モーラに対する
+ * 「筑前煮」5 モーラ) ので、混ぜて 1 列に並べるとスコア上位を同モーラの語が
+ * 埋め、モーラ数の違う候補が下に押し出されて見えなくなる。列に分けると
+ * 各モーラ数の中での順位が読めるようになる。
+ *
+ * 列は結果に現れたモーラ数だけ立てる。クエリと同じモーラ数の列には印を付ける。
+ * 画面幅に余りがあればヒット数の多いモーラ数の列を段組にして埋める
+ * (`allocateSlots`)。 */
+function renderMoraColumns(container, results, queryPhonemes, queryMora, range) {
+  // 順位はモーラ数をまたいだ全体順位。列に分けても「全体で何位か」は
+  // 情報として残す必要があるので、束ねる前に振っておく。
+  const groups = new Map();
+  results.forEach((result, i) => {
+    if (!groups.has(result.mora_count)) groups.set(result.mora_count, []);
+    groups.get(result.mora_count).push({ result, rank: i + 1 });
+  });
+
+  const counts = [...groups.keys()].sort((a, b) => a - b);
+
+  // 入る枠数は container の実幅から出す。列間の 1px は無視できる誤差。
+  // clientWidth が 0 になるのは検索ビューが非表示のときだけ。そのときは
+  // ビューポートから main の左右 padding を引いて見積もる (実測できないので
+  // 多めに配らないよう控えめに引く)。
+  const available =
+    container.clientWidth ||
+    document.documentElement.clientWidth - 2 * 32;
+  const totalSlots = Math.max(counts.length, Math.floor(available / SLOT_PX));
+  const slots = allocateSlots(counts, groups, totalSlots);
+
+  // grid は枠を単位に敷く。列は自分が持つ枠数ぶんの span を取る。
+  const gridSlots = [...slots.values()].reduce((a, b) => a + b, 0);
+  container.style.setProperty("--slots", String(gridSlots));
+  container.replaceChildren(
+    ...counts.map((count) => {
+      const items = groups.get(count);
+      const span = slots.get(count);
+      const column = document.createElement("section");
+      column.className = "mora-column";
+      column.style.setProperty("--span", String(span));
+      if (count === queryMora) column.classList.add("is-query-mora");
+
+      const head = document.createElement("h3");
+      head.className = "mora-head";
+      const label = document.createElement("span");
+      label.className = "mora-head-count";
+      label.textContent = `${count} モーラ`;
+      head.append(label);
+      if (count === queryMora) {
+        const mark = document.createElement("span");
+        mark.className = "mora-head-mark";
+        mark.textContent = "入力と同じ";
+        head.append(mark);
+      } else {
+        const diff = count - queryMora;
+        const mark = document.createElement("span");
+        mark.className = "mora-head-diff";
+        mark.textContent = `${diff > 0 ? "+" : "−"}${Math.abs(diff)}`;
+        mark.title = `入力より ${Math.abs(diff)} モーラ ${diff > 0 ? "長い" : "短い"}`;
+        head.append(mark);
+      }
+      const num = document.createElement("span");
+      num.className = "mora-head-num";
+      num.textContent = `${items.length}`;
+      head.append(num);
+
+      const list = document.createElement("ol");
+      list.className = "results";
+      // 段数は枠数と一致させる。ここを CSS の column-width に任せると
+      // 枠の配り方 (allocateSlots) と段数がずれて、余りを配ったはずの列が
+      // 1 段のまま残る。
+      list.style.setProperty("--cols", String(span));
+      list.append(...items.map(({ result, rank }) => resultRow(result, queryPhonemes, rank, range)));
+
+      column.append(head, list);
+      return column;
+    }),
+  );
+}
+
+/** 直近の描画の入力。幅が変わったときに枠を配り直すために持つ。
+ * 検索を投げ直さずに再配分できるので、全走査 (数百 ms) の結果を
+ * ウィンドウ幅を変えるたびに捨てずに済む。 */
+let lastRender = null;
+
+function renderResults(results, queryPhonemes, queryMora, range) {
+  lastRender = { results, queryPhonemes, queryMora, range };
+  renderMoraColumns($("results"), results, queryPhonemes, queryMora, range);
+}
+
+/** 幅の変化で枠数が変わったときだけ描き直す。開いていたアライメント帯は
+ * 閉じるが、これは段組の段割りが行の高さに依存するため避けられない。 */
+function relayoutResults() {
+  if (!lastRender?.results.length) return;
+  const { results, queryPhonemes, queryMora, range } = lastRender;
+  renderMoraColumns($("results"), results, queryPhonemes, queryMora, range);
+}
+
 async function runSearch(event) {
   event?.preventDefault();
   const query = $("q").value.trim();
@@ -311,10 +453,7 @@ async function runSearch(event) {
 
     const scores = data.results.map((r) => r.score);
     const range = { min: Math.min(...scores), max: Math.max(...scores) };
-    const list = $("results");
-    list.replaceChildren(
-      ...data.results.map((result, i) => resultRow(result, data.phonemes, i + 1, range)),
-    );
+    renderResults(data.results, data.phonemes, data.mora_count, range);
 
     if (!data.results.length) {
       // 全走査では候補数を増やしても何も変わらないので、助言を変える。
@@ -337,6 +476,7 @@ async function runSearch(event) {
     const shared = new URLSearchParams({ q: query, preset: activePreset });
     if ($("min-mora").value) shared.set("min_mora", $("min-mora").value);
     if ($("max-mora").value) shared.set("max_mora", $("max-mora").value);
+    if ($("limit").value !== "20") shared.set("limit", $("limit").value);
     history.replaceState(null, "", `?${shared}`);
   } catch (error) {
     setStatus(status, error.message, true);
@@ -541,6 +681,17 @@ async function main() {
     tab.addEventListener("click", () => selectView(tab.dataset.view));
   }
 
+  // 幅が変わると入る枠数が変わる。枠数が変わったときだけ描き直す —
+  // 1px 単位の resize ごとに 200 行を作り直すと重い。
+  let lastSlots = 0;
+  new ResizeObserver((entries) => {
+    const width = entries[0].contentRect.width;
+    const slots = Math.floor(width / SLOT_PX);
+    if (slots === lastSlots) return;
+    lastSlots = slots;
+    relayoutResults();
+  }).observe($("results"));
+
   for (const seg of document.querySelectorAll(".seg")) {
     seg.addEventListener("click", () => {
       activePreset = seg.dataset.preset;
@@ -583,6 +734,10 @@ async function main() {
   const maxMora = params.get("max_mora");
   if (minMora) $("min-mora").value = minMora;
   if (maxMora) $("max-mora").value = maxMora;
+  // 件数も URL から復元する。列の詰まり方は件数で変わるので、
+  // これが効かないと共有された URL が同じ画面を再現しない。
+  const limit = params.get("limit");
+  if (limit) $("limit").value = limit;
   // 共有された URL でモーラ範囲が効いているなら、絞り込みを開いて見せる。
   if (minMora || maxMora) document.querySelector(".advanced")?.setAttribute("open", "");
 

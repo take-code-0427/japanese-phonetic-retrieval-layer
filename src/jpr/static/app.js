@@ -30,8 +30,12 @@ const VOWEL_LABELS = { i: "前舌・狭", e: "前舌・半狭", a: "中舌・広
 
 const SPECIAL_LABELS = { R: "長音", Q: "促音", N: "撥音" };
 
-/** 音素の素性表。/api/phonemes で埋める。 */
+/** 音素の素性表と IPA。/api/phonemes で埋める。 */
 let features = { consonants: {}, vowels: {}, special: {} };
+
+/** 音素チップに IPA を併記するか。チップは色・title で既に情報を持っており、
+ *  結果行ごとに並ぶので、常時併記すると密度が上がりすぎる。既定は off。 */
+let showIpa = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -63,18 +67,57 @@ function phonemeColor(symbol) {
   return "var(--special)";
 }
 
+/** 音素 1 つの IPA。表は API から来るので UI 側に固定表を持たない。 */
+function phonemeIpa(symbol) {
+  return (
+    features.consonants[symbol]?.ipa ||
+    features.vowels[symbol]?.ipa ||
+    features.special[symbol]?.ipa ||
+    ""
+  );
+}
+
+/** 音素記号と IPA が別物として読めるか。
+ *
+ * 単純な !== では足りない。IPA の [ɡ] (U+0261 一本足の g) は ASCII の "g" と
+ * 別のコードポイントだが画面上ほぼ同形で、併記しても情報が増えず幅だけ増える。
+ * 同じことが起きる対をここで潰す。 */
+const _LOOKALIKE = { g: "ɡ" };
+
+/** 促音。チップ単体では IPA を出さない。
+ *
+ * 促音の実現は後続子音の重複 (キッテ = [kitte]) で、音素 1 つに対応する記号を
+ * 持たない。API が返す [ʔ] は語末促音の実現だが、チップは後続を見ないので
+ * 語中でもそれを出してしまい、連続表記 (サーバ側で重複に書き換える) と食い違う。
+ * 促音の音価は連続表記のほうで読ませる。 */
+const _NO_STANDALONE_IPA = new Set(["Q"]);
+
+function ipaDiffers(symbol) {
+  if (_NO_STANDALONE_IPA.has(symbol)) return false;
+  const ipa = phonemeIpa(symbol);
+  if (!ipa || ipa === symbol) return false;
+  return _LOOKALIKE[symbol] !== ipa;
+}
+
 /** 音素の読み方の説明。チップの title に入れる。 */
 function phonemeTitle(symbol) {
+  const ipa = phonemeIpa(symbol);
+  // IPA を先頭に置く。併記が off のときも title からは読めるようにする。
+  // title は幅の制約が無いので、見分けのつかない対 (g/ɡ) も含めて出す。
+  let head = ipa && ipa !== symbol ? `${symbol} [${ipa}]` : symbol;
+  // 促音だけは単独の記号を持たない。[ʔ] と書くと語中でも声門閉鎖に見えるので、
+  // 何が起きるかを言葉で説明する (`_NO_STANDALONE_IPA`)。
+  if (_NO_STANDALONE_IPA.has(symbol)) head = `${symbol} (後続子音の重複、語末では [ʔ])`;
   const consonant = features.consonants[symbol];
   if (consonant) {
     const parts = [PLACE_LABELS[consonant.place] || consonant.place, consonant.manner];
     parts.push(consonant.voiced ? "有声" : "無声");
     if (consonant.palatalized) parts.push("口蓋化");
-    return `${symbol} — ${parts.join(" / ")}`;
+    return `${head} — ${parts.join(" / ")}`;
   }
-  if (features.vowels[symbol]) return `${symbol} — 母音 ${VOWEL_LABELS[symbol] || ""}`.trim();
-  if (SPECIAL_LABELS[symbol]) return `${symbol} — ${SPECIAL_LABELS[symbol]}`;
-  return symbol;
+  if (features.vowels[symbol]) return `${head} — 母音 ${VOWEL_LABELS[symbol] || ""}`.trim();
+  if (SPECIAL_LABELS[symbol]) return `${head} — ${SPECIAL_LABELS[symbol]}`;
+  return head;
 }
 
 function phonemeChip(symbol) {
@@ -92,17 +135,40 @@ function phonemeChip(symbol) {
     el.classList.add("is-voiced");
   }
   el.title = phonemeTitle(symbol);
+
+  // IPA が記号と見分けのつかない字なら併記しても情報が増えないので出さない。
+  if (showIpa && ipaDiffers(symbol)) {
+    const ipa = phonemeIpa(symbol);
+    const sub = document.createElement("span");
+    sub.className = "ph-ipa";
+    sub.textContent = ipa;
+    el.append(sub);
+  }
   return el;
 }
 
 function renderPhonemes(container, symbols) {
+  // 再描画のために元の音素列を持たせる。IPA の併記を切り替えたとき、
+  // 画面に出ている全チップを引き直さずに組み直せる。
+  container.dataset.phonemes = JSON.stringify(symbols);
   container.replaceChildren(...symbols.map(phonemeChip));
+}
+
+/** 描画済みの音素チップを組み直す。IPA 併記の切り替えで使う。 */
+function rerenderAllPhonemes() {
+  for (const container of document.querySelectorAll(".phonemes[data-phonemes]")) {
+    renderPhonemes(container, JSON.parse(container.dataset.phonemes));
+  }
 }
 
 /* ---------- 検索 ---------- */
 
 let activePreset = "pun";
 const activeCategories = new Set();
+
+/** 直近の検索クエリの IPA。アライメントパネルが候補側と並べて出す。
+ *  renderResults から 4 段渡すことになるので引数にせず、ここに置く。 */
+let queryIpa = "";
 
 function familiarityMeter(value) {
   // 4 段。Sudachi のコスト由来の弱い指標なので連続値のバーにはしない。
@@ -158,13 +224,27 @@ function resultRow(result, queryPhonemes, rank, range) {
 
   const wordCell = document.createElement("div");
   wordCell.className = "result-word";
+
+  // 読みと IPA を同じ行に並べる。カードは縦に積む要素が多いので行を増やさない。
+  // **IPA は音素チップの併記トグルとは独立に常に出す** — 発音そのものを読む
+  // 表記であって、音素記号の注釈ではない。
+  const readingRow = document.createElement("div");
+  readingRow.className = "result-reading-row";
   const reading = document.createElement("span");
   reading.className = "word-reading";
   reading.textContent = result.reading;
+  readingRow.append(reading);
+  if (result.ipa) {
+    const ipa = document.createElement("span");
+    ipa.className = "ipa word-ipa";
+    ipa.textContent = `[${result.ipa}]`;
+    readingRow.append(ipa);
+  }
+
   const phonemes = document.createElement("div");
   phonemes.className = "phonemes result-phonemes";
   renderPhonemes(phonemes, result.phonemes);
-  wordCell.append(reading, phonemes);
+  wordCell.append(readingRow, phonemes);
 
   const tags = document.createElement("div");
   tags.className = "result-tags";
@@ -210,6 +290,24 @@ function alignmentNodes(data, result) {
   const title = document.createElement("p");
   title.className = "align-title";
   title.textContent = "音素の対応 — 上がクエリ、下が候補。縦棒は素性距離";
+
+  // クエリ側の連続表記だけを置く。候補側は同じカードの読みの隣に常時出ているので、
+  // ここに並べると 1 枚のカードに同じ IPA が 2 回出る。下の対応は上段がクエリ・
+  // 下段が候補なので、上段が何の発音かをここで示す。
+  const ipaRow = document.createElement("p");
+  ipaRow.className = "align-ipa";
+  if (queryIpa) {
+    const cell = document.createElement("span");
+    cell.className = "align-ipa-cell";
+    const tag = document.createElement("span");
+    tag.className = "readout-label";
+    tag.textContent = "クエリ";
+    const value = document.createElement("span");
+    value.className = "ipa";
+    value.textContent = `[${queryIpa}]`;
+    cell.append(tag, value);
+    ipaRow.append(cell);
+  }
 
   const track = document.createElement("div");
   track.className = "align-track";
@@ -277,13 +375,29 @@ function alignmentNodes(data, result) {
     foot.append(span);
   }
 
-  return [title, track, foot];
+  return ipaRow.childElementCount ? [title, ipaRow, track, foot] : [title, track, foot];
 }
 
 /** 1 枠の幅。結果行の中身 (スコア + 語 + 音素チップ列 + タグ) が折り返さずに
  * 読める最小値を実測で決めた値。これより狭めると音素チップが 2 行に落ちて
- * 行の高さが不揃いになり、列をまたいだ順位の読み比べができなくなる。 */
+ * 行の高さが不揃いになり、列をまたいだ順位の読み比べができなくなる。
+ *
+ * **成り立つのは 4 モーラ程度まで。** 実測で 3 モーラ (6 音素) のチップ列は
+ * 179px で収まるが、5〜6 モーラ (17〜18 音素) は 636px を要求し、既定の 250px
+ * では 20 行すべてが折り返す。長い語の検索では前提が崩れているが、枠をそこに
+ * 合わせると 1 画面に 2 列しか入らないので、多数派の短い語を基準に置いている。 */
 const SLOT_PX = 250;
+
+/** IPA を併記したときの 1 枠の幅。
+ *
+ * 併記でチップが広がる。3 モーラのチップ列は 179px → 268px (+50%) になり、
+ * 250px の枠では行の内寸 (253px) に 15px 足りずに折り返す。**既定の検索で
+ * 最も多い長さがそこなので、ここは枠を広げて合わせる**。上の SLOT_PX が
+ * 「4 モーラまで」なのと同じ考え方で、比例させた値を実測で確かめてある。 */
+const SLOT_PX_IPA = 340;
+
+/** 現在の 1 枠の幅。IPA 併記の状態で切り替わる。 */
+const slotPx = () => (showIpa ? SLOT_PX_IPA : SLOT_PX);
 
 /** モーラ列に枠を配る。
  *
@@ -350,12 +464,15 @@ function renderMoraColumns(container, results, queryPhonemes, queryMora, range) 
   const available =
     container.clientWidth ||
     document.documentElement.clientWidth - 2 * 32;
-  const totalSlots = Math.max(counts.length, Math.floor(available / SLOT_PX));
+  const totalSlots = Math.max(counts.length, Math.floor(available / slotPx()));
   const slots = allocateSlots(counts, groups, totalSlots);
 
   // grid は枠を単位に敷く。列は自分が持つ枠数ぶんの span を取る。
   const gridSlots = [...slots.values()].reduce((a, b) => a + b, 0);
   container.style.setProperty("--slots", String(gridSlots));
+  // 枠の下限も IPA の状態に連動させる。CSS 側に固定値を残すと、枠数だけ
+  // 減って 1 枠が広がらず、結局チップが折り返す。
+  container.style.setProperty("--slot-px", `${slotPx()}px`);
   container.replaceChildren(
     ...counts.map((count) => {
       const items = groups.get(count);
@@ -447,6 +564,8 @@ async function runSearch(event) {
     const elapsed = Math.round(performance.now() - started);
 
     $("rq-reading").textContent = data.reading || "(読みが取れない)";
+    queryIpa = data.ipa || "";
+    $("rq-ipa").textContent = queryIpa ? `[${queryIpa}]` : "";
     $("rq-mora").textContent = `${data.mora_count}`;
     renderPhonemes($("rq-phonemes"), data.phonemes);
     $("query-readout").hidden = false;
@@ -501,6 +620,7 @@ async function runPronounce(event) {
     $("pa-text").textContent = data.text;
     $("pa-reading").textContent = data.reading || "(読みが取れない)";
     $("pa-count").textContent = `${data.mora_count} モーラ / ${data.phonemes.length} 音素`;
+    $("pa-ipa").textContent = data.ipa ? `[${data.ipa}]` : "—";
 
     const moras = $("pa-moras");
     moras.replaceChildren(
@@ -651,7 +771,9 @@ function renderLegend() {
       const dot = document.createElement("span");
       dot.className = "legend-dot";
       dot.style.background = `var(--v-${symbol})`;
-      item.append(dot, `${symbol} ${VOWEL_LABELS[symbol] || ""}`.trim());
+      // /u/ のように記号と IPA が食い違う母音があるので、凡例では常に併記する。
+      const head = ipaDiffers(symbol) ? `${symbol} [${phonemeIpa(symbol)}]` : symbol;
+      item.append(dot, `${head} ${VOWEL_LABELS[symbol] || ""}`.trim());
       return item;
     }),
   );
@@ -686,11 +808,42 @@ async function main() {
   let lastSlots = 0;
   new ResizeObserver((entries) => {
     const width = entries[0].contentRect.width;
-    const slots = Math.floor(width / SLOT_PX);
+    const slots = Math.floor(width / slotPx());
     if (slots === lastSlots) return;
     lastSlots = slots;
     relayoutResults();
   }).observe($("results"));
+
+  // IPA の併記。素性表を読む前に押されても困らないよう、状態だけ持って
+  // 描画は下の 2 つに任せる。
+  const ipaToggle = $("ipa-toggle");
+  const applyIpaToggle = () => {
+    ipaToggle.classList.toggle("is-on", showIpa);
+    ipaToggle.setAttribute("aria-pressed", String(showIpa));
+    // 併記でチップの幅が変わるので、結果は枠から配り直す (SLOT_PX_IPA)。
+    // チップだけ差し替えると枠が足りずに折り返す。
+    relayoutResults();
+    // 結果の外 (クエリの読み・読みビュー・開いている対応帯) は枠を持たないので
+    // チップだけ組み直す。
+    rerenderAllPhonemes();
+  };
+  ipaToggle.addEventListener("click", () => {
+    showIpa = !showIpa;
+    // 表示の好みは検索条件と違って共有する対象ではないので URL ではなく
+    // localStorage に置く。
+    try {
+      localStorage.setItem("jpr.showIpa", showIpa ? "1" : "");
+    } catch {
+      // プライベートモードでは書けない。表示は切り替わるので黙って続ける。
+    }
+    applyIpaToggle();
+  });
+  try {
+    showIpa = localStorage.getItem("jpr.showIpa") === "1";
+  } catch {
+    showIpa = false;
+  }
+  applyIpaToggle();
 
   for (const seg of document.querySelectorAll(".seg")) {
     seg.addEventListener("click", () => {

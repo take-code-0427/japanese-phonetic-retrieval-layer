@@ -7,14 +7,17 @@ import pytest
 
 from jpr.distance import (
     _ALL_PHONEMES,
+    _IPA,
     PAD_ID,
     SUBSTITUTION_COSTS,
     WORST_SUBSTITUTION_COST,
     align_phonemes,
     edit_distance_batch,
     edit_distance_csr,
+    ipa_transcription,
     phoneme_distance,
     phoneme_ids,
+    phoneme_ipa,
     phonetic_similarity,
     weighted_edit_distance,
 )
@@ -266,3 +269,67 @@ def test_alignment_preserves_both_sequences() -> None:
 def test_alignment_labels_operations() -> None:
     pairs = align_phonemes(("ch", "i", "k", "u"), ("t", "i", "k", "u"))
     assert [op for _, _, _, op in pairs] == ["sub", "match", "match", "match"]
+
+
+# --- IPA 表記 ---------------------------------------------------------------
+
+
+def test_every_phoneme_has_an_ipa_entry() -> None:
+    """IPA 表が全音素を覆う。
+
+    `phoneme_ipa` は未知の記号をそのまま返すので、表から漏れた音素は例外にならず
+    **表示だけが黙ってヘボン式のまま残る**。素性表に音素を足したときにここで
+    気付けるよう、表のキーを直接見る (同じ字を当てる音素 k / a / v などがあるため、
+    戻り値の比較では漏れを検出できない)。
+    """
+    missing = [symbol for symbol in _ALL_PHONEMES if symbol not in _IPA]
+    assert not missing, f"IPA 表に無い音素: {missing}"
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        ("チクビ", "t͡ɕikɯbi"),
+        ("テクビ", "tekɯbi"),
+        # /u/ は円唇性が弱いので [ɯ]。素性表の rounded=False と対応する。
+        ("スシ", "sɯɕi"),
+        # /f/ は [ɸ] (両唇)。綴りに引かれて [f] にしないことの担保。
+        ("フトン", "ɸɯtoɴ"),
+        # ヴ は借用語の [v] で、こちらは唇歯音。
+        ("ヴァイオリン", "vaioɾiɴ"),
+        # 長音は長さ記号。
+        ("トーキョー", "toːkʲoː"),
+        # 拗音は口蓋化の補助記号 1 つで写す。
+        ("キャク", "kʲakɯ"),
+    ],
+)
+def test_ipa_transcription(reading: str, expected: str) -> None:
+    assert ipa_transcription(analyze_reading(reading).phonemes) == expected
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        # 促音は後続子音の重複。単独記号の [ʔ] を語中に置くと実際には起きない
+        # 声門閉鎖を書いたことになる。
+        ("キッテ", "kitte"),
+        ("ガッコウ", "ɡakkoɯ"),
+        ("イッショ", "iɕɕo"),
+        # 破擦音の重複は先頭の 1 文字だけを重ねる ([t͡ɕt͡ɕ] にはしない)。
+        ("ハッチャク", "hatt͡ɕakɯ"),
+        ("バッジ", "badd͡ʑi"),
+        # 語末促音は後続が無いので声門閉鎖のまま残る。
+        ("アッ", "aʔ"),
+    ],
+)
+def test_geminate_becomes_doubled_consonant(reading: str, expected: str) -> None:
+    assert ipa_transcription(analyze_reading(reading).phonemes) == expected
+
+
+def test_ipa_transcription_of_empty_sequence() -> None:
+    assert ipa_transcription(()) == ""
+
+
+def test_unknown_phoneme_passes_through() -> None:
+    """未知の記号は落とさずそのまま返す。表示が黙って欠けるのを避ける。"""
+    assert phoneme_ipa("zzz") == "zzz"

@@ -34,9 +34,10 @@ def test_similar_returns_reading_and_results(client: TestClient) -> None:
     assert payload["reading"] == "チクビ"
     assert payload["phonemes"] == ["ch", "i", "k", "u", "b", "i"]
     assert payload["mora_count"] == 3
+    assert payload["ipa"] == "t͡ɕikɯbi"
     assert len(payload["results"]) <= 5
     for result in payload["results"]:
-        assert set(result) >= {"word", "reading", "score", "phonemes", "category"}
+        assert set(result) >= {"word", "reading", "score", "phonemes", "ipa", "category"}
 
 
 def test_similar_filters_by_category(client: TestClient) -> None:
@@ -107,12 +108,16 @@ def test_pronounce_returns_mora_structure(client: TestClient) -> None:
     assert payload["mora_count"] == 4
     # 長音は直前の母音を引き継ぐ。
     assert payload["vowel_skeleton"] == ["a", "a", "e", "N"]
+    # 長音は IPA では長さ記号。撥音は語末の実現 [ɴ]。
+    assert payload["ipa"] == "ɾaːmeɴ"
 
 
 def test_compare_returns_space_breakdown(client: TestClient) -> None:
     payload = client.get("/api/compare", params={"a": "科学", "b": "価格"}).json()
     assert payload["a"]["reading"] == "カガク"
     assert payload["b"]["reading"] == "カカク"
+    # IPA の [ɡ] は ASCII の g と別のコードポイント。有声性の差がここに出る。
+    assert (payload["a"]["ipa"], payload["b"]["ipa"]) == ("kaɡakɯ", "kakakɯ")
     assert 0.0 <= payload["similarity"] <= 1.0
     assert set(payload["spaces"]) >= {"consonant", "vowel", "coda", "rhythm"}
 
@@ -130,16 +135,31 @@ def test_info_reports_index_metadata(client: TestClient, sample_store: PhoneticS
 
 
 def test_phonemes_exposes_features(client: TestClient) -> None:
-    """フロントは音素チップの色をこの素性表から決めるので、素性が揃っている必要がある。"""
+    """フロントは音素チップの色と IPA をこの表から決めるので、揃っている必要がある。"""
     payload = client.get("/api/phonemes").json()
     assert payload["consonants"]["k"] == {
         "place": "velar",
         "manner": "stop",
         "voiced": False,
         "palatalized": False,
+        "ipa": "k",
     }
-    assert payload["vowels"]["i"] == {"height": 0, "backness": 0, "rounded": False}
+    assert payload["vowels"]["i"] == {
+        "height": 0,
+        "backness": 0,
+        "rounded": False,
+        "ipa": "i",
+    }
     assert set(payload["special"]) == {"R", "Q", "N"}
+    assert payload["special"]["N"] == {"label": "撥音", "ipa": "ɴ"}
+
+
+def test_phonemes_ipa_covers_every_symbol(client: TestClient) -> None:
+    """IPA が欠けた音素があるとチップの併記だけが黙って空になるので、全件を要求する。"""
+    payload = client.get("/api/phonemes").json()
+    for group in ("consonants", "vowels"):
+        missing = [symbol for symbol, f in payload[group].items() if not f["ipa"]]
+        assert not missing, f"{group} に IPA が無い: {missing}"
 
 
 def test_align_pairs_sum_to_edit_distance(client: TestClient) -> None:

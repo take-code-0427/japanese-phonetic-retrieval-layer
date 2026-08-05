@@ -13,6 +13,7 @@ from typing import Any
 
 from mcp.server import MCPServer
 
+from .distance import ipa_transcription
 from .index import Category
 from .search import DEFAULT_CANDIDATES, PRESETS, PhoneticSearcher
 from .store import PhoneticStore, default_store_path
@@ -42,7 +43,11 @@ _COMPARE_DESCRIPTION = """\
 も返すので、「どこが似ているのか」を判断できる。"""
 
 _PRONOUNCE_DESCRIPTION = """\
-日本語テキストの読み・音素列・モーラ構造を返す。索引を引かずに音韻表現だけを得る。"""
+日本語テキストの読み・音素列・IPA (国際音声記号)・モーラ構造を返す。索引を引かずに
+音韻表現だけを得る。
+
+`phonemes` は内部の音素記号 (ヘボン式寄りの ASCII)、`ipa` は同じものの IPA 表記。
+発音を人に示すときや他言語の音と比べるときは `ipa` を使う。"""
 
 #: MCP が 1 回に返す件数の上限。LLM のコンテキストを溢れさせないため、
 #: CLI や Web と違って無制限は露出しない。
@@ -136,6 +141,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
             "query": query,
             "reading": pronunciation.reading,
             "phonemes": list(pronunciation.phonemes),
+            "ipa": ipa_transcription(pronunciation.phonemes),
             "mora_count": pronunciation.mora_count,
             "preset": preset,
             "min_mora": min_mora,
@@ -176,11 +182,13 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                     "text": comparison.a_text,
                     "reading": comparison.a_reading,
                     "phonemes": list(comparison.a_phonemes),
+                    "ipa": ipa_transcription(comparison.a_phonemes),
                 },
                 "b": {
                     "text": comparison.b_text,
                     "reading": comparison.b_reading,
                     "phonemes": list(comparison.b_phonemes),
+                    "ipa": ipa_transcription(comparison.b_phonemes),
                 },
                 "phonetic_similarity": comparison.similarity,
                 "phonetic_distance": comparison.distance,
@@ -203,6 +211,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                 "text": text,
                 "reading": pronunciation.reading,
                 "phonemes": list(pronunciation.phonemes),
+                "ipa": ipa_transcription(pronunciation.phonemes),
                 "mora_count": pronunciation.mora_count,
                 "moras": [m.kana or m.special for m in pronunciation.moras],
                 "vowel_skeleton": list(pronunciation.vowel_skeleton),

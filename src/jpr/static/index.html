@@ -26,11 +26,22 @@
       意味ではなく<em>発音の近さ</em>だけを引く。<span id="corpus-note">索引を読み込み中…</span>
     </p>
   </div>
-  <nav class="tabs" role="tablist" aria-label="機能">
-    <button role="tab" class="tab is-active" data-view="search" aria-selected="true">検索</button>
-    <button role="tab" class="tab" data-view="pronounce" aria-selected="false">読み</button>
-    <button role="tab" class="tab" data-view="info" aria-selected="false">索引</button>
-  </nav>
+  <!-- タブ行。右端に表示設定を載せる。トグルを tablist の中に入れないのは、 -->
+  <!-- tab でない要素をタブとして読まれるため。 -->
+  <div class="tabbar">
+    <nav class="tabs" role="tablist" aria-label="機能">
+      <button role="tab" class="tab is-active" data-view="search" aria-selected="true">検索</button>
+      <button role="tab" class="tab" data-view="pronounce" aria-selected="false">読み</button>
+      <button role="tab" class="tab" data-view="info" aria-selected="false">索引</button>
+    </nav>
+    <!-- 全ビューに効く表示設定。検索条件ではないので絞り込み (details) には入れない。 -->
+    <!-- 語全体の IPA は結果カードに常時出るので、ここで切り替わるのは -->
+    <!-- 音素チップ 1 つずつの併記だけ。ラベルでその範囲を示す。 -->
+    <button type="button" class="toggle" id="ipa-toggle" aria-pressed="false"
+            title="音素チップ 1 つずつに IPA を併記する (語全体の IPA は常に表示)">
+      <span class="toggle-mark" aria-hidden="true">ɸ</span>音素ごとの IPA
+    </button>
+  </div>
 </header>
 
 <main>
@@ -103,6 +114,8 @@
     <div class="readout-row">
       <span class="readout-label">読み</span>
       <span class="readout-value" id="rq-reading"></span>
+      <span class="readout-label">IPA</span>
+      <span class="readout-value ipa" id="rq-ipa"></span>
       <span class="readout-label">モーラ</span>
       <span class="readout-value" id="rq-mora"></span>
     </div>
@@ -132,6 +145,12 @@
       <span class="analysis-arrow" aria-hidden="true">→</span>
       <span class="analysis-reading" id="pa-reading"></span>
       <span class="analysis-count" id="pa-count"></span>
+    </div>
+    <!-- 連続表記は音素チップと分けて置く。IPA は発音の連続した写しなので、 -->
+    <!-- 音素ごとに区切ると音素列の記号違いに見えてしまう。 -->
+    <div class="analysis-ipa">
+      <span class="readout-label">IPA</span>
+      <span class="ipa ipa-large" id="pa-ipa"></span>
     </div>
     <div class="analysis-grid">
       <div class="analysis-cell">

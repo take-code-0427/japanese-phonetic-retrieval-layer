@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .distance import CONSONANTS, VOWELS, align_phonemes
+from .distance import CONSONANTS, VOWELS, align_phonemes, ipa_transcription, phoneme_ipa
 from .index import Category
 from .phonology import GEMINATE, LONG, MORAIC_N, analyze_reading
 from .search import (
@@ -138,6 +138,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             "query": q,
             "reading": pronunciation.reading,
             "phonemes": list(pronunciation.phonemes),
+            "ipa": ipa_transcription(pronunciation.phonemes),
             "mora_count": pronunciation.mora_count,
             "preset": preset,
             "scanned": scanned,
@@ -157,6 +158,9 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                     "pos": r.pos,
                     "familiarity": r.familiarity,
                     "phonemes": list(r.phonemes),
+                    # 促音の重複は後続音素を見ないと書けないので、連続表記は
+                    # JS に組ませずここで作る (`ipa_transcription` の docstring)。
+                    "ipa": ipa_transcription(r.phonemes),
                 }
                 for r in results
             ],
@@ -172,6 +176,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             "text": text,
             "reading": pronunciation.reading,
             "phonemes": list(pronunciation.phonemes),
+            "ipa": ipa_transcription(pronunciation.phonemes),
             "mora_count": pronunciation.mora_count,
             "moras": [m.kana or m.special for m in pronunciation.moras],
             "vowel_skeleton": list(pronunciation.vowel_skeleton),
@@ -195,11 +200,13 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                 "text": comparison.a_text,
                 "reading": comparison.a_reading,
                 "phonemes": list(comparison.a_phonemes),
+                "ipa": ipa_transcription(comparison.a_phonemes),
             },
             "b": {
                 "text": comparison.b_text,
                 "reading": comparison.b_reading,
                 "phonemes": list(comparison.b_phonemes),
+                "ipa": ipa_transcription(comparison.b_phonemes),
             },
             "similarity": comparison.similarity,
             "distance": comparison.distance,
@@ -236,10 +243,11 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
 
     @app.get("/api/phonemes")
     def api_phonemes() -> dict[str, Any]:
-        """音素の素性表を返す。
+        """音素の素性表と IPA 表記を返す。
 
-        フロントはこれを使って音素チップの色を決める。色を UI 側の固定表に
-        持たせると素性表を変えたときに黙ってずれるので、素性そのものを配る。
+        フロントはこれを使って音素チップの色と IPA を決める。どちらも UI 側の
+        固定表に持たせると distance.py を変えたときに黙ってずれるので、
+        素性と対応表そのものを配って JS に写させる。
         """
         return {
             "consonants": {
@@ -248,6 +256,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                     "manner": c.manner,
                     "voiced": c.voiced,
                     "palatalized": c.palatalized,
+                    "ipa": phoneme_ipa(symbol),
                 }
                 for symbol, c in CONSONANTS.items()
             },
@@ -256,10 +265,18 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                     "height": v.height,
                     "backness": v.backness,
                     "rounded": v.rounded,
+                    "ipa": phoneme_ipa(symbol),
                 }
                 for symbol, v in VOWELS.items()
             },
-            "special": {LONG: "長音", GEMINATE: "促音", MORAIC_N: "撥音"},
+            "special": {
+                symbol: {"label": label, "ipa": phoneme_ipa(symbol)}
+                for symbol, label in (
+                    (LONG, "長音"),
+                    (GEMINATE, "促音"),
+                    (MORAIC_N, "撥音"),
+                )
+            },
         }
 
     @app.get("/api/align")

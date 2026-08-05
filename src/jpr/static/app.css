@@ -101,13 +101,20 @@ h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.01em; }
 }
 .masthead-sub em { color: var(--ink); font-style: normal; font-weight: 600; }
 
-.tabs {
+/* タブ行。下線はここが張る (タブとトグルの両方の下を通す)。 */
+.tabbar {
   grid-column: 1 / -1;
   display: flex;
-  gap: 2px;
+  align-items: flex-end;
+  gap: 16px;
   margin-top: 22px;
   border-bottom: 1px solid var(--line);
 }
+
+.tabs { display: flex; gap: 2px; }
+
+/* トグルは右端。ラベル幅が変わっても固定値に依存しない。 */
+.tabbar > .toggle { margin-left: auto; }
 
 .tab {
   appearance: none;
@@ -124,6 +131,43 @@ h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: 0.01em; }
 .tab:hover { color: var(--ink-dim); }
 .tab.is-active { color: var(--ink); border-bottom-color: var(--p-alveolar); }
 .tab:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: -2px; }
+
+/* ---------- 表示トグル ---------- */
+
+.toggle {
+  appearance: none;
+  background: none;
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.toggle:hover { color: var(--ink-dim); border-color: var(--ink-faint); }
+.toggle.is-on { color: var(--bg); background: var(--p-postalveolar); border-color: var(--p-postalveolar); }
+.toggle:focus-visible { outline: 2px solid var(--p-palatal); outline-offset: 2px; }
+
+/* 状態の目印に IPA の文字そのものを使う。何が出るようになるのかが記号で分かる。 */
+.toggle-mark { font-family: var(--mono); font-size: 13px; opacity: 0.75; }
+.toggle.is-on .toggle-mark { opacity: 1; }
+
+/* ---------- IPA ---------- */
+
+/* 連続表記。音素列と違って区切らないので、字間を詰めず等幅で読ませる。 */
+.ipa {
+  font-family: var(--mono);
+  color: var(--p-postalveolar);
+  font-feature-settings: normal;
+}
+.ipa-large { font-size: 17px; }
 
 /* ---------- layout ---------- */
 
@@ -312,6 +356,20 @@ main {
 .ph.is-voiced { background: color-mix(in oklab, currentColor 30%, transparent); }
 .ph.is-gap { color: var(--ink-faint); border-style: dashed; background: none; }
 
+/* チップ内の IPA。音素記号のほうを主として読ませるので、小さく添える。
+ * 色はチップの currentColor を継ぐ — 別の色にすると調音位置で色を決める
+ * という画面全体の約束が崩れる。
+ *
+ * 区切りは薄い線 1 本。`u|ɯ` のように記号と IPA が似た形の対では線ばかりが
+ * 目に付くので、境界が分かる最小の濃さに留める。 */
+.ph-ipa {
+  margin-left: 5px;
+  padding-left: 5px;
+  border-left: 1px solid color-mix(in oklab, currentColor 22%, transparent);
+  font-size: 11px;
+  opacity: 0.8;
+}
+
 /* ---------- query readout ---------- */
 
 .readout {
@@ -351,7 +409,9 @@ main {
 .mora-columns {
   margin-top: 22px;
   display: grid;
-  grid-template-columns: repeat(var(--slots, 1), minmax(250px, 1fr));
+  /* 枠の下限は JS が渡す (--slot-px)。IPA を併記するとチップが 1.5 倍に
+   * 広がるので、固定値にすると併記時に折り返す。 */
+  grid-template-columns: repeat(var(--slots, 1), minmax(var(--slot-px, 250px), 1fr));
   gap: 0 1px;
   background: var(--line);
   overflow-x: auto;
@@ -464,7 +524,19 @@ main {
 
 .result-word { min-width: 0; }
 .word { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+
+/* 読みと IPA を 1 行に。カードは縦に積む要素が多いので行を増やさない。
+ * 狭い列で入りきらないときだけ折り返す。 */
+.result-reading-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
 .word-reading { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+/* IPA は読みと同じ大きさ。読み (カタカナ) と混ざらないよう色で分ける。 */
+.word-ipa { font-size: 12px; overflow-wrap: anywhere; }
 .result-phonemes { margin-top: 5px; }
 
 .result-tags { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -503,6 +575,17 @@ main {
   color: var(--ink-faint);
   margin: 14px 0 12px;
 }
+
+/* 2 語の連続表記。下の対応は音素単位に切って見せるので、発音全体としての
+ * 似方はここでしか読めない。 */
+.align-ipa {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  margin: 0 0 14px;
+}
+.align-ipa-cell { display: flex; align-items: baseline; gap: 7px; }
+.align-ipa-cell .ipa { font-size: 14px; }
 
 /* 音素の対応を縦 2 段で並べる。列の幅は等分で、対応しない音素は
  * 破線の空きになる。編集距離が「どの音素をどう読み替えたか」まで
@@ -590,6 +673,15 @@ main {
 .analysis-arrow { color: var(--ink-faint); }
 .analysis-reading { font-family: var(--mono); font-size: 22px; color: var(--p-alveolar); }
 .analysis-count { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+
+/* 連続表記は音素・モーラの分解より前に置く。まず全体の発音を読み、
+ * その内訳を下の 3 セルで見る順序。 */
+.analysis-ipa {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 18px;
+}
 
 .analysis-grid {
   display: grid;

@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 
+from .distance import ipa_transcription
 from .index import Category
 from .phonology import analyze_reading
 from .search import DEFAULT_CANDIDATES, DEFAULT_PRESET, PRESETS, PhoneticSearcher
@@ -94,6 +95,7 @@ def cmd_similar(args: argparse.Namespace) -> int:
                 "query": args.query,
                 "reading": pronunciation.reading,
                 "phonemes": list(pronunciation.phonemes),
+                "ipa": ipa_transcription(pronunciation.phonemes),
                 "mora_count": pronunciation.mora_count,
                 "preset": args.preset,
                 "elapsed_ms": round(elapsed, 1),
@@ -114,6 +116,7 @@ def cmd_similar(args: argparse.Namespace) -> int:
                         "pos": r.pos,
                         "familiarity": r.familiarity,
                         "phonemes": list(r.phonemes),
+                        "ipa": ipa_transcription(r.phonemes),
                     }
                     for r in results
                 ],
@@ -121,9 +124,12 @@ def cmd_similar(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # IPA は角括弧に入れる (音声表記の慣用)。既存の `[音素列]` と衝突するので、
+    # 抽象的な音素列のほうを本来の音素表記の記法 // に移す。
     print(
         f"{args.query} -> {pronunciation.reading} "
-        f"[{pronunciation.phoneme_string()}] "
+        f"/{pronunciation.phoneme_string()}/ "
+        f"[{ipa_transcription(pronunciation.phonemes)}] "
         f"{pronunciation.mora_count} モーラ  ({elapsed:.0f}ms, preset={args.preset})"
     )
     if not results:
@@ -164,11 +170,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
                     "text": comparison.a_text,
                     "reading": comparison.a_reading,
                     "phonemes": list(comparison.a_phonemes),
+                    "ipa": ipa_transcription(comparison.a_phonemes),
                 },
                 "b": {
                     "text": comparison.b_text,
                     "reading": comparison.b_reading,
                     "phonemes": list(comparison.b_phonemes),
+                    "ipa": ipa_transcription(comparison.b_phonemes),
                 },
                 "similarity": comparison.similarity,
                 "distance": comparison.distance,
@@ -177,8 +185,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
         return 0
 
-    print(f"{comparison.a_text} -> {comparison.a_reading} [{' '.join(comparison.a_phonemes)}]")
-    print(f"{comparison.b_text} -> {comparison.b_reading} [{' '.join(comparison.b_phonemes)}]")
+    for text, reading, phonemes in (
+        (comparison.a_text, comparison.a_reading, comparison.a_phonemes),
+        (comparison.b_text, comparison.b_reading, comparison.b_phonemes),
+    ):
+        print(f"{text} -> {reading} /{' '.join(phonemes)}/ [{ipa_transcription(phonemes)}]")
     print(f"\n音韻類似度: {comparison.similarity:.4f}  (編集距離 {comparison.distance:.3f})")
     print("\n空間別:")
     for name, value in comparison.spaces.items():
@@ -196,7 +207,8 @@ def cmd_pronounce(args: argparse.Namespace) -> int:
         moras = " ".join(m.kana or m.special for m in pronunciation.moras)
         print(
             f"{text} -> {pronunciation.reading} "
-            f"[{pronunciation.phoneme_string()}] "
+            f"/{pronunciation.phoneme_string()}/ "
+            f"[{ipa_transcription(pronunciation.phonemes)}] "
             f"モーラ: {moras} ({pronunciation.mora_count})"
         )
     return 0

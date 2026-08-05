@@ -120,3 +120,7 @@ async def test_pronounce_returns_mora_structure(server) -> None:
     assert payload["reading"] == "ガッコウ"
     assert payload["moras"] == ["ガ", "ッ", "コ", "ウ"]
     assert payload["mora_count"] == 4
+    # 音素列は内部表記 (ヘボン式寄りの ASCII)、ipa は同じものの IPA。促音が
+    # 後続子音の重複になっているのが LLM に渡る表記として正しい形。
+    assert payload["phonemes"] == ["g", "a", "Q", "k", "o", "u"]
+    assert payload["ipa"] == "ɡakkoɯ"

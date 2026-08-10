@@ -20,6 +20,14 @@ from fastapi.staticfiles import StaticFiles
 from .distance import CONSONANTS, VOWELS, align_phonemes, ipa_transcription, phoneme_ipa
 from .index import Category
 from .phonology import GEMINATE, LONG, MORAIC_N, analyze_reading
+from .phrase import (
+    DEFAULT_BEAM_WIDTH,
+    DEFAULT_CHUNK_CANDIDATES,
+    DEFAULT_MAX_CHUNK_MORAS,
+    DEFAULT_MAX_NODES_PER_SPAN,
+    DEFAULT_MIN_CHUNK_SCORE,
+    DEFAULT_NODE_BUDGET,
+)
 from .search import (
     DEFAULT_CANDIDATES,
     DEFAULT_PRESET,
@@ -45,6 +53,19 @@ MAX_UNLIMITED = 5_000
 #: ANN から取る候補数の上限。ここを大きくすると再現率と引き換えに
 #: rerank のコストが線形に増える (DEFAULT_CANDIDATES の項も参照)。
 MAX_CANDIDATES = 50_000
+
+#: 分割合成が 1 回に返す候補数の上限。
+#:
+#: 候補 1 件が区間ごとの内訳を持つので、JSON が件数の数倍の速さで膨らむ。
+#: 合成は 1 件あたり数百 ms かかる経路でもあり、無制限を露出する意味がない。
+MAX_PHRASE_LIMIT = 50
+
+#: ラティス表示のノード数の上限。
+#:
+#: 予算に届くまでビーム幅を広げるので、大きくすると探索が伸びる
+#: (`_LATTICE_MAX_BEAM` の 512 で打ち止まる)。200 は 14 モーラの入力でも
+#: 画面に収まる限界の目安。
+MAX_NODE_BUDGET = 200
 
 
 def _parse_categories(value: str | None) -> list[Category] | None:
@@ -166,6 +187,147 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             ],
         }
 
+    @app.get("/api/phrase")
+    def api_phrase(
+        text: str = Query(..., min_length=1, description="入力 (漢字・かな・カタカナ)"),
+        limit: int = Query(10, ge=1, le=MAX_PHRASE_LIMIT),
+        max_chunk_moras: int = Query(DEFAULT_MAX_CHUNK_MORAS, ge=1, le=8),
+        chunk_candidates: int = Query(DEFAULT_CHUNK_CANDIDATES, ge=1, le=64),
+        beam_width: int = Query(DEFAULT_BEAM_WIDTH, ge=1, le=256),
+        min_chunk_score: float = Query(DEFAULT_MIN_CHUNK_SCORE, ge=0.0, le=1.0),
+        allow_particles: bool = Query(True),
+    ) -> dict[str, Any]:
+        """入力を「複数の語 + 助詞」の連なりに合成して返す (空耳の経路)。
+
+        通常の `/api/similar` は 1 語を 1 語に写すので、長い入力には答えが
+        返らない (音が近い単一の語が辞書に無い)。こちらは入力をモーラ境界で
+        区間に切って繋ぐ (`phrase.py` 参照)。
+        """
+        pronunciation, candidates = searcher().compose(
+            text,
+            limit=limit,
+            max_chunk_moras=max_chunk_moras,
+            chunk_candidates=chunk_candidates,
+            beam_width=beam_width,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
+        return {
+            "text": text,
+            "reading": pronunciation.reading,
+            "phonemes": list(pronunciation.phonemes),
+            "ipa": ipa_transcription(pronunciation.phonemes),
+            "mora_count": pronunciation.mora_count,
+            # 入力側のモーラ列。区間の対応を画面に描くのに要る。
+            "moras": [m.kana or m.special for m in pronunciation.moras],
+            "total": len(candidates),
+            "results": [
+                {
+                    "text": c.text,
+                    "reading": c.reading,
+                    "score": c.score,
+                    "phonetic_similarity": c.phonetic_similarity,
+                    "segment_count": c.segment_count,
+                    "segments": [
+                        {
+                            "surface": s.surface,
+                            "reading": s.reading,
+                            "source_reading": s.source_reading,
+                            "start": s.start,
+                            "end": s.end,
+                            "mora_count": s.mora_count,
+                            "similarity": s.similarity,
+                            "is_particle": s.is_particle,
+                            "phonemes": list(s.phonemes),
+                            # 促音の重複は後続音素を見ないと書けないのでここで作る。
+                            "ipa": ipa_transcription(s.phonemes),
+                        }
+                        for s in c.segments
+                    ],
+                }
+                for c in candidates
+            ],
+        }
+
+    @app.get("/api/phrase/lattice")
+    def api_phrase_lattice(
+        text: str = Query(..., min_length=1, description="入力 (漢字・かな・カタカナ)"),
+        node_budget: int = Query(DEFAULT_NODE_BUDGET, ge=2, le=MAX_NODE_BUDGET),
+        max_nodes_per_span: int = Query(DEFAULT_MAX_NODES_PER_SPAN, ge=1, le=32),
+        max_chunk_moras: int = Query(DEFAULT_MAX_CHUNK_MORAS, ge=1, le=8),
+        chunk_candidates: int = Query(DEFAULT_CHUNK_CANDIDATES, ge=1, le=64),
+        beam_width: int = Query(DEFAULT_BEAM_WIDTH, ge=1, le=256),
+        min_chunk_score: float = Query(DEFAULT_MIN_CHUNK_SCORE, ge=0.0, le=1.0),
+        allow_particles: bool = Query(True),
+    ) -> dict[str, Any]:
+        """合成の候補群を 1 枚の DAG (ラティス) に畳んで返す。
+
+        候補を並べると同じ語が何度も出る (実測で区間の 65〜77% が重複し、
+        「名前」「は」は上位 10 件の全部に現れた)。ノードに畳めば 1 度しか
+        描かれず、分岐だけが見える。
+
+        `node_budget` はノード数の予算。**届くまでビーム幅を広げる** ので、
+        上位数件だけでは薄く全候補では埋まるという両極を避けられる
+        (`phrase.PhraseComposer.lattice`)。
+
+        一覧表示は `/api/phrase`。同じ経路集合の別の見せ方なので、
+        画面はこの 2 つを切り替える。
+        """
+        pronunciation, lattice = searcher().lattice(
+            text,
+            node_budget=node_budget,
+            max_nodes_per_span=max_nodes_per_span,
+            max_chunk_moras=max_chunk_moras,
+            chunk_candidates=chunk_candidates,
+            beam_width=beam_width,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
+        return {
+            "text": text,
+            "reading": pronunciation.reading,
+            "ipa": ipa_transcription(pronunciation.phonemes),
+            "mora_count": pronunciation.mora_count,
+            # ノードをモーラ位置に並べるので、入力側のモーラ列が要る。
+            "moras": [m.kana or m.special for m in pronunciation.moras],
+            "node_count": lattice.node_count,
+            "path_count": lattice.path_count,
+            "beam_width": lattice.beam_width,
+            # 予算のために経路を削ったか。画面に「もっとある」ことを出す。
+            "truncated": lattice.truncated,
+            "nodes": [
+                {
+                    "id": n.id,
+                    "surface": n.surface,
+                    "reading": n.reading,
+                    "start": n.start,
+                    "end": n.end,
+                    "mora_count": n.mora_count,
+                    "source_reading": n.source_reading,
+                    "similarity": n.similarity,
+                    "is_particle": n.is_particle,
+                    "path_count": n.path_count,
+                    "best_score": n.best_score,
+                }
+                for n in lattice.nodes
+            ],
+            "edges": [
+                {"source": e.source, "target": e.target, "path_count": e.path_count}
+                for e in lattice.edges
+            ],
+            # 図から一覧に戻れるように経路も返す。ノードを選んで絞り込むとき、
+            # どの経路が残るかをフロントが計算できる。
+            "paths": [
+                {
+                    "text": c.text,
+                    "reading": c.reading,
+                    "score": c.score,
+                    "nodes": [f"{s.start}:{s.end}:{s.surface}" for s in c.segments],
+                }
+                for c in lattice.paths
+            ],
+        }
+
     @app.get("/api/pronounce")
     def api_pronounce(
         text: str = Query(..., min_length=1, description="日本語テキスト"),
@@ -239,6 +401,17 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             "presets": sorted(PRESETS),
             "default_preset": DEFAULT_PRESET,
             "default_candidates": DEFAULT_CANDIDATES,
+            # 分割合成の既定値。フロントに固定表を持たせると phrase.py を
+            # 変えたときに黙ってずれるので、サーバ側の値を配る。
+            "phrase": {
+                "max_chunk_moras": DEFAULT_MAX_CHUNK_MORAS,
+                "chunk_candidates": DEFAULT_CHUNK_CANDIDATES,
+                "beam_width": DEFAULT_BEAM_WIDTH,
+                "min_chunk_score": DEFAULT_MIN_CHUNK_SCORE,
+                "max_limit": MAX_PHRASE_LIMIT,
+                "node_budget": DEFAULT_NODE_BUDGET,
+                "max_node_budget": MAX_NODE_BUDGET,
+            },
         }
 
     @app.get("/api/phonemes")

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import itertools
 import time
 
 import pytest
@@ -313,3 +314,163 @@ def test_edit_distance_pruning_does_not_change_ranking(
     # 標本が候補数を上回ると `_survivors` は全件計算に落ちる。これを対照にする。
     monkeypatch.setattr(search_module, "_PROBE_CANDIDATES", 1 << 30)
     assert baseline == _fingerprint(reference, query, min_mora=4, max_mora=6, preset=preset)
+
+
+# ---------- 分割合成 (空耳) ----------
+#
+# 小さなサンプル語彙では「意図した空耳が引けるか」を確認できない。
+# 202 万語の中から語 + 助詞の連なりが組めるかはここでしか捕まらない。
+
+
+def test_phrase_reconstructs_a_known_sentence(real_searcher: PhoneticSearcher) -> None:
+    """音が完全に一致する語 + 助詞の列を組める。
+
+    「ワタシノナマエハ」は 8 モーラで、これに音が近い**単一の語**は辞書に
+    無い (だから `search` では答えが返らない)。区間に切れば
+    私 + の + 名前 + は で音が完全に一致する。
+    """
+    _, candidates = real_searcher.compose("わたしのなまえは", limit=10)
+    assert candidates
+    readings = {c.reading for c in candidates}
+    assert "ワタシノナマエハ" in readings, readings
+    # 音が完全に一致する候補が上位に来る。
+    exact = [c for c in candidates if c.reading == "ワタシノナマエハ"]
+    assert all(s.similarity == 1.0 for s in exact[0].segments)
+
+
+def test_phrase_uses_particles_as_connectives(real_searcher: PhoneticSearcher) -> None:
+    """1 モーラの区間が助詞で埋まる。
+
+    索引に 1 モーラの語が 1 件も無いので (full 辞書で 2 モーラ 38210 件に対し
+    1 モーラ 0 件)、助詞の内蔵表が無いとこの位置が埋まらず、
+    「ワタシ|ノ|ナマエ|ハ」のような切り方そのものが作れない。
+    """
+    _, candidates = real_searcher.compose("わたしのなまえは", limit=10)
+    best = next(c for c in candidates if c.reading == "ワタシノナマエハ")
+    particles = [s for s in best.segments if s.is_particle]
+    assert particles, best.segments
+    assert {s.reading for s in particles} >= {"ノ"}
+
+
+def test_phrase_segments_are_readable_words(real_searcher: PhoneticSearcher) -> None:
+    """区間に当てる語が読める表記になっている。
+
+    数字混じりの見出し (「2 士」「8 耐」) は索引に入っているが、列に混ざると
+    全体が読めなくなる (`phrase._is_readable_surface`)。
+    """
+    for text in ("こんにちはせかい", "わたしのなまえは"):
+        _, candidates = real_searcher.compose(text, limit=10)
+        for candidate in candidates:
+            for segment in candidate.segments:
+                assert not any(ch.isascii() and ch.isalnum() for ch in segment.surface), (
+                    f"{text}: {candidate.text}"
+                )
+
+
+def test_phrase_prefers_known_words_over_rare_kanji(real_searcher: PhoneticSearcher) -> None:
+    """コスト 0 の語 (活用の断片・稀な異表記) が上位を埋めない。
+
+    `index.familiarity_of` はコストの反転なので `cost <= 0` を一般性 1.0 と
+    見るが、full 辞書の該当 51732 件は「炮り」「合ん」「アがん」のような
+    断片で実際には一般的でない。`phrase.UNKNOWN_COST_FAMILIARITY` で
+    「わからない」として扱っている。これが 1.0 のままだと
+    「わたしのなまえは」が「分か死の七異派」になった (実測)。
+    """
+    _, candidates = real_searcher.compose("わたしのなまえは", limit=5)
+    assert candidates
+    # 上位に「私」で始まる候補が来る。
+    assert any(c.segments[0].surface == "私" for c in candidates), [c.text for c in candidates]
+
+
+def test_phrase_scores_stay_within_the_unit_range(real_searcher: PhoneticSearcher) -> None:
+    """実辞書でもスコアが 0〜1 に収まる。通常検索と同じ尺度で読めること。"""
+    _, candidates = real_searcher.compose("ありがとうございます", limit=10)
+    assert candidates
+    for candidate in candidates:
+        assert 0.0 <= candidate.score <= 1.0
+        for segment in candidate.segments:
+            assert 0.0 <= segment.similarity <= 1.0
+
+
+def test_phrase_covers_long_input_without_gaps(real_searcher: PhoneticSearcher) -> None:
+    """長い入力でも区間が隙間なく覆う。ビームの刈り込みが経路を壊さないこと。"""
+    pronunciation, candidates = real_searcher.compose("アルミカンノウエニアルミカン", limit=5)
+    assert candidates
+    for candidate in candidates:
+        spans = [(s.start, s.end) for s in candidate.segments]
+        assert spans[0][0] == 0
+        assert spans[-1][1] == pronunciation.mora_count
+        for left, right in itertools.pairwise(spans):
+            assert left[1] == right[0]
+
+
+def test_phrase_lattice_folds_repeated_words(real_searcher: PhoneticSearcher) -> None:
+    """実辞書でラティスが候補の重複を畳む。
+
+    候補リストでは同じ語が何度も出る (実測で区間の 65〜77% が重複し、
+    「名前」「は」は上位 10 件の全部に現れた)。畳めば 1 度しか描かれない。
+    """
+    _, lattice = real_searcher.lattice("わたしのなまえは", node_budget=40)
+    assert lattice.nodes
+    # 畳む前の延べ区間数より少ない。
+    spans = sum(len(c.segments) for c in lattice.paths)
+    assert lattice.node_count < spans
+    # 「名前」が 1 ノードだけ現れ、多くの経路が通る。
+    names = [n for n in lattice.nodes if n.surface == "名前"]
+    assert len(names) == 1, [n.surface for n in lattice.nodes]
+    assert names[0].path_count > 1
+
+
+def test_phrase_lattice_stays_connected_at_scale(real_searcher: PhoneticSearcher) -> None:
+    """実辞書でも全ノードが始端から終端まで繋がる経路上にある。
+
+    予算に収めるとき経路単位で削っているので (`phrase._fit_lattice`)、
+    孤立ノードが出ないこと。ここが崩れると図として読めなくなる。
+    """
+    for text, budget in (
+        ("わたしのなまえは", 40),
+        ("わたしのなまえは", 10),
+        ("アルミカンノウエニアルミカン", 40),
+        ("ちくび", 40),
+    ):
+        pronunciation, lattice = real_searcher.lattice(text, node_budget=budget)
+        ids = {n.id for n in lattice.nodes}
+        by_id = {n.id: n for n in lattice.nodes}
+
+        forward = {e.target for e in lattice.edges if e.source is None and e.target}
+        changed = True
+        while changed:
+            changed = False
+            for edge in lattice.edges:
+                if edge.source in forward and edge.target and edge.target not in forward:
+                    forward.add(edge.target)
+                    changed = True
+        backward = {e.source for e in lattice.edges if e.target is None and e.source}
+        changed = True
+        while changed:
+            changed = False
+            for edge in lattice.edges:
+                if edge.target in backward and edge.source and edge.source not in backward:
+                    backward.add(edge.source)
+                    changed = True
+
+        assert ids == forward & backward, f"{text} budget={budget}: 孤立ノード"
+        for edge in lattice.edges:
+            if edge.source is not None and edge.target is not None:
+                assert by_id[edge.source].end == by_id[edge.target].start
+            if edge.target is None and edge.source is not None:
+                assert by_id[edge.source].end == pronunciation.mora_count
+
+
+def test_phrase_lattice_widens_the_beam_to_fill_the_budget(
+    real_searcher: PhoneticSearcher,
+) -> None:
+    """予算を上げるとノードが増える。
+
+    候補数ではなくビーム幅を広げることで育つ経路なので (`limit` を増やしても
+    ノードは増えない)、予算が実際に効いていることを見る。
+    """
+    _, small = real_searcher.lattice("わたしのなまえは", node_budget=10)
+    _, large = real_searcher.lattice("わたしのなまえは", node_budget=60)
+    assert small.node_count <= large.node_count
+    assert large.beam_width >= small.beam_width

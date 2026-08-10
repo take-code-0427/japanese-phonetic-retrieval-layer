@@ -15,6 +15,7 @@ from mcp.server import MCPServer
 
 from .distance import ipa_transcription
 from .index import Category
+from .phrase import DEFAULT_MAX_CHUNK_MORAS, DEFAULT_MIN_CHUNK_SCORE
 from .search import DEFAULT_CANDIDATES, PRESETS, PhoneticSearcher
 from .store import PhoneticStore, default_store_path
 
@@ -35,6 +36,28 @@ _SEARCH_DESCRIPTION = """\
 「もっと長い語で」「4 モーラ以上で」のようにモーラ数 (拍) を指定された場合は
 min_mora / max_mora を使う。通常の検索は音韻空間の近傍を引くので、モーラ数の
 違う語は近傍に入らず出てこない。"""
+
+_COMPOSE_DESCRIPTION = """\
+長い入力を「複数の語 + 助詞」の連なりに置き換える (空耳・替え歌)。
+
+**長いフレーズには search_phonetically を使わない。** あちらは 1 語を 1 語に
+写すので、「ワタシノナマエハ」のような長い入力に音が近い単一の語は辞書に
+存在せず、答えが返らない。こちらは入力をモーラ境界で区間に切り、区間ごとに
+別の語を当てて繋ぐ。
+
+    ワタシノナマエハ -> 私 | の | 名前 | は
+
+次のような場合に使う:
+
+- 空耳を作る (「〜に聞こえる日本語の文」)
+- 替え歌・歌詞の音合わせ
+- 長いフレーズを別の語の連なりで言い換える
+- 外国語の音を日本語で写す
+
+`segments` が「入力のどこが何になったか」を持つので、意味が通る候補を
+そこから選び直すこと。**音韻スコアが最上位の候補が意味として最良とは限らない** —
+むしろ上位は音が完全に一致する無意味な列になりやすい。意味の判断は
+呼び出し側 (LLM) の仕事。"""
 
 _COMPARE_DESCRIPTION = """\
 2 つの日本語表現の音韻類似度を計算する。
@@ -59,7 +82,12 @@ _INSTRUCTIONS = """\
 
 音韻類似度は意味とは独立した軸なので、意味的な制約のある問い (「乳首みたいな
 お菓子」など) では、返ってきた候補から意味で選び直す必要がある。音韻スコアが
-最も高い語が答えとは限らない。"""
+最も高い語が答えとは限らない。
+
+**入力の長さで使う tool が変わる。** 1 語に対して音の近い語を引くなら
+search_phonetically、長いフレーズを語の連なりに置き換えるなら compose_phrase。
+長い入力に音が近い単一の語は辞書に存在しないので、search_phonetically に
+フレーズを渡しても答えは返らない。"""
 
 
 def create_server(index_path: Path | str | None = None) -> MCPServer:
@@ -166,6 +194,73 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
             ],
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    @server.tool(name="compose_phrase", description=_COMPOSE_DESCRIPTION)
+    def compose_phrase(
+        text: str,
+        limit: int = 10,
+        max_chunk_moras: int = DEFAULT_MAX_CHUNK_MORAS,
+        min_chunk_score: float = DEFAULT_MIN_CHUNK_SCORE,
+        allow_particles: bool = True,
+    ) -> str:
+        """入力を複数の語 + 助詞の連なりに合成する。
+
+        Args:
+            text: 入力。漢字・ひらがな・カタカナのいずれでもよい。長いフレーズを想定する。
+            limit: 返す候補数。
+            max_chunk_moras: 1 区間に許すモーラ数の上限。上げると 1 区間に長い語を
+                当てられるが、区間の数が増えて遅くなる。
+            min_chunk_score: 区間ごとの音韻類似度の下限。上げると音の一致が
+                厳しくなり、候補が減る。
+            allow_particles: 助詞・助動詞を繋ぎに使うか。**索引に 1 モーラの語が
+                無いので、false にすると 1 モーラの区間が埋まらなくなる。**
+        """
+        engine = searcher()
+        pronunciation, candidates = engine.compose(
+            text,
+            limit=min(max(limit, 1), _MAX_LIMIT),
+            max_chunk_moras=max_chunk_moras,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
+        return json.dumps(
+            {
+                "text": text,
+                "reading": pronunciation.reading,
+                "phonemes": list(pronunciation.phonemes),
+                "ipa": ipa_transcription(pronunciation.phonemes),
+                "mora_count": pronunciation.mora_count,
+                "note": (
+                    "score は音韻的な近さのみを表し、意味は考慮していない。"
+                    "上位は音が合うだけの無意味な列になりやすいので、"
+                    "segments の対応を見て意味が通る候補を選び直すこと。"
+                ),
+                "results": [
+                    {
+                        "text": c.text,
+                        "reading": c.reading,
+                        "score": c.score,
+                        "phonetic_similarity": c.phonetic_similarity,
+                        "segment_count": c.segment_count,
+                        "segments": [
+                            {
+                                "surface": s.surface,
+                                "reading": s.reading,
+                                # 入力側のこの区間の読み。「どこが」を示すのに要る。
+                                "source_reading": s.source_reading,
+                                "mora_range": [s.start, s.end],
+                                "similarity": s.similarity,
+                                "is_particle": s.is_particle,
+                            }
+                            for s in c.segments
+                        ],
+                    }
+                    for c in candidates
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     @server.tool(name="compare_phonetically", description=_COMPARE_DESCRIPTION)
     def compare_phonetically(a: str, b: str) -> str:

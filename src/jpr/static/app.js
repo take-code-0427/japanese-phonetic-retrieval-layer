@@ -606,6 +606,464 @@ async function runSearch(event) {
   }
 }
 
+/* ---------- 分割合成 (空耳) ---------- */
+
+/** 合成候補 1 件。
+ *
+ * 空耳は「入力のどこが何になったか」が読めないと検証できないので、
+ * 表層だけでなく区間の対応を必ず並べる。区間は入力を隙間なく覆うので、
+ * 上段 (入力の読み) と下段 (当てた語) を同じ幅で縦に揃えれば対応が読める。 */
+function phraseCard(candidate, rank) {
+  const card = document.createElement("article");
+  card.className = "phrase";
+
+  const head = document.createElement("div");
+  head.className = "phrase-head";
+
+  const rankEl = document.createElement("span");
+  rankEl.className = "phrase-rank";
+  rankEl.textContent = String(rank);
+
+  const textEl = document.createElement("span");
+  textEl.className = "phrase-text";
+  textEl.textContent = candidate.text;
+
+  const readingEl = document.createElement("span");
+  readingEl.className = "phrase-reading";
+  readingEl.textContent = candidate.reading;
+
+  const scoreEl = document.createElement("span");
+  scoreEl.className = "phrase-score";
+  scoreEl.textContent = candidate.score.toFixed(3);
+  scoreEl.title = `音韻類似度の平均 ${candidate.phonetic_similarity.toFixed(3)} / ${candidate.segment_count} 区間`;
+
+  head.append(rankEl, textEl, readingEl, scoreEl);
+
+  // 区間の対応。列 1 つが 1 区間で、モーラ数に比例した幅を持たせる
+  // (入力のどこを覆っているかが幅で読めるようにする)。
+  const grid = document.createElement("div");
+  grid.className = "seg-grid";
+  for (const segment of candidate.segments) {
+    const col = document.createElement("div");
+    col.className = segment.is_particle ? "seg-col is-particle" : "seg-col";
+    col.style.flexGrow = String(segment.mora_count);
+
+    const source = document.createElement("span");
+    source.className = "seg-source";
+    source.textContent = segment.source_reading;
+
+    const arrow = document.createElement("span");
+    arrow.className = "seg-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "↓";
+
+    const surface = document.createElement("span");
+    surface.className = "seg-surface";
+    surface.textContent = segment.surface;
+
+    const meta = document.createElement("span");
+    meta.className = "seg-meta";
+    meta.textContent = segment.reading;
+
+    const bar = document.createElement("span");
+    bar.className = "seg-bar";
+    // 区間ごとの音の一致度。どこで音が外れたかが読めるようにする。
+    bar.style.setProperty("--fill", `${Math.round(segment.similarity * 100)}%`);
+    bar.title = `音韻類似度 ${segment.similarity.toFixed(3)}${segment.is_particle ? " (助詞)" : ""}`;
+
+    col.append(source, arrow, surface, meta, bar);
+    grid.append(col);
+  }
+
+  card.append(head, grid);
+  return card;
+}
+
+/* ---------- ラティス図 ---------- */
+
+/** 分割合成の見せ方。"list" (候補を並べる) か "lattice" (DAG に畳む)。 */
+let phraseView = "list";
+
+/** 直近のラティス。ノードを選んで絞り込むときに使い回す。 */
+let latticeData = null;
+
+/** 選択中のノード id。空なら全経路を出す。 */
+const latticeSelection = new Set();
+
+/** 列の幅の下限・上限と列の間隔 (px)。
+ *
+ * モーラ位置に比例させるのをやめ、中身が要る分だけ取る。間隔を広めに取るのは
+ * 辺の始点と終点を見分けるため — 詰めると複数の辺がノードの縁で重なる。 */
+const LATTICE_MIN_COL_PX = 76;
+const LATTICE_MAX_COL_PX = 180;
+const LATTICE_COL_GAP_PX = 56;
+
+/** ノードの高さと行間 (px)。SVG の座標計算と CSS の両方で使うので JS 側に持つ。 */
+const LATTICE_ROW_PX = 46;
+const LATTICE_NODE_H = 34;
+
+/** ノードを列に割り当て、列ごとの幅と各ノードの座標を決める。
+ *
+ * **モーラ位置に幅を比例させない。** 以前はモーラ位置を横軸に固定していたが、
+ * 1 モーラのノードが 78px しか取れない一方で隣の列が遠くに置かれ、辺が長い
+ * 曲線になって「どれがどれに繋がるか」が読めなかった。
+ *
+ * 代わりに**開始位置で列を作り、列の幅は中身が要求する分だけ取る**。
+ * 上下の位置合わせは捨てる — 位置を揃えることより、辺が短く追えることを取る。
+ * どのモーラを覆っているかはノードが持つ読み (`source_reading`) で分かるので、
+ * 目盛りに頼らなくてよい。
+ *
+ * 同じ列の中は経路数の多い順に縦に積む (よく使われる語が上)。 */
+function layoutLattice(nodes, edges) {
+  // 開始位置ごとに列を作る。同じ位置から始まるノードは互いに排他な選択肢
+  // (どれか 1 つを選ぶ) なので、縦に並べるのが自然。
+  const byStart = new Map();
+  for (const node of nodes) {
+    if (!byStart.has(node.start)) byStart.set(node.start, []);
+    byStart.get(node.start).push(node);
+  }
+  const columns = [...byStart.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([start, items]) => ({
+      start,
+      items: items.sort(
+        (a, b) =>
+          b.path_count - a.path_count ||
+          a.mora_count - b.mora_count ||
+          a.surface.localeCompare(b.surface),
+      ),
+    }));
+
+  // 列の中の縦順を、前の列の繋がり先に寄せて決める。
+  //
+  // 経路数だけで並べると、繋がっている 2 つのノードが離れた行に来て辺が
+  // 縦に大きく動く (実測で最大 414px = 9 行ぶん)。前の列でのその語の入口
+  // (直前のノードの行) の平均を目標にして並べ替えると、辺が短くなる。
+  const rowOf = new Map();
+  const incoming = new Map();
+  for (const edge of edges) {
+    if (!edge.source || !edge.target) continue;
+    if (!incoming.has(edge.target)) incoming.set(edge.target, []);
+    incoming.get(edge.target).push(edge.source);
+  }
+  for (const column of columns) {
+    const target = (node) => {
+      const sources = (incoming.get(node.id) || [])
+        .map((id) => rowOf.get(id))
+        .filter((row) => row !== undefined);
+      if (!sources.length) return Number.POSITIVE_INFINITY;
+      return sources.reduce((sum, row) => sum + row, 0) / sources.length;
+    };
+    // 目標行の昇順。入口が無いノード (先頭の列など) は経路数の順で後ろに置く。
+    column.items.sort((a, b) => {
+      const gap = target(a) - target(b);
+      if (Number.isFinite(gap) && gap !== 0) return gap;
+      return b.path_count - a.path_count || a.surface.localeCompare(b.surface);
+    });
+    column.items.forEach((node, depth) => rowOf.set(node.id, depth));
+  }
+
+  // 列の幅は中身の一番長い表層に合わせる。全角 1 文字あたりの実効幅で見積もり、
+  // 下限と上限で挟む (長すぎる語は CSS 側で省略される)。
+  const box = new Map();
+  let x = 0;
+  for (const column of columns) {
+    const longest = Math.max(
+      ...column.items.map((n) => Math.max(n.surface.length, n.source_reading.length * 0.8)),
+    );
+    const width = Math.min(LATTICE_MAX_COL_PX, Math.max(LATTICE_MIN_COL_PX, longest * 15 + 20));
+    column.items.forEach((node, depth) => {
+      box.set(node.id, { x, y: depth * LATTICE_ROW_PX, w: width });
+    });
+    column.width = width;
+    column.x = x;
+    x += width + LATTICE_COL_GAP_PX;
+  }
+
+  const rowCount = Math.max(...columns.map((c) => c.items.length));
+  return {
+    box,
+    columns,
+    width: Math.max(0, x - LATTICE_COL_GAP_PX),
+    height: rowCount * LATTICE_ROW_PX + LATTICE_NODE_H,
+  };
+}
+
+/** 選択中のノードをすべて通る経路だけを残す。 */
+function activePaths() {
+  if (!latticeData) return [];
+  if (!latticeSelection.size) return latticeData.paths;
+  return latticeData.paths.filter((path) => {
+    const ids = new Set(path.nodes);
+    for (const selected of latticeSelection) {
+      if (!ids.has(selected)) return false;
+    }
+    return true;
+  });
+}
+
+/** ラティスを描く。
+ *
+ * ノードは div、辺は背後に敷いた SVG。辺を DOM 要素で描くと曲線が引けず、
+ * ノードを SVG に入れるとテキストの折り返しが効かないので、両方の都合を
+ * 取ってこの組み合わせにしている。 */
+function renderLattice() {
+  const host = $("lattice");
+  if (!latticeData) {
+    host.replaceChildren();
+    return;
+  }
+  const { nodes, edges } = latticeData;
+  const { box, width, height } = layoutLattice(nodes, edges);
+
+  // 絞り込みで残る経路。ノードと辺の強調に使う。
+  const paths = activePaths();
+  const liveNodes = new Set();
+  const liveEdges = new Set();
+  for (const path of paths) {
+    path.nodes.forEach((id) => liveNodes.add(id));
+    for (let i = 0; i < path.nodes.length - 1; i += 1) {
+      liveEdges.add(`${path.nodes[i]} ${path.nodes[i + 1]}`);
+    }
+    liveEdges.add(` ${path.nodes[0]}`);
+    liveEdges.add(`${path.nodes[path.nodes.length - 1]} `);
+  }
+
+  host.style.width = `${width}px`;
+  host.style.height = `${height}px`;
+
+  // --- 辺 (SVG) ---
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("class", "lattice-edges");
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  // 辺はノードの右端から次のノードの左端へ。列の間隔ぶんの隙間に引く。
+  const anchor = (id) => {
+    const geometry = box.get(id);
+    return {
+      left: geometry.x,
+      right: geometry.x + geometry.w,
+      y: geometry.y + LATTICE_NODE_H / 2,
+    };
+  };
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const maxEdge = Math.max(1, ...edges.map((e) => e.path_count));
+  for (const edge of edges) {
+    if (edge.source && !byId.has(edge.source)) continue;
+    if (edge.target && !byId.has(edge.target)) continue;
+    const key = `${edge.source || ""} ${edge.target || ""}`;
+    const live = liveEdges.has(key);
+
+    // 始端と終端は図の外側に小さく突き出す。どのノードが文頭・文末になり得るか。
+    const from = edge.source ? anchor(edge.source) : null;
+    const to = edge.target ? anchor(edge.target) : null;
+    const x1 = from ? from.right : to.left - 14;
+    const y1 = from ? from.y : to.y;
+    const x2 = to ? to.left : from.right + 14;
+    const y2 = to ? to.y : from.y;
+
+    const line = document.createElementNS(svgNS, "path");
+    // 縦の差を水平の立ち上がりで吸収するベジエ。制御点を端に寄せると辺が
+    // ノードの縁から横向きに出るので、束になった辺の行き先が見分けやすい。
+    const dx = Math.max(18, (x2 - x1) * 0.55);
+    line.setAttribute("d", `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+    line.setAttribute("class", live ? "lattice-edge is-live" : "lattice-edge");
+    // ノードにカーソルを当てたときにその辺だけを強調するための目印。
+    // 縦に離れた辺は形だけでは追えないので、CSS 側で色を変える。
+    if (edge.source) line.dataset.from = edge.source;
+    if (edge.target) line.dataset.to = edge.target;
+    // 経路数を太さに写す。よく通る繋がりが太くなる。
+    line.setAttribute("stroke-width", String(0.8 + (edge.path_count / maxEdge) * 2.4));
+    svg.append(line);
+  }
+
+  // --- ノード ---
+  const layer = document.createElement("div");
+  layer.className = "lattice-nodes";
+  const maxNode = Math.max(1, ...nodes.map((n) => n.path_count));
+  // 隣接するノード。カーソルを当てたときに繋がる相手を浮かせるのに使う。
+  const neighbours = new Map();
+  for (const edge of edges) {
+    if (!edge.source || !edge.target) continue;
+    if (!neighbours.has(edge.source)) neighbours.set(edge.source, new Set());
+    if (!neighbours.has(edge.target)) neighbours.set(edge.target, new Set());
+    neighbours.get(edge.source).add(edge.target);
+    neighbours.get(edge.target).add(edge.source);
+  }
+  for (const node of nodes) {
+    const geometry = box.get(node.id);
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "lattice-node";
+    if (node.is_particle) el.classList.add("is-particle");
+    if (latticeSelection.has(node.id)) el.classList.add("is-selected");
+    if (!liveNodes.has(node.id)) el.classList.add("is-dim");
+    el.style.left = `${geometry.x}px`;
+    el.style.width = `${geometry.w}px`;
+    el.style.top = `${geometry.y}px`;
+    // 経路数を地の濃さに写す。よく使われる語が目に入る。
+    el.style.setProperty("--weight", (node.path_count / maxNode).toFixed(3));
+    el.setAttribute("aria-pressed", String(latticeSelection.has(node.id)));
+    el.title =
+      `${node.source_reading} → ${node.surface} (${node.reading})\n` +
+      `入力の ${node.start + 1}-${node.end} 拍 / 音韻類似度 ${node.similarity.toFixed(3)}\n` +
+      `${node.path_count} 経路が通る` +
+      (node.is_particle ? " / 助詞" : "");
+
+    const surface = document.createElement("span");
+    surface.className = "lattice-node-surface";
+    surface.textContent = node.surface;
+    // 入力側の読み。モーラの目盛りを外したので、どこを覆っているかはこれで読ませる。
+    const meta = document.createElement("span");
+    meta.className = "lattice-node-meta";
+    meta.textContent = node.source_reading;
+    el.append(surface, meta);
+
+    el.addEventListener("click", () => {
+      // 同じノードをもう一度押すと外す。複数選ぶと AND で絞る。
+      if (latticeSelection.has(node.id)) latticeSelection.delete(node.id);
+      else latticeSelection.add(node.id);
+      renderLattice();
+      renderLatticePaths();
+    });
+
+    // そのノードに繋がる辺だけを強調する。縦に離れた辺は曲線の形だけでは
+    // 追えないので、当てているあいだ色を変えて行き先を示す。
+    const spotlight = (on) => {
+      for (const path of svg.querySelectorAll("path")) {
+        const touches = path.dataset.from === node.id || path.dataset.to === node.id;
+        path.classList.toggle("is-hot", on && touches);
+        path.classList.toggle("is-cold", on && !touches);
+      }
+      // 繋がる相手のノードも一緒に浮かせる。
+      for (const other of layer.children) {
+        if (!on) {
+          other.classList.remove("is-near");
+          continue;
+        }
+        const id = other.dataset.nodeId;
+        other.classList.toggle("is-near", neighbours.get(node.id)?.has(id) || id === node.id);
+      }
+    };
+    el.dataset.nodeId = node.id;
+    el.addEventListener("mouseenter", () => spotlight(true));
+    el.addEventListener("mouseleave", () => spotlight(false));
+    el.addEventListener("focus", () => spotlight(true));
+    el.addEventListener("blur", () => spotlight(false));
+    layer.append(el);
+  }
+
+  host.replaceChildren(svg, layer);
+}
+
+/** 絞り込んだ経路を図の下に並べる。図だけでは「結局どう読むのか」が出ないため。 */
+function renderLatticePaths() {
+  const host = $("lattice-paths");
+  const paths = activePaths();
+  const clear = $("lattice-clear");
+  clear.hidden = latticeSelection.size === 0;
+
+  const note = $("lattice-note");
+  if (latticeData) {
+    const parts = [
+      `${latticeData.node_count} ノード / ${latticeData.path_count} 経路`,
+      `ビーム幅 ${latticeData.beam_width}`,
+    ];
+    if (latticeData.truncated) parts.push("予算のため一部の経路のみ");
+    if (latticeSelection.size) parts.push(`選択中 ${latticeSelection.size} — ${paths.length} 経路`);
+    else parts.push("カーソルを当てると繋がる先が光る / 押すとその語を通る経路に絞る");
+    note.textContent = parts.join(" · ");
+  }
+
+  host.replaceChildren(
+    ...paths.slice(0, 20).map((path) => {
+      const row = document.createElement("div");
+      row.className = "lattice-path";
+      const score = document.createElement("span");
+      score.className = "lattice-path-score";
+      score.textContent = path.score.toFixed(3);
+      const text = document.createElement("span");
+      text.className = "lattice-path-text";
+      text.textContent = path.text;
+      const reading = document.createElement("span");
+      reading.className = "lattice-path-reading";
+      reading.textContent = path.reading;
+      row.append(score, text, reading);
+      return row;
+    }),
+  );
+}
+
+async function runPhrase(event) {
+  event?.preventDefault();
+  const text = $("ptext-phrase").value.trim();
+  if (!text) return;
+
+  const status = $("phrase-status");
+  const button = event?.target?.querySelector?.(".run") || null;
+  if (button) button.disabled = true;
+  setStatus(status, "合成中…");
+  // 共通のパラメータ。2 つの経路で同じ条件を使う。
+  const shared = {
+    text,
+    max_chunk_moras: $("ph-max-chunk").value,
+    chunk_candidates: $("ph-chunk-candidates").value,
+    beam_width: $("ph-beam").value,
+    min_chunk_score: $("ph-min-chunk").value,
+    allow_particles: $("ph-particles").checked ? "true" : "false",
+  };
+  const lattice = phraseView === "lattice";
+  try {
+    const started = performance.now();
+    const data = lattice
+      ? await getJSON("/api/phrase/lattice", {
+          ...shared,
+          node_budget: $("ph-node-budget").value,
+        })
+      : await getJSON("/api/phrase", { ...shared, limit: $("ph-limit").value });
+    const elapsed = Math.round(performance.now() - started);
+
+    $("rp-reading").textContent = data.reading || "(読みが取れない)";
+    $("rp-ipa").textContent = data.ipa ? `[${data.ipa}]` : "—";
+    $("rp-mora").textContent = `${data.mora_count} モーラ`;
+    $("phrase-readout").hidden = false;
+
+    // 表示するのは片方だけ。切り替えのたびに引き直すので、もう一方は消す。
+    $("phrase-results").hidden = lattice;
+    $("lattice-wrap").hidden = !lattice;
+
+    if (lattice) {
+      latticeSelection.clear();
+      latticeData = data.nodes.length ? data : null;
+      renderLattice();
+      renderLatticePaths();
+      if (!data.nodes.length) {
+        setStatus(status, `該当なし (${elapsed}ms) — 区間スコア下限を下げると候補が増える`);
+        return;
+      }
+      setStatus(status, `${data.node_count} ノード / ${data.path_count} 経路 (${elapsed}ms)`);
+      return;
+    }
+
+    const results = $("phrase-results");
+    if (!data.results.length) {
+      results.replaceChildren();
+      setStatus(status, `該当なし (${elapsed}ms) — 区間スコア下限を下げると候補が増える`);
+      return;
+    }
+    results.replaceChildren(...data.results.map((c, i) => phraseCard(c, i + 1)));
+    setStatus(status, `${data.results.length} 件 (${elapsed}ms)`);
+  } catch (error) {
+    setStatus(status, error.message, true);
+    $("phrase-results").replaceChildren();
+    $("lattice-wrap").hidden = true;
+    $("phrase-readout").hidden = true;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 /* ---------- 読み ---------- */
 
 async function runPronounce(event) {
@@ -797,7 +1255,29 @@ function selectView(name) {
 
 async function main() {
   $("search-form").addEventListener("submit", runSearch);
+  $("phrase-form").addEventListener("submit", runPhrase);
   $("pronounce-form").addEventListener("submit", runPronounce);
+
+  // 一覧 / ラティスの切り替え。同じ経路集合の別の見せ方なので、条件は変えずに
+  // 引き直す。`.seg` は検索タブのプリセットと同じクラスなので、この
+  // グループの中だけを見る。
+  for (const seg of $("phrase-view-group").querySelectorAll(".seg")) {
+    seg.addEventListener("click", () => {
+      phraseView = seg.dataset.phraseView;
+      for (const other of $("phrase-view-group").querySelectorAll(".seg")) {
+        const on = other === seg;
+        other.classList.toggle("is-active", on);
+        other.setAttribute("aria-checked", String(on));
+      }
+      if ($("ptext-phrase").value.trim()) runPhrase();
+    });
+  }
+
+  $("lattice-clear").addEventListener("click", () => {
+    latticeSelection.clear();
+    renderLattice();
+    renderLatticePaths();
+  });
 
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => selectView(tab.dataset.view));
@@ -845,10 +1325,14 @@ async function main() {
   }
   applyIpaToggle();
 
-  for (const seg of document.querySelectorAll(".seg")) {
+  // **プリセットのグループの中だけを見る。** `.seg` は分割合成ビューの
+  // 見せ方の切り替えにも使っているので、文書全体から引くとあちらを押したときに
+  // activePreset が undefined になり、検索が壊れる。
+  const presetGroup = $("preset-group");
+  for (const seg of presetGroup.querySelectorAll(".seg")) {
     seg.addEventListener("click", () => {
       activePreset = seg.dataset.preset;
-      for (const other of document.querySelectorAll(".seg")) {
+      for (const other of presetGroup.querySelectorAll(".seg")) {
         const on = other === seg;
         other.classList.toggle("is-active", on);
         other.setAttribute("aria-checked", String(on));
@@ -873,6 +1357,17 @@ async function main() {
       `${info.count.toLocaleString("ja-JP")} 語 / SudachiDict ${info.dict_type}`;
     $("candidates").value = String(info.default_candidates);
     renderCategoryChips(info.categories);
+    // 分割合成の既定値もサーバから受け取る。phrase.py の定数を変えたときに
+    // 画面の初期値が黙ってずれないようにする (音素の色と同じ理由)。
+    if (info.phrase) {
+      $("ph-max-chunk").value = String(info.phrase.max_chunk_moras);
+      $("ph-chunk-candidates").value = String(info.phrase.chunk_candidates);
+      $("ph-beam").value = String(info.phrase.beam_width);
+      $("ph-min-chunk").value = String(info.phrase.min_chunk_score);
+      $("ph-limit").max = String(info.phrase.max_limit);
+      $("ph-node-budget").value = String(info.phrase.node_budget);
+      $("ph-node-budget").max = String(info.phrase.max_node_budget);
+    }
   } catch {
     $("corpus-note").textContent = "索引が未構築 — `jpr build-index` で構築する";
   }
@@ -880,7 +1375,7 @@ async function main() {
   const params = new URLSearchParams(location.search);
   const preset = params.get("preset");
   if (preset) {
-    const seg = document.querySelector(`.seg[data-preset="${CSS.escape(preset)}"]`);
+    const seg = presetGroup.querySelector(`.seg[data-preset="${CSS.escape(preset)}"]`);
     if (seg) seg.click();
   }
   const minMora = params.get("min_mora");
@@ -892,7 +1387,11 @@ async function main() {
   const limit = params.get("limit");
   if (limit) $("limit").value = limit;
   // 共有された URL でモーラ範囲が効いているなら、絞り込みを開いて見せる。
-  if (minMora || maxMora) document.querySelector(".advanced")?.setAttribute("open", "");
+  // **検索ビューの中を指定する** — `.advanced` は分割合成ビューにもあるので、
+  // 文書全体から引くと先に出てくる別のビューの詳細が開く。
+  if (minMora || maxMora) {
+    document.querySelector("#view-search .advanced")?.setAttribute("open", "");
+  }
 
   const query = params.get("q");
   if (query) {

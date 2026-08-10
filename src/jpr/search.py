@@ -39,6 +39,17 @@ from .index import (
     IndexEntry,
 )
 from .phonology import Pronunciation, analyze_reading
+from .phrase import (
+    DEFAULT_BEAM_WIDTH,
+    DEFAULT_CHUNK_CANDIDATES,
+    DEFAULT_MAX_CHUNK_MORAS,
+    DEFAULT_MAX_NODES_PER_SPAN,
+    DEFAULT_MIN_CHUNK_SCORE,
+    DEFAULT_NODE_BUDGET,
+    PhraseCandidate,
+    PhraseComposer,
+    PhraseLattice,
+)
 from .reading import ReadingExtractor
 from .store import PhoneticStore
 
@@ -248,6 +259,7 @@ class PhoneticSearcher:
         self._extractor = extractor
         self._category_ids = store.category_ids
         self._mora_counts = store.mora_counts
+        self._composer: PhraseComposer | None = None
 
     @property
     def extractor(self) -> ReadingExtractor:
@@ -811,6 +823,81 @@ class PhoneticSearcher:
     def compare(self, a: str, b: str) -> ComparisonResult:
         """2 つのテキストの音韻類似度を計算する。"""
         return compare_pronunciations(a, b, self.pronounce(a), self.pronounce(b))
+
+    # --- 分割合成 ---------------------------------------------------------
+
+    @property
+    def composer(self) -> PhraseComposer:
+        """分割合成器 (`phrase.PhraseComposer`)。
+
+        モーラ数ごとの行の選抜を抱えるので (実測 150〜330ms)、窓ごとに作り直さず
+        searcher に持たせて使い回す。常駐する窓 (Web / MCP) ではこれが体感を
+        分ける。カテゴリを変えて合成したいときは `PhraseComposer` を直接作る。
+        """
+        if self._composer is None:
+            self._composer = PhraseComposer(self.store)
+        return self._composer
+
+    def compose(
+        self,
+        text: str,
+        *,
+        limit: int = 10,
+        max_chunk_moras: int = DEFAULT_MAX_CHUNK_MORAS,
+        chunk_candidates: int = DEFAULT_CHUNK_CANDIDATES,
+        beam_width: int = DEFAULT_BEAM_WIDTH,
+        min_chunk_score: float = DEFAULT_MIN_CHUNK_SCORE,
+        allow_particles: bool = True,
+    ) -> tuple[Pronunciation, list[PhraseCandidate]]:
+        """`text` の音を「複数の語 + 助詞」の連なりで組み立てる。
+
+        長い入力に音が近い**単一の語**は辞書に無いので、通常の `search` では
+        答えが返らない。こちらは入力をモーラ境界で区間に切り、区間ごとに語を
+        当てて繋ぐ (`phrase.py` 参照)。空耳・替え歌の経路。
+
+        読みの解析はここで行うので、漢字を含むテキストをそのまま渡せる
+        (`PhraseComposer.compose` 自体は Sudachi を持たない)。
+        """
+        return self.composer.compose(
+            text,
+            pronunciation=self.pronounce(text),
+            limit=limit,
+            max_chunk_moras=max_chunk_moras,
+            chunk_candidates=chunk_candidates,
+            beam_width=beam_width,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
+
+    def lattice(
+        self,
+        text: str,
+        *,
+        node_budget: int = DEFAULT_NODE_BUDGET,
+        max_nodes_per_span: int = DEFAULT_MAX_NODES_PER_SPAN,
+        max_chunk_moras: int = DEFAULT_MAX_CHUNK_MORAS,
+        chunk_candidates: int = DEFAULT_CHUNK_CANDIDATES,
+        beam_width: int = DEFAULT_BEAM_WIDTH,
+        min_chunk_score: float = DEFAULT_MIN_CHUNK_SCORE,
+        allow_particles: bool = True,
+    ) -> tuple[Pronunciation, PhraseLattice]:
+        """`compose` と同じ経路集合を 1 枚の DAG に畳んで返す。
+
+        候補を並べると同じ語が何度も出る (実測で区間の 65〜77% が重複)。
+        ノードに畳むと 1 度しか現れず、分岐だけが見える。`node_budget` に
+        届くまでビーム幅を広げる (`phrase.PhraseComposer.lattice`)。
+        """
+        return self.composer.lattice(
+            text,
+            pronunciation=self.pronounce(text),
+            node_budget=node_budget,
+            max_nodes_per_span=max_nodes_per_span,
+            max_chunk_moras=max_chunk_moras,
+            chunk_candidates=chunk_candidates,
+            beam_width=beam_width,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
 
 
 def compare_pronunciations(

@@ -12,6 +12,7 @@ LLM が弱い「音韻空間」を外部の検索システムとして提供す�
 from .distance import phoneme_distance, phonetic_similarity, weighted_edit_distance
 from .index import Category, IndexEntry
 from .phonology import Mora, Pronunciation, analyze_reading
+from .phrase import PhraseCandidate, PhraseComposer, PhraseSegment
 from .reading import ReadingExtractor
 from .search import (
     PRESETS,
@@ -31,6 +32,9 @@ __all__ = [
     "Mora",
     "PhoneticSearcher",
     "PhoneticStore",
+    "PhraseCandidate",
+    "PhraseComposer",
+    "PhraseSegment",
     "Pronunciation",
     "ReadingExtractor",
     "ScoreWeights",

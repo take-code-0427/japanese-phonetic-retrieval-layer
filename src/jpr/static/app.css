@@ -657,6 +657,271 @@ main {
 }
 .align-foot b { color: var(--ink); font-weight: 600; }
 
+/* ---------- 分割合成 (空耳) ---------- */
+
+/* 結果はモーラ列の枠 (`.mora-columns`) に載せない。あちらは「モーラ数ごとに
+ * 列を立てて順位を読み比べる」ための配り方だが、合成候補はどれも入力と同じ
+ * モーラ数なので列に分ける軸がない。1 件が区間の対応帯を持って縦に伸びるため、
+ * 素直に 1 列で積む。 */
+.phrases {
+  margin-top: 22px;
+  display: grid;
+  gap: 10px;
+  /* 対応帯は横に長くなりうるので、読みやすい幅で止める。 */
+  max-width: 1080px;
+}
+
+.phrase {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--p-palatal);
+  border-radius: var(--r);
+  padding: 12px 16px 14px;
+}
+
+.phrase-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.phrase-rank {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+  min-width: 1.5em;
+}
+.phrase-text { font-size: 19px; font-weight: 600; }
+.phrase-reading { font-family: var(--mono); font-size: 13px; color: var(--ink-dim); }
+.phrase-score {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--p-palatal);
+}
+
+/* 区間の対応帯。
+ *
+ * 列の幅をモーラ数に比例させる (`flex-grow`)。等幅にすると 1 モーラの助詞と
+ * 4 モーラの語が同じ幅になり、「入力のどこを覆っているか」が読めなくなる。
+ * 区間は入力を隙間なく覆うので、帯全体の幅が入力の長さに対応する。 */
+.seg-grid {
+  margin-top: 12px;
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+}
+.seg-col {
+  flex: 1 1 0;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  justify-items: center;
+  padding: 8px 6px 6px;
+  background: var(--bg);
+  border-radius: var(--r);
+}
+/* 助詞は繋ぎなので沈めて出す。語と同じ強さで並べると、どこが「意味を持つ語」
+ * なのかが読み取れない。 */
+.seg-col.is-particle { background: var(--bg-sunken); }
+.seg-col.is-particle .seg-surface { color: var(--ink-dim); font-weight: 400; }
+
+.seg-source {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.seg-arrow { font-size: 10px; color: var(--line-bright); line-height: 1; }
+.seg-surface {
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+  /* 長い表層で列を潰さない。折り返して縦に伸ばす。 */
+  overflow-wrap: anywhere;
+}
+.seg-meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+/* 区間ごとの音の一致度。どこで音が外れたかを帯の下端で示す。数値は title に
+ * 入れて、画面では相対的な長さだけを読ませる (結果カードのスコア棒と同じ
+ * 二重表現)。 */
+.seg-bar {
+  margin-top: 2px;
+  width: 100%;
+  height: 2px;
+  background: var(--line);
+  border-radius: 1px;
+  position: relative;
+}
+.seg-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--fill, 0%);
+  background: var(--p-alveolar);
+  border-radius: 1px;
+}
+.seg-col.is-particle .seg-bar::after { background: var(--special); }
+
+/* チェックボックスのノブ。数値入力と違って高さが揃わないので個別に置く。 */
+.knob-check { display: grid; gap: 4px; }
+.knob-check input { width: auto; justify-self: start; }
+
+/* ---------- ラティス図 ---------- */
+
+/* 候補を並べると同じ語が何度も出る (実測で区間の 65〜77% が重複)。ノードに
+ * 畳んで 1 度だけ描き、分岐を辺で見せる。
+ *
+ * ノードは div、辺は背後の SVG。辺を DOM で描くと曲線が引けず、ノードを SVG に
+ * 入れるとテキストの折り返しが効かないので、両方の都合を取っている。
+ *
+ * **横軸はモーラ位置ではない。** 位置に幅を比例させると 1 モーラのノードが
+ * 78px しか取れず、隣の列が遠くに離れて辺の行き先が読めなかった。列の幅は
+ * 中身が要る分だけ取り、上下の位置合わせは捨てている (`layoutLattice`)。
+ * どのモーラを覆っているかはノード内の読みが示す。 */
+.lattice-wrap { margin-top: 22px; }
+
+.lattice-legend {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.lattice-legend .hint { margin: 0; }
+
+.lattice-clear {
+  font: inherit;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--p-alveolar);
+  background: none;
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.lattice-clear:hover { border-color: var(--p-alveolar); }
+
+/* 図は入力の長さに比例して横に伸びる。折り返すと経路が追えなくなるので
+ * 横スクロールにする (モーラ列の枠と同じ判断)。 */
+.lattice-scroll {
+  overflow-x: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 12px 16px 16px;
+}
+.lattice { position: relative; }
+
+.lattice-edges { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+.lattice-edge {
+  fill: none;
+  stroke: var(--line-bright);
+  opacity: 0.5;
+}
+/* 絞り込みで残った経路の辺。選択していないときは全部が is-live。 */
+.lattice-edge.is-live { stroke: var(--p-palatal); opacity: 0.85; }
+
+/* カーソルを当てたノードに繋がる辺だけを立てる。
+ *
+ * 縦に離れた辺 (実測で最大 276px = 6 行ぶん) は曲線の形だけでは追えない。
+ * 列の並び順を繋がり先に寄せて縮めてはいるが、多くの経路が同じ語に収束する
+ * 構造なので縦の移動は残る。当てているあいだ他を沈めて行き先を示す。 */
+.lattice-edge.is-hot {
+  stroke: var(--p-alveolar);
+  opacity: 1;
+  stroke-width: 2.5px !important;
+}
+.lattice-edge.is-cold { opacity: 0.08; }
+
+.lattice-nodes { position: relative; }
+
+.lattice-node {
+  position: absolute;
+  height: 34px;
+  display: grid;
+  align-content: center;
+  gap: 1px;
+  padding: 0 6px;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  /* 経路数を地の濃さに写す (--weight は JS が入れる)。よく使われる語が
+   * 目に入るようにする。数値は title に持たせる。 */
+  background: color-mix(in oklab, var(--bg-raised), var(--p-palatal) calc(var(--weight, 0) * 26%));
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r);
+  color: var(--ink);
+  overflow: hidden;
+}
+.lattice-node:hover { border-color: var(--p-palatal); }
+.lattice-node.is-selected {
+  border-color: var(--p-alveolar);
+  box-shadow: 0 0 0 1px var(--p-alveolar);
+}
+/* 当てているノードと、それに繋がる相手。辺だけでなくノード側も示すと
+ * 「どこからどこへ」が一目で読める。 */
+.lattice-node.is-near { border-color: var(--p-alveolar); }
+/* 絞り込みで経路から外れたノード。消さずに沈める — 消すと図の形が変わって
+ * どこを絞ったのかが読めなくなる。 */
+.lattice-node.is-dim { opacity: 0.28; }
+.lattice-node.is-particle {
+  background: var(--bg-sunken);
+  border-style: dashed;
+}
+.lattice-node.is-particle .lattice-node-surface { color: var(--ink-dim); font-weight: 400; }
+
+.lattice-node-surface {
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.lattice-node-meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+/* 絞り込んだ経路。図だけでは「結局どう読むのか」が出ないので下に並べる。 */
+.lattice-paths { margin-top: 14px; display: grid; gap: 4px; max-width: 1080px; }
+.lattice-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 5px 10px;
+  background: var(--bg-raised);
+  border-left: 2px solid var(--line-bright);
+  border-radius: var(--r);
+}
+.lattice-path-score {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--p-palatal);
+}
+.lattice-path-text { font-size: 15px; font-weight: 600; }
+.lattice-path-reading { font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim); }
+
 /* ---------- 読み ---------- */
 
 .analysis { margin-top: 24px; }

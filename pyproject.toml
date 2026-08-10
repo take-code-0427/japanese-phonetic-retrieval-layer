@@ -1,10 +1,10 @@
 [project]
 name = "jpr"
 version = "0.1.0"
-description = "Add your description here"
+description = "日本語の音韻空間を検索レイヤーとして提供する (Phonetic RAG)"
 readme = "README.md"
 authors = [
-    { name = "take-code-0427", email = "take-code-0427@e-seikatsu.co.jp" }
+    { name = "take-code-0427", email = "modsyoukaizenryoku@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [

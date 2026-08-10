@@ -11,6 +11,12 @@ from pathlib import Path
 from .distance import ipa_transcription
 from .index import Category
 from .phonology import analyze_reading
+from .phrase import (
+    DEFAULT_BEAM_WIDTH,
+    DEFAULT_CHUNK_CANDIDATES,
+    DEFAULT_MAX_CHUNK_MORAS,
+    DEFAULT_MIN_CHUNK_SCORE,
+)
 from .search import DEFAULT_CANDIDATES, DEFAULT_PRESET, PRESETS, PhoneticSearcher
 from .store import INNER_PRODUCT_SPACES, PhoneticStore, default_store_path
 
@@ -147,6 +153,84 @@ def cmd_similar(args: argparse.Namespace) -> int:
             f"{result.mora_count:3d}  "
             f"{result.surface:<16} {result.reading:<14} {result.category.value}"
         )
+    return 0
+
+
+def cmd_phrase(args: argparse.Namespace) -> int:
+    """長い入力を「複数の語 + 助詞」の連なりに合成する。"""
+    searcher = _open_searcher(args.index)
+
+    started = time.perf_counter()
+    pronunciation, candidates = searcher.compose(
+        args.text,
+        limit=args.limit,
+        max_chunk_moras=args.max_chunk,
+        chunk_candidates=args.chunk_candidates,
+        beam_width=args.beam,
+        min_chunk_score=args.min_chunk_score,
+        allow_particles=not args.no_particles,
+    )
+    elapsed = (time.perf_counter() - started) * 1000
+
+    if args.json:
+        _print_json(
+            {
+                "text": args.text,
+                "reading": pronunciation.reading,
+                "phonemes": list(pronunciation.phonemes),
+                "ipa": ipa_transcription(pronunciation.phonemes),
+                "mora_count": pronunciation.mora_count,
+                "elapsed_ms": round(elapsed, 1),
+                "result_count": len(candidates),
+                "results": [
+                    {
+                        "text": c.text,
+                        "reading": c.reading,
+                        "score": c.score,
+                        "phonetic_similarity": c.phonetic_similarity,
+                        "segment_count": c.segment_count,
+                        "segments": [
+                            {
+                                "surface": s.surface,
+                                "reading": s.reading,
+                                "source_reading": s.source_reading,
+                                "start": s.start,
+                                "end": s.end,
+                                "mora_count": s.mora_count,
+                                "similarity": s.similarity,
+                                "is_particle": s.is_particle,
+                                "phonemes": list(s.phonemes),
+                                "ipa": ipa_transcription(s.phonemes),
+                            }
+                            for s in c.segments
+                        ],
+                    }
+                    for c in candidates
+                ],
+            }
+        )
+        return 0
+
+    print(
+        f"{args.text} -> {pronunciation.reading} "
+        f"/{pronunciation.phoneme_string()}/ "
+        f"[{ipa_transcription(pronunciation.phonemes)}] "
+        f"{pronunciation.mora_count} モーラ  ({elapsed:.0f}ms)"
+    )
+    if not candidates:
+        print("該当なし")
+        return 0
+
+    # 区間の対応が読めないと空耳として検証できないので、表層だけでなく
+    # 「入力のどこが何になったか」を 2 行目に出す。
+    print()
+    for candidate in candidates:
+        print(f"{candidate.score:6.3f}  {candidate.text}   [{candidate.reading}]")
+        parts = " | ".join(
+            f"{segment.source_reading}→{segment.surface}({segment.similarity:.2f})"
+            for segment in candidate.segments
+        )
+        print(f"        {parts}")
     return 0
 
 
@@ -329,6 +413,49 @@ def build_parser() -> argparse.ArgumentParser:
     similar.add_argument("--json", action="store_true", help="JSON で出力する")
     _add_store_argument(similar)
     similar.set_defaults(func=cmd_similar)
+
+    phrase = subparsers.add_parser(
+        "phrase",
+        help="長い入力を複数の語 + 助詞の連なりに合成する (空耳)",
+        description=(
+            "入力をモーラ境界で区間に切り、区間ごとに音の近い語を当てて繋ぐ。"
+            "長い入力に音が近い単一の語は辞書に無いので、similar では答えが返らない。"
+        ),
+    )
+    phrase.add_argument("text", help="入力 (漢字・かな・カタカナ)")
+    phrase.add_argument("-n", "--limit", type=int, default=10, help="結果数 (既定: %(default)s)")
+    phrase.add_argument(
+        "--max-chunk",
+        type=int,
+        default=DEFAULT_MAX_CHUNK_MORAS,
+        help="1 区間に許すモーラ数の上限。上げると遅くなる (既定: %(default)s)",
+    )
+    phrase.add_argument(
+        "--chunk-candidates",
+        type=int,
+        default=DEFAULT_CHUNK_CANDIDATES,
+        help="1 区間あたり保持する語の数 (既定: %(default)s)",
+    )
+    phrase.add_argument(
+        "--beam",
+        type=int,
+        default=DEFAULT_BEAM_WIDTH,
+        help="連結の探索幅。上げると取り逃がしが減り遅くなる (既定: %(default)s)",
+    )
+    phrase.add_argument(
+        "--min-chunk-score",
+        type=float,
+        default=DEFAULT_MIN_CHUNK_SCORE,
+        help="区間ごとの音韻類似度の下限 (既定: %(default)s)",
+    )
+    phrase.add_argument(
+        "--no-particles",
+        action="store_true",
+        help="助詞を繋ぎに使わない (1 モーラの区間が埋まらなくなる)",
+    )
+    phrase.add_argument("--json", action="store_true", help="JSON で出力する")
+    _add_store_argument(phrase)
+    phrase.set_defaults(func=cmd_phrase)
 
     compare = subparsers.add_parser("compare", help="2 語の音韻類似度を計算する")
     compare.add_argument("a")

@@ -31,6 +31,7 @@
   <div class="tabbar">
     <nav class="tabs" role="tablist" aria-label="機能">
       <button role="tab" class="tab is-active" data-view="search" aria-selected="true">検索</button>
+      <button role="tab" class="tab" data-view="phrase" aria-selected="false">分割合成</button>
       <button role="tab" class="tab" data-view="pronounce" aria-selected="false">読み</button>
       <button role="tab" class="tab" data-view="info" aria-selected="false">索引</button>
     </nav>
@@ -127,6 +128,100 @@
 
   <!-- 結果はモーラ数ごとの列に分かれる。列の生成は JS 側 (renderMoraColumns)。 -->
   <div class="mora-columns" id="results"></div>
+</section>
+
+<!-- ============ 分割合成 (空耳) ============ -->
+<section class="view" id="view-phrase" role="tabpanel">
+  <form class="query" id="phrase-form">
+    <div class="query-main">
+      <label class="field-label" for="ptext-phrase">フレーズ</label>
+      <input id="ptext-phrase" type="text" placeholder="わたしのなまえは"
+             autocomplete="off" spellcheck="false" required>
+      <span class="hint">長い入力をモーラ境界で区切り、区間ごとに音の近い語を当てて繋ぐ。長い入力に音が近い単一の語は辞書に無いので、検索タブでは答えが出ない</span>
+    </div>
+    <div class="query-preset">
+      <span class="field-label">見せ方</span>
+      <div class="segmented" id="phrase-view-group" role="radiogroup" aria-label="見せ方">
+        <button type="button" role="radio" class="seg is-active" data-phrase-view="list"
+                aria-checked="true">
+          <span class="seg-name">一覧</span><span class="seg-note">候補を並べる</span>
+        </button>
+        <button type="button" role="radio" class="seg" data-phrase-view="lattice"
+                aria-checked="false">
+          <span class="seg-name">ラティス</span><span class="seg-note">同じ語を 1 つに畳む</span>
+        </button>
+      </div>
+    </div>
+    <button class="run" type="submit">合成</button>
+  </form>
+
+  <details class="advanced">
+    <summary>詳細な条件</summary>
+    <div class="advanced-body">
+      <div class="knobs">
+        <label class="knob">
+          <span class="field-label">件数</span>
+          <input id="ph-limit" type="number" value="10" min="1" max="50">
+        </label>
+        <label class="knob">
+          <span class="field-label">1 区間の最大モーラ</span>
+          <input id="ph-max-chunk" type="number" value="4" min="1" max="8">
+          <span class="hint">上げると長い語を当てられるが区間が増えて遅くなる</span>
+        </label>
+        <label class="knob">
+          <span class="field-label">区間あたりの候補数</span>
+          <input id="ph-chunk-candidates" type="number" value="12" min="1" max="64">
+        </label>
+        <label class="knob">
+          <span class="field-label">探索幅 (ビーム)</span>
+          <input id="ph-beam" type="number" value="24" min="1" max="256">
+          <span class="hint">上げると取り逃がしが減り遅くなる</span>
+        </label>
+        <label class="knob">
+          <span class="field-label">区間スコア下限</span>
+          <input id="ph-min-chunk" type="number" value="0.55" min="0" max="1" step="0.05">
+        </label>
+        <label class="knob">
+          <span class="field-label">ノード数の予算</span>
+          <input id="ph-node-budget" type="number" value="40" min="2" max="200">
+          <span class="hint">ラティス表示のみ。届くまでビーム幅を広げるので、上げると探索が伸びる</span>
+        </label>
+        <label class="knob knob-check">
+          <span class="field-label">助詞を繋ぎに使う</span>
+          <input id="ph-particles" type="checkbox" checked>
+          <span class="hint">索引に 1 モーラの語が無いので、外すと 1 モーラの区間が埋まらない</span>
+        </label>
+      </div>
+    </div>
+  </details>
+
+  <div id="phrase-status" class="status" role="status"></div>
+
+  <!-- 入力側の読みと連続表記。区間の対応を読むのに要る。 -->
+  <div id="phrase-readout" class="readout" hidden>
+    <div class="readout-row">
+      <span class="readout-label">読み</span>
+      <span class="readout-value" id="rp-reading"></span>
+      <span class="readout-label">IPA</span>
+      <span class="readout-value ipa" id="rp-ipa"></span>
+      <span class="readout-label">モーラ</span>
+      <span class="readout-value" id="rp-mora"></span>
+    </div>
+  </div>
+
+  <div class="phrases" id="phrase-results"></div>
+
+  <!-- ラティス図。ノードを選ぶと経路が絞られる。 -->
+  <div class="lattice-wrap" id="lattice-wrap" hidden>
+    <div class="lattice-legend">
+      <span class="hint" id="lattice-note"></span>
+      <button type="button" class="lattice-clear" id="lattice-clear" hidden>選択を解除</button>
+    </div>
+    <div class="lattice-scroll">
+      <div class="lattice" id="lattice"></div>
+    </div>
+    <div class="lattice-paths" id="lattice-paths"></div>
+  </div>
 </section>
 
 <!-- ============ 読み ============ -->

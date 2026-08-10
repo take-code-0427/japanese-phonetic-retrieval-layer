@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -25,7 +26,12 @@ async def call(server, name: str, arguments: dict) -> dict:
 @pytest.mark.asyncio
 async def test_tools_are_registered(server) -> None:
     names = {tool.name for tool in await server.list_tools()}
-    assert names == {"search_phonetically", "compare_phonetically", "pronounce"}
+    assert names == {
+        "search_phonetically",
+        "compose_phrase",
+        "compare_phonetically",
+        "pronounce",
+    }
 
 
 @pytest.mark.asyncio
@@ -102,6 +108,33 @@ async def test_search_caps_limit_for_the_context_window(server) -> None:
     # 0 や負の件数を渡されても 1 件以上は返す (0 件を無制限と誤解させない)。
     zero = await call(server, "search_phonetically", {"query": "チョコビ", "limit": 0})
     assert zero["results"]
+
+
+@pytest.mark.asyncio
+async def test_compose_splits_the_input_into_segments(server) -> None:
+    """長い入力が複数の区間に分かれ、どこが何になったかが返る。"""
+    payload = await call(server, "compose_phrase", {"text": "チョコビラーメン", "limit": 5})
+    assert payload["results"]
+    best = payload["results"][0]
+    # 8 モーラの入力は sample_store の語 1 つでは覆えないので必ず分割される。
+    assert best["segment_count"] >= 2
+    # 区間の対応が読めないと空耳として検証できない。
+    for segment in best["segments"]:
+        assert set(segment) >= {"surface", "reading", "source_reading", "mora_range"}
+        start, end = segment["mora_range"]
+        assert start < end
+    # 区間は入力を隙間なく覆う。
+    covered = [s["mora_range"] for s in best["segments"]]
+    assert covered[0][0] == 0
+    assert covered[-1][1] == payload["mora_count"]
+    for left, right in itertools.pairwise(covered):
+        assert left[1] == right[0]
+
+
+@pytest.mark.asyncio
+async def test_compose_warns_that_score_ignores_meaning(server) -> None:
+    payload = await call(server, "compose_phrase", {"text": "チョコビラーメン"})
+    assert "意味" in payload["note"]
 
 
 @pytest.mark.asyncio

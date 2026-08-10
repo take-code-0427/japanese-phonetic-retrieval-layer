@@ -10,6 +10,8 @@ API は CLI の `--json` 出力と同じ構造を返す。フロント側の JS 
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +69,21 @@ MAX_PHRASE_LIMIT = 50
 #: 画面に収まる限界の目安。
 MAX_NODE_BUDGET = 200
 
+#: モーラ範囲の全走査を同時に走らせる本数。
+#:
+#: 全走査は母集団ぶんの内積を一時配列に起こすので、1 本で +279MB・10 本で
+#: +348MB 使う (通常検索は 10 並行でも +13MB)。2GB の割り当てでは並行度を
+#: 抑えないと OOM で SIGKILL される (実測: anon-rss 1.9GB で kill)。
+#: 待たせるほうが落とすよりましなので、この経路だけ直列に近づける。
+#: 通常検索とは別の門にしてあるので、軽いリクエストは待たされない。
+MAX_CONCURRENT_SCANS = 2
+
+#: 全走査の順番待ちを諦める秒数。
+#:
+#: 待ち行列が伸びたときに無制限に待たせるとクライアントのタイムアウトと
+#: 二重待ちになるので、503 で明示的に断る。
+SCAN_QUEUE_TIMEOUT = 30.0
+
 
 def _parse_categories(value: str | None) -> list[Category] | None:
     """カンマ区切りのカテゴリ名を Category に変換する。"""
@@ -102,6 +119,30 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
     # 無い環境でもサーバは起動でき、/api/info が原因を 503 で返せるようにする。
     state: dict[str, PhoneticSearcher] = {}
 
+    # 全走査の同時実行を絞る門 (`MAX_CONCURRENT_SCANS` 参照)。エンドポイントは
+    # 非 async なのでスレッドプールで動く。threading の semaphore で足りる。
+    scan_gate = threading.Semaphore(MAX_CONCURRENT_SCANS)
+
+    @contextmanager
+    def limit_scans():
+        """モーラ範囲の全走査を `MAX_CONCURRENT_SCANS` 本までに絞る。
+
+        取れなければ 503 で断る。待ち続けるとクライアント側のタイムアウトと
+        二重待ちになり、どちらが原因か画面から読めなくなる。
+        """
+        if not scan_gate.acquire(timeout=SCAN_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "モーラ範囲の全走査が混み合っています "
+                    f"(同時 {MAX_CONCURRENT_SCANS} 本まで)。時間をおいて再試行してください。"
+                ),
+            )
+        try:
+            yield
+        finally:
+            scan_gate.release()
+
     def searcher() -> PhoneticSearcher:
         if "searcher" not in state:
             try:
@@ -135,22 +176,27 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         # モーラ範囲を指定すると ANN を迂回して全走査するので、母集団の
         # 規模をレスポンスに含めて「なぜ遅いのか」を画面から読めるようにする。
         scanned: int | None = None
-        if min_mora is not None or max_mora is not None:
+        scanning = min_mora is not None or max_mora is not None
+        if scanning:
             try:
                 scanned = engine.mora_range_size(min_mora, max_mora)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from None
 
-        pronunciation, results = engine.search(
-            q,
-            limit=None if limit == 0 else limit,
-            preset=preset,
-            candidates=candidates,
-            min_score=min_score,
-            categories=_parse_categories(categories),
-            min_mora=min_mora,
-            max_mora=max_mora,
-        )
+        # 全走査は母集団ぶんの一時配列を作るので、並行で走らせるとメモリが
+        # 溢れる (`MAX_CONCURRENT_SCANS` 参照)。ANN 経路は 10 並行でも
+        # +13MB しか増えないので門を通さない。
+        with limit_scans() if scanning else nullcontext():
+            pronunciation, results = engine.search(
+                q,
+                limit=None if limit == 0 else limit,
+                preset=preset,
+                candidates=candidates,
+                min_score=min_score,
+                categories=_parse_categories(categories),
+                min_mora=min_mora,
+                max_mora=max_mora,
+            )
         total = len(results)
         truncated = total > MAX_UNLIMITED
         if truncated:

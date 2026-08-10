@@ -14,9 +14,12 @@ primary_region = 'nrt'
   min_machines_running = 1
 
 [[vm]]
-  # 実測のピーク RSS は core で 0.86GB。索引の mmap がページキャッシュを
-  # 使うので、余裕を持たせるほど 2 回目以降が速い。本番の実測で
-  # MemAvailable 949MB / Cached 997MB。
-  memory = '2gb'
+  # 単発のピーク RSS は core で 0.86GB だが、モーラ範囲の全走査が母集団ぶんの
+  # 一時配列を作るので 1 本で +279MB・10 本で +348MB 積む。2GB では並行
+  # リクエストで OOM killed になった (実測: anon-rss 1.9GB で SIGKILL、
+  # 502 が 60 並行中 15 件)。web.py 側でも全走査を 2 本に絞っているが、
+  # 索引の mmap がページキャッシュを使うぶんも同じ cgroup に乗るため、
+  # 余裕を持たせるほうが体感が安定する。
+  memory = '4gb'
   cpus = 1
-  memory_mb = 2048
+  memory_mb = 4096

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -313,6 +315,71 @@ def test_concurrent_requests_do_not_return_errors(client: TestClient) -> None:
 
     failed = [r for r in responses if r.status_code != 200]
     assert not failed, f"{len(failed)} 件が失敗: {failed[0].status_code} {failed[0].text[:200]}"
+
+
+def test_mora_scan_concurrency_is_capped(sample_store: PhoneticStore) -> None:
+    """モーラ範囲の全走査は同時実行数が制限される。
+
+    全走査は母集団ぶんの内積を一時配列に起こすので、並行させるとメモリが
+    溢れる (実測で 1 本 +279MB / 10 本 +348MB、2GB の本番が OOM killed に
+    なった)。門が実際に閉じることを、同時に入った本数の最大値で見る。
+    """
+    import concurrent.futures
+    import contextlib
+    import threading
+
+    from jpr import web as web_module
+
+    app = create_app(sample_store.path)
+    client = TestClient(app)
+
+    workers = 8
+    inside = 0
+    peak = 0
+    guard = threading.Lock()
+    original = web_module.PhoneticSearcher.search
+    # 全員が門をくぐろうとするまで中で待たせる。門が開いていれば workers 本が
+    # 揃って peak == workers になり、閉じていれば揃わずタイムアウトで抜ける。
+    # sleep で代用すると、小さな語彙では走査が一瞬で終わって同時に入らない。
+    gathered = threading.Barrier(workers, timeout=1.0)
+
+    def slow_search(self, *args, **kwargs):
+        nonlocal inside, peak
+        scanning = kwargs.get("min_mora") is not None or kwargs.get("max_mora") is not None
+        if not scanning:
+            return original(self, *args, **kwargs)
+        with guard:
+            inside += 1
+            peak = max(peak, inside)
+        try:
+            # 門が閉じていれば全員が揃わずタイムアウトで割れる。それが期待動作。
+            with contextlib.suppress(threading.BrokenBarrierError):
+                gathered.wait()
+            return original(self, *args, **kwargs)
+        finally:
+            with guard:
+                inside -= 1
+
+    with (
+        mock.patch.object(web_module.PhoneticSearcher, "search", slow_search),
+        concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool,
+    ):
+        responses = list(
+            pool.map(
+                lambda _: client.get(
+                    "/api/similar",
+                    params={"q": "サカナ", "limit": 5, "min_mora": 1, "max_mora": 8},
+                ),
+                range(workers),
+            )
+        )
+
+    assert all(r.status_code == 200 for r in responses)
+    # 門の本数を超えないこと。加えて 8 本を投げているので、門が無ければ
+    # barrier が揃って peak == workers になる — つまり workers 未満で
+    # あることが「門が実際に絞った」証拠になる。
+    assert peak <= web_module.MAX_CONCURRENT_SCANS, f"同時に {peak} 本入った"
+    assert peak < workers, f"門が絞っていない (peak={peak} で {workers} 本すべてが同時に入った)"
 
 
 def test_missing_index_reports_how_to_build(tmp_path) -> None:

@@ -1,0 +1,36 @@
+# See https://fly.io/docs/app-guides/continuous-deployment-with-github-actions/
+#
+# 索引をイメージに焼き込むのでビルドが 8 分かかる (Dockerfile 参照)。
+# ドキュメントだけの修正で発火させたくないので、成果物に効くパスに限定する。
+# fly.toml と uv.lock も含めるのは、VM の構成と依存の解決結果が
+# デプロイされるイメージを変えるため。
+
+name: Fly Deploy
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - 'rust/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'fly.toml'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/fly-deploy.yml'
+  # 索引を作り直したいときなど、コードを触らずに流す経路も残す。
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy app
+    runs-on: ubuntu-latest
+    concurrency: deploy-group    # optional: ensure only one action runs at a time
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

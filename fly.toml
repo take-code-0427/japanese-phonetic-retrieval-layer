@@ -1,5 +1,5 @@
-app = "japanese-phonetic-retrieval"
-primary_region = "nrt"
+app = 'japanese-phonetic-retrieval'
+primary_region = 'nrt'
 
 [build]
 
@@ -7,14 +7,16 @@ primary_region = "nrt"
   internal_port = 8080
   force_https = true
   # 索引の mmap を暖め直すコストを避けたいので 0 台には落とさない。
-  # 落とすと次のリクエストが 1 秒のロードを払う (実測: core で 1.0s)。
-  auto_stop_machines = "suspend"
+  # 落とすと次のリクエストが索引ロードを払う (実測: core 1.0s / full 9.6s)。
+  # suspend はメモリ状態を保つので stop より復帰が速い。
+  auto_stop_machines = 'suspend'
   auto_start_machines = true
   min_machines_running = 1
 
 [[vm]]
   # 実測のピーク RSS は core で 0.86GB。索引の mmap がページキャッシュを
-  # 使うので、余裕を持たせるほど 2 回目以降が速い。
-  memory = "2gb"
-  cpu_kind = "shared"
+  # 使うので、余裕を持たせるほど 2 回目以降が速い。本番の実測で
+  # MemAvailable 949MB / Cached 997MB。
+  memory = '2gb'
   cpus = 1
+  memory_mb = 2048

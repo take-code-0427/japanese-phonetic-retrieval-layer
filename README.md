@@ -2,6 +2,9 @@
 
 LLM が弱い「音韻空間」を、外部の検索システムとして提供する。
 
+**デモ: https://japanese-phonetic-retrieval.fly.dev**
+(SudachiDict core / 111 万語。full の 202 万語はローカルで構築できる)
+
 LLM は意味的類似性には強いが、「音として似ている」という関係を明示的に扱うのが
 苦手だ。たとえば **乳首** と **チョコビ** は意味的にはほぼ無関係だが、発音上は
 一定の類似性がある。人間はなぞなぞ・ダジャレ・空耳・聞き間違いの文脈でこの
@@ -455,8 +458,20 @@ fly deploy
 **メモリは 2GB を割り当てる** (実測のピーク RSS は 0.86GB)。索引の mmap が
 ページキャッシュを使うので、余裕があるほど 2 回目以降が速い。
 
-**`auto_stop_machines = "suspend"` にして 0 台には落とさない。** 落とすと次の
-リクエストが索引ロードの 1 秒 (full なら 9.6 秒) を払う。
+**`auto_stop_machines = "suspend"` + `min_machines_running = 1` で 0 台には
+落とさない。** 落とすと次のリクエストが索引ロードの 1 秒 (full なら 9.6 秒) を払う。
+
+公開先の実測 (nrt / core 辞書):
+
+| 経路 | 時間 |
+|---|---|
+| `/api/similar` | 33〜56ms |
+| `/api/phrase` | 371ms |
+| `/api/phrase/lattice` | 55ms |
+| `/api/pronounce`, `/api/compare` | 27〜34ms |
+
+メモリは 2GB のうち `MemAvailable` 949MB・`Cached` 997MB。索引の mmap が
+約 1GB をページキャッシュに使っている。
 
 Serverless (Vercel / Lambda 等) には載らない。索引 1.8GB が関数の
 デプロイ上限 (250MB) を大きく超え、圧縮しても解凍後サイズで判定されるため

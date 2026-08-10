@@ -3,6 +3,8 @@ name = "jpr"
 version = "0.1.0"
 description = "日本語の音韻空間を検索レイヤーとして提供する (Phonetic RAG)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "take-code-0427", email = "modsyoukaizenryoku@gmail.com" }
 ]

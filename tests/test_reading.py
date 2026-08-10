@@ -71,3 +71,41 @@ def test_cache_is_bounded(extractor: ReadingExtractor) -> None:
 def test_normalize_absorbs_spelling_variants(extractor: ReadingExtractor) -> None:
     """表層の揺れを吸収する。クエリ自身を結果から除くのに使う。"""
     assert extractor.normalize("ふとん") == extractor.normalize("布団")
+
+
+def test_concurrent_access_does_not_break_the_tokenizer() -> None:
+    """複数スレッドから同時に呼んでも壊れない。
+
+    Sudachi の Tokenizer は解析用バッファを内部に持つので、ロックを外すと
+    Rust 側が `RuntimeError: Already borrowed` を投げる。web.py の非 async な
+    エンドポイントは starlette のスレッドプールで動くため、同時リクエストが
+    そのまま衝突する — 実際に本番の /api/similar が 500 を返した。
+
+    キャッシュが埋まると tokenize に入らず衝突しないので、毎回キャッシュを
+    捨てて解析させる。
+    """
+    import threading
+
+    local = ReadingExtractor(dict_type="core")
+    words = ["科学", "乳首", "布団", "手首", "価格", "東京特許許可局"]
+    errors: list[BaseException] = []
+
+    def hammer(offset: int) -> None:
+        try:
+            for i in range(60):
+                word = words[(i + offset) % len(words)]
+                local._reading_cache.clear()
+                local._normalized_cache.clear()
+                assert local.reading_of(word)
+                assert local.normalize(word)
+        except BaseException as error:
+            # 何が飛ぶかを見るのが目的なので広く捕まえる。
+            errors.append(error)
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, f"{type(errors[0]).__name__}: {errors[0]}"

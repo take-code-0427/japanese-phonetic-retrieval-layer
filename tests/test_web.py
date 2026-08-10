@@ -286,6 +286,35 @@ def test_align_marks_insertions_and_deletions(client: TestClient) -> None:
     assert deleted["b"] is None
 
 
+def test_concurrent_requests_do_not_return_errors(client: TestClient) -> None:
+    """同時リクエストで 500 を返さない。
+
+    非 async なエンドポイントは starlette のスレッドプールで動くので、
+    リクエストごとに別スレッドから searcher へ入る。Sudachi の Tokenizer は
+    スレッドセーフではないため、ロックを外すと `Already borrowed` で 500 に
+    なる (本番の /api/similar で実際に起きた)。
+    """
+    import concurrent.futures
+
+    paths = [
+        ("/api/similar", {"q": "科学", "limit": 5}),
+        ("/api/similar", {"q": "乳首", "limit": 5, "preset": "rhyme"}),
+        ("/api/phrase", {"text": "ちくび", "limit": 3}),
+        ("/api/pronounce", {"text": "布団"}),
+        ("/api/compare", {"a": "布団", "b": "ストン"}),
+    ]
+
+    def fetch(index: int):
+        path, params = paths[index % len(paths)]
+        return client.get(path, params=params)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(fetch, range(40)))
+
+    failed = [r for r in responses if r.status_code != 200]
+    assert not failed, f"{len(failed)} 件が失敗: {failed[0].status_code} {failed[0].text[:200]}"
+
+
 def test_missing_index_reports_how_to_build(tmp_path) -> None:
     """索引が無くてもサーバは起動でき、原因と対処を 503 で返す。"""
     client = TestClient(create_app(tmp_path / "absent"), raise_server_exceptions=False)

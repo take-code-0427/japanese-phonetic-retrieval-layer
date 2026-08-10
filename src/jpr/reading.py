@@ -7,6 +7,8 @@ Sudachi の形態素解析を使い、複合語やフレーズも語ごとの読
 
 from __future__ import annotations
 
+import threading
+
 from sudachipy import Dictionary, SplitMode
 
 from .phonology import to_katakana
@@ -26,6 +28,14 @@ class ReadingExtractor:
         self._split_mode = split_mode
         self._dictionary = Dictionary(dict=dict_type)
         self._tokenizer = self._dictionary.create()
+        # Sudachi の Tokenizer は解析用バッファを内部に持つので複数スレッドから
+        # 同時に呼べない (Rust 側が `RuntimeError: Already borrowed` を投げる)。
+        # web.py の非 async なエンドポイントは starlette のスレッドプールで動くため
+        # 同時リクエストがそのまま衝突する — 実際に本番の /api/similar が 500 を
+        # 返した。tokenize は 1 語あたり 1ms 未満でキャッシュも効くので、
+        # スレッドごとに tokenizer を持つ (Sudachi 辞書を重複して抱える) より
+        # 直列化するほうが安い。
+        self._lock = threading.Lock()
         # 解析結果はプロセス内で不変なのでキャッシュする。メソッドに lru_cache を
         # 付けるとクラス単位のキャッシュが self を握り続けインスタンスが解放され
         # なくなるため、インスタンスごとに持つ。
@@ -55,10 +65,12 @@ class ReadingExtractor:
             return katakana
 
         parts: list[str] = []
-        for morpheme in self._tokenizer.tokenize(stripped, self._split_mode):
-            reading = morpheme.reading_form()
-            # OOV では読みが空になることがあるため表層で代替する。
-            parts.append(to_katakana(reading or morpheme.surface()))
+        # Morpheme は解析器のバッファを参照するので、読み出しまでロック内で終える。
+        with self._lock:
+            for morpheme in self._tokenizer.tokenize(stripped, self._split_mode):
+                reading = morpheme.reading_form()
+                # OOV では読みが空になることがあるため表層で代替する。
+                parts.append(to_katakana(reading or morpheme.surface()))
         return "".join(parts)
 
     def normalize(self, text: str) -> str:
@@ -71,8 +83,11 @@ class ReadingExtractor:
         if not stripped:
             normalized = ""
         else:
-            morphemes = self._tokenizer.tokenize(stripped, self._split_mode)
-            normalized = "".join(m.normalized_form() for m in morphemes)
+            # 生成子のままロックを出ると解析器のバッファを外で触るので、
+            # ロック内で文字列に確定させる。
+            with self._lock:
+                morphemes = self._tokenizer.tokenize(stripped, self._split_mode)
+                normalized = "".join(m.normalized_form() for m in morphemes)
 
         self._remember(self._normalized_cache, text, normalized)
         return normalized

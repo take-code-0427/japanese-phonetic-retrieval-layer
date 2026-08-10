@@ -459,6 +459,20 @@ SudachiDict full は地名 49 万・人名 24 万を含み索引の 7 割を占�
   (手書きの内積ループは自動ベクトル化されず、8 スレッドでも 90ms)。
 - **`ReadingExtractor` のキャッシュはインスタンス単位**: メソッドに `lru_cache` を付けると
   クラス単位のキャッシュが `self` を握り続けインスタンスが解放されなくなる。
+- **Sudachi の `Tokenizer` はスレッドセーフではない**: 解析用バッファを内部に持つので
+  複数スレッドから `tokenize()` に入ると Rust 側が `RuntimeError: Already borrowed` を
+  投げる。**web.py の非 async なエンドポイントは starlette のスレッドプールで動く**ため
+  同時リクエストがそのまま衝突し、本番の `/api/similar` が 500 を返した。
+  `ReadingExtractor._lock` で直列化している。`tokenize` は 1 語あたり 1ms 未満で
+  キャッシュも効くので、スレッドごとに tokenizer を持つ (Sudachi 辞書を重複して抱える)
+  より安い。**`Morpheme` は解析器のバッファを参照するので、読み出しまでロック内で
+  終える** — 生成子のままロックを出すと同じ問題が残る。
+
+  **単発のテストでは踏まない。** キャッシュが埋まると `tokenize` に入らないので、
+  回帰テスト (`test_reading.py::test_concurrent_access_does_not_break_the_tokenizer`) は
+  毎回キャッシュを捨てて 8 スレッドで叩く。HTTP 経由も
+  `test_web.py::test_concurrent_requests_do_not_return_errors` で押さえてある。
+  HNSW と Rust の編集距離は 8 スレッド並行で問題が出ないことを確認済み。
 - **Sudachi のロードは重い**: `PhoneticSearcher.extractor` は初回参照まで遅延させている。
   索引 (mmap) も MCP サーバ・Web サーバでは最初のリクエストまで開かない。実測で
   初回 12.5 秒、2 回目以降は 34ms〜1 秒。

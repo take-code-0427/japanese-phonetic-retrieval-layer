@@ -499,6 +499,40 @@ SudachiDict full は地名 49 万・人名 24 万を含み索引の 7 割を占�
   片方を押したときにもう片方の状態を壊す (`activePreset` が undefined になった)。
   グループの id (`preset-group` / `phrase-view-group`) の中だけを見る。
 
+## デプロイ (`Dockerfile` / `fly.toml`)
+
+**Serverless には載らない。** 索引が core で 1.8GB・full で 3.23GB あり、Vercel /
+Lambda の関数サイズ上限 (250MB) を超える。圧縮しても解凍後サイズで判定されるので
+回避できない。加えて Rust 拡張のビルド (`jpr_distance` が無いと import に失敗する) と
+mmap 常駐の前提があり、**この 3 つはいずれもコンテナを要求する**。だから
+コンテナ系 PaaS (Fly.io) を選んでいる。
+
+**索引はイメージに焼き込む** (Volume に置かない)。Volume だと「初回に索引を用意する」
+手順がデプロイと別に必要になり、`fly deploy` 一発で動く状態にならない。ビルド時に
+`build-index` を走らせる代償はイメージ 2.77GB・ビルド 8 分だが、Fly の上限 8GB には
+収まる。
+
+**辞書は core。** full は索引 3.23GB でイメージが上限に迫る。core (111 万語) に
+落としても検索品質は保たれることを実測した — 「乳首」→ 手首、「わたしのなまえは」→
+私の名前は が同じ順位で出て、検索 11〜22ms・`compose` 178ms。full の 202 万語が
+効くのは稀な語の再現性なので、公開デモでは core で足りる。
+
+**`hnsw-consonant.bin` を持ち込まないこと。** `INNER_PRODUCT_SPACES` は
+`("phonetic", "coda")` なので現在のコードは consonant の HNSW を読まない。古い索引
+ディレクトリには 915MB の残骸が残っていることがあり、そのままコピーするとイメージが
+無駄に膨らむ。`build-index` は生成しないので、新規構築なら問題にならない。
+
+**`LICENSE` を COPY し忘れると uv のビルドが落ちる。** `pyproject.toml` の
+`project.license-files` が参照するので、メタデータ検証の段階で
+`glob 'LICENSE' did not match any files` になる。
+
+**`--host 0.0.0.0` が必須。** `serve-web` の既定は `127.0.0.1` なのでコンテナ外に
+届かない。
+
+**0 台に落とさない** (`auto_stop_machines = "suspend"`)。停止すると次のリクエストが
+索引ロードを払う (core 1.0 秒 / full 9.6 秒)。メモリ 2GB は実測のピーク RSS 0.86GB に
+対する余裕で、mmap がページキャッシュを使うぶんだけ 2 回目以降が速くなる。
+
 ## 言語とスタイル
 
 コード内のドキュメンテーション文字列・コメントは日本語で書く。既存コードは「なぜこの

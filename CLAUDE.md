@@ -955,6 +955,27 @@ websockets / watchfiles を連れてくるが、`web.py` は `uvicorn.run` を�
 読まないので、これは性能低下ではない)。`min_machines_running = 1` が効いているので
 通常運用でコールドスタートは起きない。
 
+**v6 デプロイ後の本番実測 (nrt / core)**:
+
+| | v5 | v6 |
+|---|---|---|
+| `MemAvailable` | 1699MB | **1718MB** |
+| `Cached` | 225MB | 218MB |
+| プロセスの RssAnon / RssFile | 107MB / 143MB | **99MB / 142MB** |
+| 検索 (サーバ内) | 22ms | **15.3ms** |
+| `phrase` (サーバ内) | 432ms | **123ms** |
+
+**メモリはほぼ横ばい。** v6 の変更は速度が主で、`memoryview` はページを mmap の
+まま参照するので匿名メモリを動かさない (`_byte_view` の項)。減った 8MB は
+`uvicorn[standard]` を外したぶん。
+
+**`phrase` が 3.5 倍速い。** 区間ごとの照合が `search` と同じ経路を通るので、
+候補生成の帯とアクセサの改善がそのまま効く。
+
+**測るときはサーバ内とクライアント側を分ける。** 日本から HTTPS で叩くと
+検索 39ms・`phrase` 155ms になるが、差は往復とプロキシのぶん。`flyctl ssh
+console` から `127.0.0.1:8080` を叩けばアプリの処理時間だけが取れる。
+
 **全マシンを手で suspend すると復帰の初回が 48 秒になる。** これは索引ロードでは
 なく Fly のプロキシが `machine was recently stopped and is unavailable to service
 request` のマシンにルーティングを試みて待つ時間で、ログを見ると起動自体は 158ms

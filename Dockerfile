@@ -7,8 +7,8 @@
 # ANN のグラフを作らなくなったので構築は 496s -> 163s に縮んでいる
 # (`store.py` の CANDIDATE_SPACES と `search.py` の _top_candidates を参照)。
 # さらにベクトルを int8 に量子化したので (`store.py` の `_quantize`)、
-# 索引は full の実測で 1.64GB -> 508MB になった。core はその語数比で
-# 280MB 前後の見込み (未実測)。
+# 索引は core で 855MB -> 274MB、full で 1.64GB -> 508MB になった。
+# イメージは 1.75GB -> 329MB。
 
 FROM python:3.12-slim AS builder
 

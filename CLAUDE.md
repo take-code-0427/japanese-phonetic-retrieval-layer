@@ -842,12 +842,21 @@ v5 のイメージ内実測 (core / 2GB 制限、`docker run -m 2g`):
 
 **0 台に落とさない** (`auto_stop_machines = "suspend"` + `min_machines_running = 1`)。
 停止すると次のリクエストが索引ロードを払う (core 1.0 秒 / full 9.6 秒)。
-メモリ 2GB は実測のピーク RSS 0.86GB に対する余裕で、mmap がページキャッシュを
-使うぶんだけ 2 回目以降が速くなる。**本番の実測で `MemAvailable` 949MB /
-`Cached` 997MB** — 索引の mmap が約 1GB をキャッシュに使い、余裕が残っている。
 
-本番 (nrt) の実測: 検索 33〜56ms、`phrase` 371ms。`min_machines_running = 1` が
-効いているので通常運用でコールドスタートは起きない (初回 56ms)。
+**v5 デプロイ後の本番実測 (nrt / core)**:
+
+| | v4 | v5 |
+|---|---|---|
+| `MemAvailable` | 949MB | **1699MB** |
+| `Cached` | 997MB | 225MB |
+| プロセスの RssAnon / RssFile | — | **107MB / 143MB** |
+| 検索 | 33〜56ms | 22ms |
+| `phrase` | 371ms | 432ms |
+
+**空きメモリが 750MB 増えた。** `Cached` が減っているのは索引が 274MB -> 148MB に
+なってページキャッシュに載る量そのものが減ったため (mmap は必要なページしか
+読まないので、これは性能低下ではない)。`min_machines_running = 1` が効いているので
+通常運用でコールドスタートは起きない。
 
 **全マシンを手で suspend すると復帰の初回が 48 秒になる。** これは索引ロードでは
 なく Fly のプロキシが `machine was recently stopped and is unavailable to service

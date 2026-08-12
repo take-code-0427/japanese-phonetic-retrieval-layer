@@ -530,13 +530,15 @@ core) は索引を開いた直後が匿名 19MB、全走査と分割合成まで
 
 | 経路 | 時間 |
 |---|---|
-| `/api/similar` | 33〜56ms |
-| `/api/phrase` | 371ms |
+| `/api/similar` | 22ms |
+| `/api/similar` (5 モーラ全走査) | 570ms |
+| `/api/phrase` | 432ms |
 | `/api/phrase/lattice` | 55ms |
 | `/api/pronounce`, `/api/compare` | 27〜34ms |
 
-メモリは 2GB のうち `MemAvailable` 949MB・`Cached` 997MB。索引の mmap が
-約 1GB をページキャッシュに使っている。
+メモリは 2GB のうち `MemAvailable` 1699MB。プロセスの内訳は匿名 107MB +
+mmap 143MB。索引を 274MB から 148MB に落としたぶん、空きが 949MB から
+750MB 増えた。
 
 Serverless (Vercel / Lambda 等) には載らない。ただし**理由からサイズは外れた** —
 core の索引は 148MB になり、関数のデプロイ上限 (250MB) を下回っている

@@ -37,7 +37,7 @@ from .search import (
     PhoneticSearcher,
     compare_pronunciations,
 )
-from .store import INNER_PRODUCT_SPACES, PhoneticStore, default_store_path
+from .store import CANDIDATE_SPACES, PhoneticStore, default_store_path
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -52,8 +52,9 @@ MAX_LIMIT = 200
 #: `truncated` で伝える。本当に全件が要るなら CLI を使う。
 MAX_UNLIMITED = 5_000
 
-#: ANN から取る候補数の上限。ここを大きくすると再現率と引き換えに
-#: rerank のコストが線形に増える (DEFAULT_CANDIDATES の項も参照)。
+#: 候補生成から取る件数の上限。ここを大きくすると rerank のコストが線形に
+#: 増える (DEFAULT_CANDIDATES の項も参照)。内積は全行に対して取るので、
+#: 増やしても候補生成側のコストは変わらない。
 MAX_CANDIDATES = 50_000
 
 #: 分割合成が 1 回に返す候補数の上限。
@@ -71,11 +72,12 @@ MAX_NODE_BUDGET = 200
 
 #: モーラ範囲の全走査を同時に走らせる本数。
 #:
-#: 全走査は母集団ぶんの内積を一時配列に起こすので、1 本で +279MB・10 本で
-#: +348MB 使う (通常検索は 10 並行でも +13MB)。2GB の割り当てでは並行度を
-#: 抑えないと OOM で SIGKILL される (実測: anon-rss 1.9GB で kill)。
-#: 待たせるほうが落とすよりましなので、この経路だけ直列に近づける。
-#: 通常検索とは別の門にしてあるので、軽いリクエストは待たされない。
+#: 全走査は母集団ぶんの一時配列を並行数だけ抱えるので、匿名メモリが並行度に
+#: 比例して伸びる。full (202 万語) の実測ピークは 2 並行 +190MB・5 並行
+#: +357MB・10 並行 +613MB。2 なら常駐 260MB と合わせて 451MB で収まる。
+#:
+#: 通常検索は門を通さない (10 並行 x30 回でも匿名メモリは +60MB 程度)。
+#: 待たせるほうが落とすよりましだが、待たせる相手は重い経路だけに限る。
 MAX_CONCURRENT_SCANS = 2
 
 #: 全走査の順番待ちを諦める秒数。
@@ -173,7 +175,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             )
 
         engine = searcher()
-        # モーラ範囲を指定すると ANN を迂回して全走査するので、母集団の
+        # モーラ範囲を指定すると Top-K ではなく範囲の全行を見るので、母集団の
         # 規模をレスポンスに含めて「なぜ遅いのか」を画面から読めるようにする。
         scanned: int | None = None
         scanning = min_mora is not None or max_mora is not None
@@ -184,8 +186,8 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from None
 
         # 全走査は母集団ぶんの一時配列を作るので、並行で走らせるとメモリが
-        # 溢れる (`MAX_CONCURRENT_SCANS` 参照)。ANN 経路は 10 並行でも
-        # +13MB しか増えないので門を通さない。
+        # 溢れる (`MAX_CONCURRENT_SCANS` 参照)。Top-K の経路は軽いので
+        # 門を通さない。
         with limit_scans() if scanning else nullcontext():
             pronunciation, results = engine.search(
                 q,
@@ -435,8 +437,8 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                 {
                     "name": name,
                     "dim": dim,
-                    # 候補生成に使う空間のみ ANN を張る。他は rerank でベクトルを直接引く。
-                    "role": "ANN + rerank" if name in INNER_PRODUCT_SPACES else "rerank のみ",
+                    # 候補生成は 1 空間との内積で行う。他は rerank でスコアを足すだけ。
+                    "role": "候補生成 + rerank" if name in CANDIDATE_SPACES else "rerank のみ",
                 }
                 for name, dim in store.meta.dims.items()
             ],

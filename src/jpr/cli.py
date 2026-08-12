@@ -18,7 +18,7 @@ from .phrase import (
     DEFAULT_MIN_CHUNK_SCORE,
 )
 from .search import DEFAULT_CANDIDATES, DEFAULT_PRESET, PRESETS, PhoneticSearcher
-from .store import INNER_PRODUCT_SPACES, PhoneticStore, default_store_path
+from .store import CANDIDATE_SPACES, PhoneticStore, default_store_path
 
 
 def _add_store_argument(parser: argparse.ArgumentParser) -> None:
@@ -338,8 +338,8 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"語数: {len(store):,}")
     print("\n埋め込み空間:")
     for name, dim in store.meta.dims.items():
-        # 候補生成に使う空間のみ ANN を張る。他は rerank でベクトルを直接引く。
-        role = "ANN + rerank" if name in INNER_PRODUCT_SPACES else "rerank のみ"
+        # 候補生成は 1 空間との内積で行う。他は rerank でスコアを足すだけ。
+        role = "候補生成 + rerank" if name in CANDIDATE_SPACES else "rerank のみ"
         print(f"  {name:<10} {dim:>4} 次元  ({role})")
 
     print("\nカテゴリ:")

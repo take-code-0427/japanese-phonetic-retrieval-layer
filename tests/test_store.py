@@ -144,16 +144,21 @@ def test_vectors_are_memory_mapped(roundtrip: PhoneticStore) -> None:
     assert vectors.shape == (4, roundtrip.meta.dims["phonetic"])
 
 
-def test_ann_index_exists_for_phonetic_space(roundtrip: PhoneticStore) -> None:
-    assert roundtrip.has_ann("phonetic")
+def test_no_ann_graph_is_written(roundtrip: PhoneticStore) -> None:
+    """HNSW のグラフは書かない。
+
+    hnswlib の `load_index` はグラフをヒープに実体化し、しかもベクトルを
+    内部に複製するので、mmap したベクトル行列と同じデータを二重に持つ
+    (`PhoneticSearcher._top_candidates` 参照)。候補生成は内積で足りる。
+    """
+    assert not list(roundtrip.path.glob("hnsw-*.bin"))
 
 
-def test_ann_query_returns_self_first(roundtrip: PhoneticStore) -> None:
-    """自身のベクトルで引けば自身が最も近い。ANN が正しく張れている確認。"""
-    index = roundtrip.ann("phonetic", ef=16)
-    query = np.asarray(roundtrip.vectors("phonetic")[1]).reshape(1, -1)
-    labels, _ = index.knn_query(query, k=1)
-    assert int(labels[0][0]) == 1
+def test_inner_product_ranks_self_first(roundtrip: PhoneticStore) -> None:
+    """自身のベクトルで引けば自身が最も近い。候補生成の土台の確認。"""
+    vectors = roundtrip.vectors("phonetic")
+    scores = vectors @ np.asarray(vectors[1])
+    assert int(np.argmax(scores)) == 1
 
 
 def test_missing_index_raises(tmp_path: Path) -> None:

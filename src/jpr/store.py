@@ -5,7 +5,6 @@
     meta.json          形式バージョンと件数、空間の次元
     entries.npz        語彙のメタデータ (表層・読み・音素列・カテゴリ・コスト)
     vectors-<空間>.npy 各埋め込み空間の (N, D) 行列
-    hnsw-<空間>.bin    ANN 索引
 
 pickle をやめた理由は 2 つ。ロードに 12〜18 秒かかり MCP サーバの起動コスト
 として重すぎたこと、そして任意コード実行を招く形式を配布物に使いたくないこと。
@@ -15,7 +14,7 @@ NumPy 配列は mmap で開けるので実質 0 秒で立ち上がる。
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,14 +24,21 @@ from .distance import PAD_ID, PHONEME_TO_ID, UNKNOWN_PHONEME_ID
 from .embedding import SPACES
 from .index import Category, IndexEntry
 
+#: 索引形式のバージョン。エントリの持ち方や行の並びを変えたら上げる。
+#:
+#: ANN のグラフを作らなくなったときは**上げていない**。読み込み側は
+#: `hnsw-*.bin` を参照しないので、グラフが残っている古い索引もそのまま動く
+#: (無駄なファイルが残るだけ)。バージョンを上げると再構築を強いることになり、
+#: full なら 5.5 分かかる — 動くものを動かなくする理由がない。
 FORMAT_VERSION = 3
 
-#: ANN 索引を作る空間。
+#: 候補生成に使う空間。
 #:
-#: 候補生成は原則 phonetic 1 本で足りる。全空間に HNSW を張ると 1 空間あたり
-#: 1.2GB (202 万語) かかる一方、rerank 側は行を直接引くだけなのでベクトル行列が
-#: あれば済む。韻の検索で語尾から候補を引きたい場合のみ coda を足す。
-INNER_PRODUCT_SPACES = ("phonetic", "coda")
+#: **phonetic 1 本だけ。** `PhoneticSearcher.candidate_space` (既定 "phonetic") が
+#: 索引全体と内積を取る空間で、他の空間は rerank でスコアを足すだけ。
+#: どちらもベクトル行列を mmap で読むので、空間を増やしてもディスクだけが
+#: 増える (匿名メモリは増えない)。
+CANDIDATE_SPACES = ("phonetic",)
 
 _META_FILE = "meta.json"
 _ENTRIES_FILE = "entries.npz"
@@ -214,7 +220,6 @@ class PhoneticStore:
         )
 
         self._vectors: dict[str, np.ndarray] = {}
-        self._ann: dict[str, object] = {}
 
     def __len__(self) -> int:
         return self.meta.count
@@ -350,32 +355,19 @@ class PhoneticStore:
         )
         return start, max(start, end)
 
-    # --- ベクトルと ANN ---------------------------------------------------
+    # --- ベクトル ---------------------------------------------------------
 
     def vectors(self, space: str) -> np.ndarray:
-        """指定した空間の (N, D) 行列を mmap で返す。"""
+        """指定した空間の (N, D) 行列を mmap で返す。
+
+        候補生成も rerank もこの行列だけで足りる。mmap なので匿名メモリに
+        載らず、ページキャッシュとして回収できる — ANN のグラフを持っていた
+        頃はここと同じデータをヒープに複製していた
+        (`PhoneticSearcher._top_candidates` 参照)。
+        """
         if space not in self._vectors:
             self._vectors[space] = np.load(self.path / f"vectors-{space}.npy", mmap_mode="r")
         return self._vectors[space]
-
-    def ann(self, space: str, ef: int = 200):
-        """指定した空間の HNSW 索引を返す。
-
-        hnswlib のインポートは索引を実際に引くときまで遅らせる。
-        """
-        if space not in self._ann:
-            import hnswlib
-
-            dim = self.meta.dims[space]
-            index = hnswlib.Index(space="ip", dim=dim)
-            index.load_index(str(self.path / f"hnsw-{space}.bin"), max_elements=self.meta.count)
-            self._ann[space] = index
-        index = self._ann[space]
-        index.set_ef(ef)  # type: ignore[attr-defined]
-        return index
-
-    def has_ann(self, space: str) -> bool:
-        return (self.path / f"hnsw-{space}.bin").exists()
 
 
 def write_store(
@@ -384,17 +376,18 @@ def write_store(
     vectors: dict[str, np.ndarray],
     *,
     dict_type: str = "full",
-    ann_spaces: Iterable[str] = INNER_PRODUCT_SPACES,
-    ef_construction: int = 100,
-    m: int = 24,
     progress: object = None,
 ) -> None:
-    """索引をディスクに書く。ANN 索引の構築もここで行う。
+    """索引をディスクに書く。
 
     行は入力順ではなく `_locality_order` (モーラ数, 音素列) で格納する。
     検索側のモーラ範囲スライスと同音異表記の畳み込みがこの並びに依存する。
     ベクトル行列も同じ順に並べ替えるので、呼び出し側は entries と vectors の
     行対応だけ揃えればよい。
+
+    ANN のグラフは作らない。候補生成はベクトル行列との内積で足りるので
+    (`PhoneticSearcher._top_candidates`)、グラフを持つと同じデータを二重に
+    保存することになる。
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -416,18 +409,6 @@ def write_store(
         report(f"ベクトルを書き出し中: {space}")
         np.save(path / f"vectors-{space}.npy", matrix)
 
-    import hnswlib
-
-    for space in ann_spaces:
-        if space not in vectors:
-            continue
-        matrix = vectors[space]
-        report(f"ANN 索引を構築中: {space} ({matrix.shape[0]:,} 件)")
-        index = hnswlib.Index(space="ip", dim=matrix.shape[1])
-        index.init_index(max_elements=matrix.shape[0], ef_construction=ef_construction, M=m)
-        index.add_items(matrix, np.arange(matrix.shape[0]))
-        index.save_index(str(path / f"hnsw-{space}.bin"))
-
     meta = StoreMeta(
         version=FORMAT_VERSION,
         count=len(entries),
@@ -439,8 +420,8 @@ def write_store(
 
 
 __all__ = [
+    "CANDIDATE_SPACES",
     "FORMAT_VERSION",
-    "INNER_PRODUCT_SPACES",
     "SPACES",
     "PhoneticStore",
     "StoreMeta",

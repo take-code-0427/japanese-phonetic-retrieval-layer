@@ -224,9 +224,9 @@ def test_info_reports_index_metadata(client: TestClient, sample_store: PhoneticS
     assert payload["count"] == len(sample_store)
     assert payload["format_version"] == sample_store.meta.version
     assert {space["name"] for space in payload["spaces"]} == set(sample_store.meta.dims)
-    # ANN を張る空間は候補生成に使うものだけ。
+    # 候補生成に使うのは 1 空間だけ。他は rerank でスコアを足すのに使う。
     roles = {space["name"]: space["role"] for space in payload["spaces"]}
-    assert roles["phonetic"] == "ANN + rerank"
+    assert roles["phonetic"] == "候補生成 + rerank"
     assert roles["vowel"] == "rerank のみ"
     assert payload["presets"] == ["mishearing", "pun", "rhyme"]
 

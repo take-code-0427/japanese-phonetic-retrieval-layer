@@ -24,7 +24,7 @@ from .index import (
     is_searchable_surface,
 )
 from .phonology import analyze_reading, to_katakana
-from .store import INNER_PRODUCT_SPACES, write_store
+from .store import write_store
 
 ProgressCallback = Callable[[str], None] | None
 
@@ -113,8 +113,6 @@ def build_index(
     dict_type: str = "full",
     min_mora: int = 2,
     max_mora: int = 12,
-    ef_construction: int = 100,
-    m: int = 24,
     progress: ProgressCallback = None,
 ) -> int:
     """索引を構築してディスクに書く。戻り値は索引した語数。"""
@@ -127,9 +125,6 @@ def build_index(
         entries,
         vectors,
         dict_type=dict_type,
-        ann_spaces=INNER_PRODUCT_SPACES,
-        ef_construction=ef_construction,
-        m=m,
         progress=progress,
     )
     return len(entries)

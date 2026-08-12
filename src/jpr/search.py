@@ -105,12 +105,19 @@ PRESETS: dict[str, ScoreWeights] = {
 
 DEFAULT_PRESET = "pun"
 
-#: ANN から取る候補数の既定値。
+#: 候補生成から rerank に渡す件数の既定値。
 #:
 #: 202 万語では 3 モーラ語のクエリに対しコサイン 0.91 以上の候補が 400 件を超える。
 #: k=400 では「乳首」に対する「手首」のような明らかな近傍が候補にすら入らず、
 #: 稀語ばかりが並んだ。実測では k=5000 で「手首」が 1 位に来る。
 #: 候補数を増やすと rerank のコストが線形に増えるので、品質が飽和する手前で止める。
+#:
+#: **候補生成は索引全体との内積なので、ここを増やしても生成側は重くならない**
+#: (`PhoneticSearcher._top_candidates`)。伸びるのは rerank だけ。ANN を使って
+#: いた頃は k を上げると探索そのものが線形以上に遅くなり、かつ Top-K に入らない
+#: 語を rerank が拾えないという取りこぼしがあったが (k=5000 で総当たりとの
+#: top10 一致率 0.73)、いまは内積の順位が正確なので k の意味は
+#: 「rerank に何件見せるか」だけになった。
 DEFAULT_CANDIDATES = 5000
 
 #: 打ち切り線を決めるために確定させる件数の、limit に対する倍率。
@@ -252,10 +259,10 @@ class PhoneticSearcher:
         store: PhoneticStore,
         extractor: ReadingExtractor | None = None,
         *,
-        ann_space: str = "phonetic",
+        candidate_space: str = "phonetic",
     ) -> None:
         self.store = store
-        self.ann_space = ann_space
+        self.candidate_space = candidate_space
         self._extractor = extractor
         self._category_ids = store.category_ids
         self._mora_counts = store.mora_counts
@@ -328,7 +335,7 @@ class PhoneticSearcher:
         # ANN を迂回して母集団を全走査する (`_scan_candidates` 参照)。
         bounds = self._mora_bounds(min_mora=min_mora, max_mora=max_mora)
         if bounds is None:
-            rows, embedding_scores = self._ann_candidates(query_vectors, candidates)
+            rows, embedding_scores = self._top_candidates(query_vectors, candidates)
         else:
             rows, embedding_scores = self._scan_candidates(query_vectors, bounds)
         if rows.size == 0:
@@ -450,19 +457,40 @@ class PhoneticSearcher:
             raise ValueError(f"モーラ範囲が逆転しています: {min_mora} > {max_mora}")
         return self.store.mora_range(min_mora, max_mora)
 
-    def _ann_candidates(
+    def _top_candidates(
         self,
         query_vectors: dict[str, np.ndarray],
         candidates: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """HNSW で候補行とコサイン類似度を得る。"""
+        """索引全体と内積を取り、上位 `candidates` 件の行と類似度を得る。
+
+        **HNSW を使わない。** hnswlib の `load_index` はグラフをヒープに
+        実体化するので (mmap のオプションが無い)、匿名メモリを 652MB 使う
+        (core / 111 万語)。内訳はグラフ 346MB と**ベクトルの複製 306MB** で、
+        後者は `vectors-phonetic.npy` と同じデータの二重持ち。`M` を下げても
+        複製は消えないので 408MB (M=4) が下限で、そこでは recall が 0.758 まで
+        落ちる。2GB の本番が OOM killed になった主因がこれ。
+
+        総当たりは mmap をそのまま読むので匿名メモリが増えない (+4MB)。
+        速度も core では負けない — 実測で内積 8〜9ms + Top-K 抽出 3〜7ms の
+        11〜16ms に対し、HNSW (M=24) は 16ms。**recall は 1.0 になるので
+        品質は上がる** (M=24 で 0.986)。
+
+        かつて「総当たりは ANN より遅い (21〜30ms 対 15ms)」と記録していたが、
+        あれは full (202 万語) での測定。core (111 万語) では逆転している。
+        **語数が変われば測り直す。**
+        """
         wanted = min(candidates, len(self.store))
-        index = self.store.ann(self.ann_space, ef=max(wanted, 64))
-        query = query_vectors[self.ann_space].reshape(1, -1)
-        labels, distances = index.knn_query(query, k=wanted)
-        # hnswlib の 'ip' 空間は 1 - 内積を返す。正規化済みベクトルなので
-        # これを戻すとコサイン類似度になる。
-        return labels[0].astype(np.int64), 1.0 - distances[0]
+        vectors = self.store.vectors(self.candidate_space)
+        # 正規化済みベクトルなので内積がそのままコサイン類似度になる。
+        scores = vectors @ query_vectors[self.candidate_space]
+        if wanted >= scores.size:
+            rows = np.argsort(-scores)
+            return rows.astype(np.int64), scores[rows]
+        # 完全ソートは要らない。上位 `wanted` 件を切り出してから並べる。
+        top = np.argpartition(scores, scores.size - wanted)[scores.size - wanted :]
+        top = top[np.argsort(-scores[top])]
+        return top.astype(np.int64), scores[top]
 
     def _scan_candidates(
         self,
@@ -485,10 +513,10 @@ class PhoneticSearcher:
         rows = np.arange(start, end, dtype=np.int64)
         if rows.size == 0:
             return rows, np.zeros(0, dtype=np.float32)
-        vectors = self.store.vectors(self.ann_space)
+        vectors = self.store.vectors(self.candidate_space)
         # 正規化済みベクトルなので内積がそのままコサイン類似度になり、
         # ANN 経路が返すスコアと同じ尺度で揃う。
-        scores = vectors[start:end] @ query_vectors[self.ann_space]
+        scores = vectors[start:end] @ query_vectors[self.candidate_space]
         return rows, scores
 
     def _apply_cheap_filters(

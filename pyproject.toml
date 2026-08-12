@@ -16,7 +16,12 @@ dependencies = [
     "numpy>=2.5.1",
     "sudachidict-core>=20260723",
     "sudachipy>=0.6.11",
-    "uvicorn[standard]>=0.52.1",
+    # `[standard]` は付けない。あれは uvloop / httptools / websockets /
+    # watchfiles を連れてくるが、このアプリは WebSocket を使わず本番で
+    # リロードもしないので (`web.py` は `uvicorn.run` を素で呼ぶだけ)、
+    # 実行時に一度も読まれない。venv で実測 uvloop 16MB + watchfiles +
+    # websockets + PyJWT 経由の cryptography 15MB が死荷重になっていた。
+    "uvicorn>=0.52.1",
 ]
 
 [project.optional-dependencies]

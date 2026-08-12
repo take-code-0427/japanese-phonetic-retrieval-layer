@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import jpr_distance as _rust
 import numpy as np
 
 from .distance import PAD_ID, PHONEME_TO_ID, UNKNOWN_PHONEME_ID
@@ -30,7 +31,10 @@ from .index import Category, IndexEntry
 #: `hnsw-*.bin` を参照しないので、グラフが残っている古い索引もそのまま動く
 #: (無駄なファイルが残るだけ)。バージョンを上げると再構築を強いることになり、
 #: full なら 5.5 分かかる — 動くものを動かなくする理由がない。
-FORMAT_VERSION = 3
+#:
+#: v4 でベクトルを int8 に量子化した (`_quantize`)。float32 の索引は読めない
+#: ので再構築が要る。
+FORMAT_VERSION = 4
 
 #: 候補生成に使う空間。
 #:
@@ -55,6 +59,8 @@ class StoreMeta:
     count: int
     dims: dict[str, int]
     dict_type: str
+    #: 空間ごとの量子化スケール。int8 の値にこれを掛けると元の float32 に戻る。
+    scales: dict[str, float]
 
     def to_json(self) -> str:
         return json.dumps(
@@ -63,6 +69,7 @@ class StoreMeta:
                 "count": self.count,
                 "dims": self.dims,
                 "dict_type": self.dict_type,
+                "scales": self.scales,
             },
             ensure_ascii=False,
             indent=2,
@@ -76,6 +83,47 @@ class StoreMeta:
             count=payload["count"],
             dims=payload["dims"],
             dict_type=payload.get("dict_type", "full"),
+            scales=payload["scales"],
+        )
+
+
+def _quantize(matrix: np.ndarray) -> tuple[np.ndarray, float]:
+    """(N, D) の float32 行列を int8 とスケールに落とす。
+
+    **スケールは空間ごとに 1 つ。** 行ごとに持つ案も測ったが、`phonetic` は
+    L2 正規化済みで行の最大値が 0.24〜0.49 に収まるため再構成誤差が変わらない
+    (どちらも 0.0026)。行ごとのスケール配列を持つ複雑さに見合わない。
+    `rhythm` だけは正規化しないので絶対量が大きいが (ノルム最大 2.24)、
+    空間ごとに最大値を取るこの形なら自動的に追従する。
+
+    量子化の誤差は内積で最大 0.012 (全 5 空間の実測)。順位を分ける
+    スコア差は Top-K 境界でも 0.0002 程度あるので、この誤差は候補生成の
+    順位をわずかに揺らす。`search.DEFAULT_CANDIDATES` を広げて吸収する
+    (`_top_candidates` の項を参照)。
+    """
+    peak = float(np.abs(matrix).max())
+    if peak == 0.0:
+        return np.zeros(matrix.shape, dtype=np.int8), 1.0
+    scale = peak / 127.0
+    quantized = np.round(matrix / scale).astype(np.int8)
+    return quantized, scale
+
+
+#: 境界インデックスに int32 を使うので、blob はこの長さを超えられない。
+_MAX_BLOB_BYTES = 2**31 - 1
+
+
+def _check_blob_fits(name: str, size: int) -> None:
+    """blob が int32 の境界で表せることを確かめる。
+
+    full 辞書の実測は表層 2900 万 / 読み 3900 万 / 音素 2200 万バイトなので
+    2 桁の余裕がある。**それでも黙って壊れるより落ちるほうがいい** —
+    溢れると境界が負に回り、索引全体が静かに誤った文字列を返す。
+    """
+    if size > _MAX_BLOB_BYTES:
+        raise ValueError(
+            f"{name} が int32 の境界で表せる上限を超えています ({size} > {_MAX_BLOB_BYTES})。"
+            "境界配列の dtype を int64 に戻す必要があります。"
         )
 
 
@@ -85,12 +133,20 @@ def _encode_strings(values: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
     NumPy の固定幅 unicode 配列 (`<U27`) は最長要素の幅で全行を埋めるため、
     表層のように長さの散らばる列では実データの数十倍を消費する
     (実測 202 万語で 218MB)。可変長で詰めれば 1/5 以下になる。
+
+    境界は int32。full 辞書でも読みの blob が 3900 万バイトしかないので
+    int64 の幅が要らない (3 本の境界配列で 24MB の差)。**2^31 を超える
+    blob は表現できない** ので、`_check_blob_fits` が構築時に検証する。
     """
     blob = bytearray()
-    boundaries = np.zeros(len(values) + 1, dtype=np.int64)
-    for row, value in enumerate(values):
+    offsets = [0]
+    for value in values:
         blob.extend(value.encode("utf-8"))
-        boundaries[row + 1] = len(blob)
+        offsets.append(len(blob))
+    # 境界を int32 の配列に落とす前に検証する。溢れてから確かめても、
+    # そのときには既に値が負へ回っている。
+    _check_blob_fits("文字列 blob", len(blob))
+    boundaries = np.asarray(offsets, dtype=np.int32)
     return np.frombuffer(bytes(blob), dtype=np.uint8), boundaries
 
 
@@ -138,7 +194,7 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     # 音素列も同様に ID 化して連結する。同時に、同じ (モーラ数, 音素列) が
     # 続く区間へ同じグループ ID を振る (ソート済みなので隣接比較で足りる)。
     phoneme_ids: list[int] = []
-    phoneme_bounds = np.zeros(len(entries) + 1, dtype=np.int64)
+    phoneme_offsets = [0]
     group_ids = np.zeros(len(entries), dtype=np.int32)
     symbols: dict[str, int] = {}
     group = -1
@@ -146,12 +202,14 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     for row, entry in enumerate(entries):
         for symbol in entry.phonemes:
             phoneme_ids.append(symbols.setdefault(symbol, len(symbols)))
-        phoneme_bounds[row + 1] = len(phoneme_ids)
+        phoneme_offsets.append(len(phoneme_ids))
         key = (entry.mora_count, entry.phonemes)
         if key != previous_key:
             group += 1
             previous_key = key
         group_ids[row] = group
+
+    _check_blob_fits("音素 blob", len(phoneme_ids))
 
     phoneme_vocabulary = [""] * len(symbols)
     for symbol, index in symbols.items():
@@ -170,7 +228,7 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
         "mora_counts": np.array([e.mora_count for e in entries], dtype=np.int16),
         "phoneme_vocabulary": np.array(phoneme_vocabulary, dtype=np.str_),
         "phoneme_ids": np.array(phoneme_ids, dtype=np.uint8),
-        "phoneme_bounds": phoneme_bounds,
+        "phoneme_bounds": np.asarray(phoneme_offsets, dtype=np.int32),
         "group_ids": group_ids,
     }
 
@@ -358,16 +416,81 @@ class PhoneticStore:
     # --- ベクトル ---------------------------------------------------------
 
     def vectors(self, space: str) -> np.ndarray:
-        """指定した空間の (N, D) 行列を mmap で返す。
+        """指定した空間の (N, D) int8 行列を mmap で返す。
 
         候補生成も rerank もこの行列だけで足りる。mmap なので匿名メモリに
         載らず、ページキャッシュとして回収できる — ANN のグラフを持っていた
         頃はここと同じデータをヒープに複製していた
         (`PhoneticSearcher._top_candidates` 参照)。
+
+        **値は int8 の量子化済み。** そのまま内積を取っても元のコサイン
+        類似度にはならないので、`scale(space)` を掛けて戻す。掛ける操作は
+        Rust 側 (`jpr_distance.top_candidates` / `dot_all`) が担う。
         """
         if space not in self._vectors:
             self._vectors[space] = np.load(self.path / f"vectors-{space}.npy", mmap_mode="r")
         return self._vectors[space]
+
+    def scale(self, space: str) -> float:
+        """量子化スケール。int8 の内積にこれの 2 乗を掛けると元の値に戻る。
+
+        行列側とクエリ側で同じスケールを使う (どちらも同じ空間の値なので
+        分ける理由がない)。
+        """
+        return self.meta.scales[space]
+
+    def dequantized(self, space: str) -> np.ndarray:
+        """int8 の行列を float32 に戻したものを返す。
+
+        **検索経路では使わない** (行列全体を実体化するので full だと 583MB)。
+        量子化の誤差を確かめるテストと、索引を調べる用途のための入口。
+        """
+        return self.vectors(space).astype(np.float32) * self.scale(space)
+
+    def quantize_query(self, space: str, vector: np.ndarray) -> np.ndarray:
+        """クエリベクトルを索引と同じスケールで int8 に落とす。
+
+        索引側と同じ量子化を通さないと内積の尺度が揃わない。範囲外に出た値は
+        飽和させる — クエリは索引に無い語でもよいので、索引の最大値を超える
+        成分が出うる。
+        """
+        scaled = np.round(np.asarray(vector, dtype=np.float32) / self.scale(space))
+        return np.clip(scaled, -127, 127).astype(np.int8)
+
+    def top_rows(self, space: str, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        """索引全体と内積を取り、上位 `k` 行とコサイン類似度を返す。
+
+        内積と Top-K の両方を Rust が担う。NumPy に int8 の GEMV 経路が無い
+        ためで、`astype(np.int32)` を挟むと 202 万行ぶんの中間配列
+        (582MB) を実体化してしまう。
+        """
+        vectors = self.vectors(space)
+        quantized = self.quantize_query(space, query)
+        scale = self.scale(space)
+        return _rust.top_candidates(vectors, quantized, k, scale * scale)
+
+    def dot_rows(self, space: str, query: np.ndarray, start: int, end: int) -> np.ndarray:
+        """連続区間 [start, end) の全行とのコサイン類似度。
+
+        母集団をスライスで渡すので、mmap 上の連続読みになる。
+        """
+        vectors = self.vectors(space)
+        quantized = self.quantize_query(space, query)
+        scale = self.scale(space)
+        return _rust.dot_all(vectors[start:end], quantized, scale * scale)
+
+    def dot_selected(self, space: str, query: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """指定した行だけとのコサイン類似度。
+
+        候補が母集団のごく一部のときだけ使う経路 (`search._space_scores` が
+        件数で切り替える)。`vectors[rows]` が飛び飛びの行を実体化するので、
+        行数が増えるとコストが急伸する — 多いときは連続読みの `dot_rows` が
+        速い。
+        """
+        vectors = self.vectors(space)
+        quantized = self.quantize_query(space, query)
+        scale = self.scale(space)
+        return _rust.dot_all(np.ascontiguousarray(vectors[rows]), quantized, scale * scale)
 
 
 def write_store(
@@ -405,15 +528,21 @@ def write_store(
     report("語彙メタデータを書き出し中")
     np.savez(path / _ENTRIES_FILE, **_encode_entries(entries))
 
+    # ベクトルは int8 に量子化して保存する。float32 のままだと full で 1.47GB
+    # あり、そのままイメージに焼くとコンテナが膨らむ (`_quantize` の項を参照)。
+    scales: dict[str, float] = {}
     for space, matrix in vectors.items():
-        report(f"ベクトルを書き出し中: {space}")
-        np.save(path / f"vectors-{space}.npy", matrix)
+        report(f"ベクトルを量子化して書き出し中: {space}")
+        quantized, scale = _quantize(matrix)
+        scales[space] = scale
+        np.save(path / f"vectors-{space}.npy", quantized)
 
     meta = StoreMeta(
         version=FORMAT_VERSION,
         count=len(entries),
         dims={name: int(vectors[name].shape[1]) for name in vectors},
         dict_type=dict_type,
+        scales=scales,
     )
     (path / _META_FILE).write_text(meta.to_json(), encoding="utf-8")
     report("完了")

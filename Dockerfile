@@ -2,10 +2,13 @@
 # 「初回に索引を用意する」手順がデプロイと別に要る。ビルド時に構築すれば
 # デプロイした時点で動く状態になる。
 #
-# 辞書は core を使う。索引は 855MB (full の 202 万語だと 1.52GB)。実測で
-# 品質は保たれる (「乳首」-> 手首 / 「ワタシノナマエハ」-> 私の名前は)。
+# 辞書は core を使う。実測で品質は保たれる
+# (「乳首」-> 手首 / 「ワタシノナマエハ」-> 私の名前は)。
 # ANN のグラフを作らなくなったので構築は 496s -> 163s に縮んでいる
-# (`store.py` の CANDIDATE_SPACES と `search.py` の _ann_candidates を参照)。
+# (`store.py` の CANDIDATE_SPACES と `search.py` の _top_candidates を参照)。
+# さらにベクトルを int8 に量子化したので (`store.py` の `_quantize`)、
+# 索引は full の実測で 1.64GB -> 508MB になった。core はその語数比で
+# 280MB 前後の見込み (未実測)。
 
 FROM python:3.12-slim AS builder
 
@@ -42,7 +45,7 @@ RUN uv run jpr build-index --dict core --index "$JPR_INDEX"
 FROM python:3.12-slim
 
 # 実行時は Rust ツールチェインが要らない (ビルド済みの .so を持ち込む)。
-# libgomp は numpy / hnswlib が参照する。
+# libgomp は numpy が参照する。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*

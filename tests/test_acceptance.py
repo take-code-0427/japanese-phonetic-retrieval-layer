@@ -59,11 +59,14 @@ def test_flagship_riddle_with_semantic_constraint(
     assert results[0].surface == "チョコビ"
 
 
-def test_ann_recall_reaches_the_target(real_searcher: PhoneticSearcher) -> None:
-    """ANN の候補生成が「チョコビ」に到達できる。
+def test_candidate_generation_reaches_the_target(real_searcher: PhoneticSearcher) -> None:
+    """候補生成が「チョコビ」に到達できる。
 
     精密な編集距離では 0.808 で数百位に沈む語だが、埋め込み空間では上位に来る。
     2 段構成が成立する前提条件。
+
+    候補生成が int8 の量子化内積になったので、**この経路は量子化の誤差が
+    候補を落としていないことの確認も兼ねる** (`store._quantize` の項を参照)。
     """
     _, results = real_searcher.search("乳首", limit=400, candidates=2000)
     assert any(r.surface == "チョコビ" for r in results)

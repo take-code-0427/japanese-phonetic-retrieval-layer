@@ -17,6 +17,8 @@ use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+mod gemv;
+
 /// パディングで「音素なし」を表す値。Python 側の `PAD_ID` と一致させる。
 const PAD_ID: i64 = -1;
 
@@ -130,7 +132,9 @@ fn edit_distance_csr<'py>(
     query_ids: PyReadonlyArray1<'py, i32>,
     rows: PyReadonlyArray1<'py, i64>,
     phoneme_ids: PyReadonlyArray1<'py, u8>,
-    phoneme_bounds: PyReadonlyArray1<'py, i64>,
+    // 索引の境界は int32 (`store.py` の `_encode_strings`)。int64 を要求すると
+    // 呼び出しごとに 16MB の変換コピーが走る。
+    phoneme_bounds: PyReadonlyArray1<'py, i32>,
     distance_ids: PyReadonlyArray1<'py, i32>,
     substitution: PyReadonlyArray1<'py, f32>,
     indel: PyReadonlyArray1<'py, f32>,
@@ -225,5 +229,7 @@ fn compute(
 fn jpr_distance(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(edit_distance_batch, module)?)?;
     module.add_function(wrap_pyfunction!(edit_distance_csr, module)?)?;
+    module.add_function(wrap_pyfunction!(gemv::top_candidates, module)?)?;
+    module.add_function(wrap_pyfunction!(gemv::dot_all, module)?)?;
     Ok(())
 }

@@ -478,7 +478,7 @@ def edit_distance_csr(
         np.ascontiguousarray(query_ids, dtype=np.int32),
         np.ascontiguousarray(rows, dtype=np.int64),
         np.ascontiguousarray(phoneme_ids_blob, dtype=np.uint8),
-        np.ascontiguousarray(phoneme_bounds, dtype=np.int64),
+        np.ascontiguousarray(phoneme_bounds, dtype=np.int32),
         np.ascontiguousarray(distance_ids, dtype=np.int32),
         _SUB_FLAT32,
         _INDEL_FLAT32,

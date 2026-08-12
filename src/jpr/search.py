@@ -118,7 +118,13 @@ DEFAULT_PRESET = "pun"
 #: 語を rerank が拾えないという取りこぼしがあったが (k=5000 で総当たりとの
 #: top10 一致率 0.73)、いまは内積の順位が正確なので k の意味は
 #: 「rerank に何件見せるか」だけになった。
-DEFAULT_CANDIDATES = 5000
+#:
+#: **5000 -> 8000 は量子化 (int8) の誤差を吸収するため。** 内積の誤差は最大
+#: 0.012 で、Top-K 境界のスコア差 (0.0002 程度) より大きいので順位が入れ替わる。
+#: float32 の Top-5000 を正解としたときの recall は k=5000 で 0.919、
+#: k=6000 で 0.977、**k=8000 で 0.997**。int8 の候補生成は k を増やしても
+#: 重くならないので (内積は全行に対して取る)、広げて取りこぼしを消すほうが得。
+DEFAULT_CANDIDATES = 8000
 
 #: 打ち切り線を決めるために確定させる件数の、limit に対する倍率。
 #: 同音の異表記が後段で 1 件に畳まれるため、limit ぴったりで打ち切ると
@@ -479,18 +485,24 @@ class PhoneticSearcher:
         かつて「総当たりは ANN より遅い (21〜30ms 対 15ms)」と記録していたが、
         あれは full (202 万語) での測定。core (111 万語) では逆転している。
         **語数が変われば測り直す。**
+
+        内積と Top-K は Rust が担う (`store.top_rows`)。実測 (full 202 万語、
+        プロセスを分けて 20 回の最小値):
+
+        | | 内積 | Top-K |
+        |---|---|---|
+        | NumPy float32 (BLAS + argpartition) | 15.4〜26.0ms | 9.0〜15.5ms |
+        | Rust int8 | 16.8〜28.8ms | 2.6〜10.0ms |
+
+        **内積は BLAS と互角** — int8 で読むバイト数が 1/4 になっても、
+        202 万行の走査は DRAM 帯域で決まり、int8 の積和が BLAS の SIMD された
+        f32 積和よりスループットで劣るぶんと相殺される。速度で得しているのは
+        Top-K だけで、**量子化の主目的はサイズ** (索引 1.64GB -> 508MB)。
         """
         wanted = min(candidates, len(self.store))
-        vectors = self.store.vectors(self.candidate_space)
-        # 正規化済みベクトルなので内積がそのままコサイン類似度になる。
-        scores = vectors @ query_vectors[self.candidate_space]
-        if wanted >= scores.size:
-            rows = np.argsort(-scores)
-            return rows.astype(np.int64), scores[rows]
-        # 完全ソートは要らない。上位 `wanted` 件を切り出してから並べる。
-        top = np.argpartition(scores, scores.size - wanted)[scores.size - wanted :]
-        top = top[np.argsort(-scores[top])]
-        return top.astype(np.int64), scores[top]
+        return self.store.top_rows(
+            self.candidate_space, query_vectors[self.candidate_space], wanted
+        )
 
     def _scan_candidates(
         self,
@@ -513,10 +525,11 @@ class PhoneticSearcher:
         rows = np.arange(start, end, dtype=np.int64)
         if rows.size == 0:
             return rows, np.zeros(0, dtype=np.float32)
-        vectors = self.store.vectors(self.candidate_space)
-        # 正規化済みベクトルなので内積がそのままコサイン類似度になり、
-        # ANN 経路が返すスコアと同じ尺度で揃う。
-        scores = vectors[start:end] @ query_vectors[self.candidate_space]
+        # 量子化スケールを戻したコサイン類似度が返るので、Top-K 経路と
+        # 同じ尺度で揃う。
+        scores = self.store.dot_rows(
+            self.candidate_space, query_vectors[self.candidate_space], start, end
+        )
         return rows, scores
 
     def _apply_cheap_filters(
@@ -773,13 +786,12 @@ class PhoneticSearcher:
         (`bounds=None`, 候補 2000 件 = 全体の 0.1%) は下。どちらも通るので
         件数で切り替える。
         """
-        vectors = self.store.vectors(space)
         query = query_vectors[space]
         start, end = bounds if bounds is not None else (0, len(self.store))
         if rows.size >= self._FULL_SCAN_RATIO * (end - start):
             positions = rows if start == 0 else rows - start
-            return (vectors[start:end] @ query)[positions]
-        return vectors[rows] @ query
+            return self.store.dot_rows(space, query, start, end)[positions]
+        return self.store.dot_selected(space, query, rows)
 
     def _materialize(
         self,

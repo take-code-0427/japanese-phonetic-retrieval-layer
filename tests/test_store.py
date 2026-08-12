@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import jpr_distance
 import numpy as np
 import pytest
 
@@ -155,10 +156,82 @@ def test_no_ann_graph_is_written(roundtrip: PhoneticStore) -> None:
 
 
 def test_inner_product_ranks_self_first(roundtrip: PhoneticStore) -> None:
-    """自身のベクトルで引けば自身が最も近い。候補生成の土台の確認。"""
-    vectors = roundtrip.vectors("phonetic")
-    scores = vectors @ np.asarray(vectors[1])
-    assert int(np.argmax(scores)) == 1
+    """自身のベクトルで引けば自身が最も近い。候補生成の土台の確認。
+
+    量子化スケールを戻す経路 (`top_rows`) を通す。行列は int8 なので、
+    生の内積を取ると尺度が復元されない。
+    """
+    original = roundtrip.dequantized("phonetic")
+    rows, scores = roundtrip.top_rows("phonetic", original[1], 4)
+    assert int(rows[0]) == 1
+    # 正規化済みベクトルの自己内積なのでコサイン類似度は 1.0。
+    assert scores[0] == pytest.approx(1.0, abs=0.01)
+
+
+def test_vectors_are_quantized_to_int8(roundtrip: PhoneticStore) -> None:
+    """ベクトルは int8 で保存される (float32 の 1/4)。"""
+    assert roundtrip.vectors("phonetic").dtype == np.int8
+    assert roundtrip.scale("phonetic") > 0.0
+
+
+def test_quantized_dot_matches_float32(roundtrip: PhoneticStore) -> None:
+    """量子化した内積が元の float32 の内積と一致する (誤差の範囲で)。
+
+    候補生成 (`top_rows`)・全走査 (`dot_rows`)・選抜 (`dot_selected`) の
+    3 経路が同じ尺度を返すことを確かめる。ここがずれると rerank の
+    スコア合成が静かに狂う。
+    """
+    original = roundtrip.dequantized("phonetic")
+    query = original[2]
+    reference = original @ query
+
+    scanned = roundtrip.dot_rows("phonetic", query, 0, len(roundtrip))
+    assert scanned == pytest.approx(reference, abs=0.02)
+
+    selected = roundtrip.dot_selected("phonetic", query, np.array([0, 3]))
+    assert selected == pytest.approx(reference[[0, 3]], abs=0.02)
+
+    rows, scores = roundtrip.top_rows("phonetic", query, len(roundtrip))
+    assert scores == pytest.approx(reference[rows], abs=0.02)
+
+
+def test_tied_scores_resolve_to_row_order() -> None:
+    """同点の候補は行番号の小さい順に返る。
+
+    候補生成を並列にすると、同点がどれも選ばれうるので「どれが k 件に
+    残るか」が揺れる。代表選び (`search._representative_rank`) は候補の
+    到着順に依存するので、揺れると**同じクエリが違う表記を返す**。
+
+    スコアだけを見る比較関数では足りない。チャンク内の選抜は入力順を
+    保証しないので (`select_nth_unstable`)、最後に並べ替えても生き残った
+    中の順序が揃うだけになる — 実装当初はここで全件同点の 5000 行から
+    行 0, 1 を飛ばして 2852 が入っていた。チャンク境界 (262144 行) を
+    跨ぐ規模で確かめる。
+    """
+    matrix = np.ones((900000, 8), dtype=np.int8)
+    query = np.ones(8, dtype=np.int8)
+
+    for _ in range(5):
+        rows, _ = jpr_distance.top_candidates(matrix, query, 20, 1.0)
+        assert list(rows) == list(range(20))
+
+    # 一部だけ高スコアにしても、残りは行番号順で埋まる。
+    matrix[7] = 2
+    matrix[500000] = 2
+    for _ in range(5):
+        rows, _ = jpr_distance.top_candidates(matrix, query, 5, 1.0)
+        assert list(rows) == [7, 500000, 0, 1, 2]
+
+
+def test_bounds_are_int32(roundtrip: PhoneticStore) -> None:
+    """CSR の境界は int32。full でも blob は 3900 万バイトしかない。
+
+    `edit_distance_csr` が int32 を受け取る前提でもあり、int64 に戻すと
+    呼び出しごとに 16MB の変換コピーが走る。
+    """
+    with np.load(roundtrip.path / "entries.npz", allow_pickle=False) as archive:
+        for name in ("surface_bounds", "reading_bounds", "phoneme_bounds"):
+            assert archive[name].dtype == np.int32, name
 
 
 def test_missing_index_raises(tmp_path: Path) -> None:

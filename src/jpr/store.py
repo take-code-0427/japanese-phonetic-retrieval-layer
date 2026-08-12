@@ -202,8 +202,24 @@ def _encode_strings(values: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
     return np.frombuffer(bytes(blob), dtype=np.uint8), boundaries
 
 
-def _decode_string(blob: np.ndarray, boundaries: np.ndarray, row: int) -> str:
-    start, end = int(boundaries[row]), int(boundaries[row + 1])
+def _byte_view(array: np.ndarray) -> memoryview:
+    """mmap 配列をバイトの `memoryview` として見る (コピーしない)。
+
+    **NumPy の添字を経由しない**ための入口。`blob[start:end]` は memmap の
+    スライスなので、1 回ごとに memmap オブジェクトを構築する。文字列の復号は
+    1 検索で数万回走るため、実測で `memmap.__getitem__` が 20 万回・
+    2.4ms/クエリを占めていた。`memoryview` ならバッファプロトコルで直接
+    読めて **5.5 倍速い** (20000 件で 146ms -> 26ms)。
+
+    ページは mmap のまま参照するので、**匿名メモリは増えない** (実測 +0kB)。
+    境界配列を `np.asarray` で実体化すると 3 本で 24MB がヒープに載るので、
+    そちらは採らない — この索引は匿名メモリを削るために mmap にしてある。
+    """
+    return memoryview(array).cast("B")
+
+
+def _decode_string(blob: memoryview, boundaries: memoryview, row: int) -> str:
+    start, end = boundaries[row], boundaries[row + 1]
     return bytes(blob[start:end]).decode("utf-8")
 
 
@@ -354,8 +370,27 @@ class PhoneticStore:
             dtype=np.int32,
         )
 
+        # 文字列の復号は NumPy の添字を通さず memoryview で読む
+        # (`_byte_view` の項を参照)。境界は int32 なのでバイト経由で写す。
+        self._surface_blob = _byte_view(self._data["surface_blob"])
+        self._surface_bounds = _byte_view(self._data["surface_bounds"]).cast("i")
+        self._reading_blob = _byte_view(self._data["reading_blob"])
+        self._reading_bounds = _byte_view(self._data["reading_bounds"]).cast("i")
+
+        # 1 行ずつ引く列も同じ理由で memoryview を通す (`entry` / `phonemes`)。
+        # 配列演算で読む経路は NumPy のまま (`self._data`) — こちらはスカラー
+        # 引きの Python 呼び出しが支配的な経路だけを置き換える。
+        self._row_group_ids = _byte_view(self._data["group_ids"]).cast("i")
+        self._phoneme_bounds_view = _byte_view(self._data["phoneme_bounds"]).cast("i")
+        self._phoneme_ids_view = _byte_view(self._data["phoneme_ids"])
+        self._mora_counts_view = _byte_view(self._data["mora_counts"]).cast("h")
+        self._pos_ids_view = _byte_view(self._data["pos_ids"]).cast("h")
+        self._category_ids_view = _byte_view(self._data["category_ids"]).cast("b")
+        self._costs_view = _byte_view(self._data["costs"]).cast("i")
+
         self._vectors: dict[str, np.ndarray] = {}
         self._group_starts: np.ndarray | None = None
+        self._mora_edge_cache: np.ndarray | None = None
 
     def __len__(self) -> int:
         return self.meta.count
@@ -363,17 +398,17 @@ class PhoneticStore:
     # --- 語彙メタデータ ---------------------------------------------------
 
     def surface(self, row: int) -> str:
-        return _decode_string(self._data["surface_blob"], self._data["surface_bounds"], row)
+        return _decode_string(self._surface_blob, self._surface_bounds, row)
 
     def reading(self, row: int) -> str:
-        return _decode_string(self._data["reading_blob"], self._data["reading_bounds"], row)
+        return _decode_string(self._reading_blob, self._reading_bounds, row)
 
     def phonemes(self, row: int) -> tuple[str, ...]:
-        group = int(self._data["group_ids"][row])
-        bounds = self._data["phoneme_bounds"]
-        start, end = int(bounds[group]), int(bounds[group + 1])
+        group = self._row_group_ids[row]
+        bounds = self._phoneme_bounds_view
+        start, end = bounds[group], bounds[group + 1]
         vocabulary = self._phoneme_vocabulary
-        return tuple(vocabulary[i] for i in self._data["phoneme_ids"][start:end])
+        return tuple(vocabulary[i] for i in self._phoneme_ids_view[start:end])
 
     def phoneme_id_array(self, row: int) -> np.ndarray:
         """音素列を距離計算用の ID 配列として返す。
@@ -381,9 +416,9 @@ class PhoneticStore:
         索引が持つ ID は語彙内で振ったものなので、距離テーブルの ID に写し直す。
         記号のタプルを経由しないので rerank の内側で使える。
         """
-        group = int(self._data["group_ids"][row])
-        bounds = self._data["phoneme_bounds"]
-        start, end = int(bounds[group]), int(bounds[group + 1])
+        group = self._row_group_ids[row]
+        bounds = self._phoneme_bounds_view
+        start, end = bounds[group], bounds[group + 1]
         return self._distance_ids[self._data["phoneme_ids"][start:end]]
 
     def phoneme_id_matrix(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -438,14 +473,14 @@ class PhoneticStore:
             surface=self.surface(row),
             reading=self.reading(row),
             phonemes=self.phonemes(row),
-            mora_count=int(self._data["mora_counts"][row]),
-            pos=self._pos_vocabulary[int(self._data["pos_ids"][row])],
-            category=self._category_vocabulary[int(self._data["category_ids"][row])],
-            cost=int(self._data["costs"][row]),
+            mora_count=self._mora_counts_view[row],
+            pos=self._pos_vocabulary[self._pos_ids_view[row]],
+            category=self._category_vocabulary[self._category_ids_view[row]],
+            cost=self._costs_view[row],
         )
 
     def category_of(self, row: int) -> Category:
-        return self._category_vocabulary[int(self._data["category_ids"][row])]
+        return self._category_vocabulary[self._category_ids_view[row]]
 
     @property
     def category_ids(self) -> np.ndarray:
@@ -524,18 +559,42 @@ class PhoneticStore:
             return first, first
         return int(groups[start]), int(groups[end - 1]) + 1
 
+    @property
+    def _mora_edges(self) -> np.ndarray:
+        """モーラ数ごとの行の開始位置。`_mora_edges[n]` が「n モーラ未満」の行数。
+
+        **毎回 `searchsorted` を呼んではいけない。** 探索する `mora_counts` は
+        mmap 上の 202 万要素なので、二分探索がページフォールトを踏んで 1 回
+        1.2ms かかる。既定の検索は候補生成のたびに帯の両端を引くので、実測で
+        **1 クエリあたり 3.2ms** — 内積 (4ms) に並ぶ第 2 の項目になっていた。
+
+        モーラ数の種類は 2〜12 の 11 個しかないので、全境界を一度に求めて
+        持てば以降は配列引きで済む (前計算は 3.1ms、1 回だけ)。
+        """
+        if self._mora_edge_cache is None:
+            moras = self._data["mora_counts"]
+            largest = int(moras[-1]) if moras.size else 0
+            # 添字 n をそのまま使えるよう 0..largest+1 の全整数で切る。
+            self._mora_edge_cache = np.searchsorted(
+                moras, np.arange(largest + 2), side="left"
+            ).astype(np.int64)
+        return self._mora_edge_cache
+
     def mora_range(self, min_mora: int | None, max_mora: int | None) -> tuple[int, int]:
         """モーラ数が範囲に入る行の連続区間 [start, end) を返す。
 
-        行はモーラ数の昇順に並んでいるので (`_locality_order`)、範囲の切り出しは
-        二分探索で済み、該当行は必ず連続する。マスク + fancy indexing で選抜する
-        必要がなく、ベクトル行列や列配列をスライスで直接読める。
+        行はモーラ数の昇順に並んでいるので (`_locality_order`)、該当行は必ず
+        連続する。マスク + fancy indexing で選抜する必要がなく、ベクトル行列や
+        列配列をスライスで直接読める。
+
+        境界は前計算した表から引く (`_mora_edges`)。mmap 上の二分探索は
+        1 回 1.2ms かかり、毎クエリ払うには重すぎる。
         """
-        moras = self._data["mora_counts"]
-        start = 0 if min_mora is None else int(np.searchsorted(moras, min_mora, side="left"))
-        end = (
-            moras.size if max_mora is None else int(np.searchsorted(moras, max_mora, side="right"))
-        )
+        edges = self._mora_edges
+        total = self._data["mora_counts"].size
+        # 表は「n モーラ未満の行数」なので、上端は max_mora + 1 の位置を引く。
+        start = 0 if min_mora is None else int(edges[min(max(min_mora, 0), edges.size - 1)])
+        end = total if max_mora is None else int(edges[min(max(max_mora + 1, 0), edges.size - 1)])
         return start, max(start, end)
 
     # --- ベクトル ---------------------------------------------------------
@@ -588,20 +647,39 @@ class PhoneticStore:
         scaled = np.round(np.asarray(vector, dtype=np.float32) / self.scale(space))
         return np.clip(scaled, -127, 127).astype(np.int8)
 
-    def top_groups(self, space: str, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """索引全体と内積を取り、上位 `k` グループとコサイン類似度を返す。
+    def top_groups(
+        self,
+        space: str,
+        query: np.ndarray,
+        k: int,
+        start: int = 0,
+        end: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """グループ区間 [start, end) と内積を取り、上位 `k` 件とコサイン類似度を返す。
 
         **返るのは行ではなくグループ** (v5)。同音異表記はベクトルが同一なので、
         行単位で Top-K を取ると上位が同じ音の異表記で埋まる。呼び出し側が
         `group_starts` で行へ展開する (`search._top_candidates`)。
 
+        **区間はモーラ帯** (v6)。既定の検索は候補生成の直後にモーラ差で候補を
+        削るので (`search._MAX_MORA_GAP`)、帯の外に内積を取っても捨てるだけに
+        なる。グループもモーラ数順に並ぶので区間はスライスで切れ、mmap の
+        連続読みのまま行数だけが減る。返すグループ番号は `start` を足して
+        索引全体の番号に戻す — 呼び出し側は区間を意識しなくてよい。
+
         内積と Top-K の両方を Rust が担う。NumPy に int8 の GEMV 経路が無い
         ためで、`astype(np.int32)` を挟むと索引ぶんの中間配列を実体化してしまう。
         """
         vectors = self.vectors(space)
+        if end is None:
+            end = vectors.shape[0]
         quantized = self.quantize_query(space, query)
         scale = self.scale(space)
-        return _rust.top_candidates(vectors, quantized, k, scale * scale)
+        # mmap のスライスはビューなので、ここでコピーは起きない。
+        groups, scores = _rust.top_candidates(vectors[start:end], quantized, k, scale * scale)
+        if start:
+            groups += start
+        return groups, scores
 
     def dot_groups(self, space: str, query: np.ndarray, start: int, end: int) -> np.ndarray:
         """連続区間 [start, end) の全**グループ**とのコサイン類似度。

@@ -343,7 +343,7 @@ class PhoneticSearcher:
         # ANN を迂回して母集団を全走査する (`_scan_candidates` 参照)。
         bounds = self._mora_bounds(min_mora=min_mora, max_mora=max_mora)
         if bounds is None:
-            rows, embedding_scores = self._top_candidates(query_vectors, candidates)
+            rows, embedding_scores = self._top_candidates(query_vectors, candidates, pronunciation)
         else:
             rows, embedding_scores = self._scan_candidates(query_vectors, bounds)
         if rows.size == 0:
@@ -469,6 +469,7 @@ class PhoneticSearcher:
         self,
         query_vectors: dict[str, np.ndarray],
         candidates: int,
+        pronunciation: Pronunciation,
     ) -> tuple[np.ndarray, np.ndarray]:
         """索引全体と内積を取り、上位 `candidates` 件の行と類似度を得る。
 
@@ -505,11 +506,37 @@ class PhoneticSearcher:
         行単位で Top-K を取ると上位が同じ音の異表記で埋まる。グループで取って
         から行へ展開すれば、`candidates` 件が「異なる音素列 `candidates` 個」を
         意味するようになり、rerank に渡る音の多様性が上がる。
+
+        **内積を取るのはモーラ帯だけ** (v6)。この経路の候補は直後に
+        `_apply_cheap_filters` が `_MAX_MORA_GAP` で削るので、帯の外の行は
+        内積を取っても必ず捨てられる。行はモーラ数順に並んでいるので
+        (`store._locality_order`) 帯は連続区間で、スライス 1 本で切れる。
+        実測 (full 202 万語) で 3 モーラのクエリは行が 49% になり、候補生成が
+        **8.0ms -> 4.0ms**。7 モーラでは帯が広く 86% にしか減らないので
+        7.2ms -> 6.2ms に留まる — **効きはクエリのモーラ数に依存する**。
+
+        **近似ではない。** 落とすのはどのみち後段が捨てる行なので、上位の
+        順位とスコアは全行に内積を取った場合と一致する (実測で Top-200 が
+        完全一致、`tests/test_acceptance.py::test_mora_band_does_not_change_ranking`
+        が検証する)。だから `_apply_cheap_filters` 側のギャップ判定と
+        **同じ `_MAX_MORA_GAP` を使わなければならない** — ここを緩めると
+        後段が捨てる行に内積を取り、狭めると順位が変わる。
         """
         store = self.store
         wanted = min(candidates, store.group_count)
+        query = query_vectors[self.candidate_space]
+
+        # 後段のギャップ判定が残す帯だけをグループの連続区間に落とす。
+        row_start, row_end = store.mora_range(
+            pronunciation.mora_count - self._MAX_MORA_GAP,
+            pronunciation.mora_count + self._MAX_MORA_GAP,
+        )
+        if row_start >= row_end:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        group_start, group_end = store.group_mora_range_of_rows(row_start, row_end)
+
         groups, scores = store.top_groups(
-            self.candidate_space, query_vectors[self.candidate_space], wanted
+            self.candidate_space, query, wanted, group_start, group_end
         )
         return self._expand_groups(groups, scores)
 

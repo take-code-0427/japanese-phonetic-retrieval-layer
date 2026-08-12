@@ -370,6 +370,35 @@ def test_edit_distance_pruning_does_not_change_ranking(
     assert baseline == _fingerprint(reference, query, min_mora=4, max_mora=6, preset=preset)
 
 
+@pytest.mark.parametrize("query", _EQUIVALENCE_QUERIES)
+@pytest.mark.parametrize("preset", ["pun", "rhyme", "mishearing"])
+def test_mora_band_only_drops_rows_the_filter_would_reject(
+    real_store: PhoneticStore,
+    query: str,
+    preset: str,
+) -> None:
+    """候補生成のモーラ帯が、後段の判定と同じ行だけを落とす (v6)。
+
+    `_top_candidates` は帯の外の行に内積を取らない。これが安全なのは、
+    そこが直後に `_apply_cheap_filters` の `_MAX_MORA_GAP` で必ず捨てられる
+    行だから — **帯の幅とギャップ判定が同じ定数を使っていることが根拠**で、
+    片方だけを動かすとこの前提が崩れる。
+
+    「帯を広げても結果が同じ」ではないことに注意する。帯を広げると Top-K が
+    遠いモーラ数の語で埋まり、**近い語が候補から押し出されて結果が悪くなる**
+    (実測で「乳首」の 8 位が 低み 0.8914 -> シクベ 0.8818 に落ちた)。帯は
+    取りこぼしを減らす方向に働くので、対照に取れるのは「結果の全件がそもそも
+    帯の中にある」ことのほう。
+    """
+    searcher = PhoneticSearcher(real_store)
+    pronunciation, results = searcher.search(query, limit=30, preset=preset)
+    assert results
+
+    gap = searcher._MAX_MORA_GAP
+    for result in results:
+        assert abs(result.mora_count - pronunciation.mora_count) <= gap, result
+
+
 # ---------- 分割合成 (空耳) ----------
 #
 # 小さなサンプル語彙では「意図した空耳が引けるか」を確認できない。

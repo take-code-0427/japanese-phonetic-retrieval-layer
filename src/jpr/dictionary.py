@@ -51,10 +51,14 @@ def find_system_dic(dict_type: str = "full") -> Path:
     try:
         module = __import__(module_name)
     except ImportError as exc:  # pragma: no cover - 環境依存
-        raise FileNotFoundError(
-            f"{module_name} がインストールされていません。"
-            f"`uv add sudachidict-{dict_type}` を実行してください。"
-        ) from exc
+        # full は任意の依存 (`pyproject.toml` の `[project.optional-dependencies]`)。
+        # core だけで動かすコンテナに 344MB を持ち込まないため外してある。
+        hint = (
+            "`uv sync --extra full` を実行してください。"
+            if dict_type == "full"
+            else f"`uv add sudachidict-{dict_type}` を実行してください。"
+        )
+        raise FileNotFoundError(f"{module_name} がインストールされていません。{hint}") from exc
 
     path = Path(module.__file__).parent / "resources" / "system.dic"
     if not path.exists():  # pragma: no cover - 環境依存

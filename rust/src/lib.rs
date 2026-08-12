@@ -52,6 +52,12 @@ fn edit_distance_one(
         previous[j + 1] = previous[j] + indel[candidate[j] as usize];
     }
 
+    // 2 行を入れ替えながら進める。行の複製 (`copy_from_slice`) を挟むと
+    // クエリ音素ごとに m+1 要素を書き戻すことになり、DP 本体と同じ量の
+    // 書き込みが増える。参照を差し替えれば同じ結果が複製なしで得られる。
+    let mut previous: &mut [f32] = previous;
+    let mut current: &mut [f32] = current;
+
     for &qp in query {
         let q_indel = indel[qp as usize];
         // 置換コスト表のうち、このクエリ音素に対応する行。
@@ -70,9 +76,10 @@ fn edit_distance_one(
             }
             current[j + 1] = best;
         }
-        previous[..=m].copy_from_slice(&current[..=m]);
+        std::mem::swap(&mut previous, &mut current);
     }
 
+    // 入れ替えた直後なので、最後に書いた行は `previous` のほう。
     previous[m]
 }
 

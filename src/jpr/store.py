@@ -3,8 +3,20 @@
 保存するもの:
 
     meta.json          形式バージョンと件数、空間の次元
-    entries.npz        語彙のメタデータ (表層・読み・音素列・カテゴリ・コスト)
-    vectors-<空間>.npy 各埋め込み空間の (N, D) 行列
+    <配列名>.npy       語彙のメタデータ (表層・読み・音素列・カテゴリ・コスト)
+    vectors-<空間>.npy 各埋め込み空間の (G, D) 行列
+
+**語彙メタデータを npz にまとめない。** npz は zip なので mmap できず、
+`np.load` が全配列をヒープに展開する (full で 133MB が匿名メモリに載る)。
+1 配列 1 ファイルなら mmap で開けて、同じ 133MB が回収可能なページキャッシュ
+に移る。圧縮していないのでディスク上の大きさは変わらない。
+
+**行列の行は語ではなく音素列グループ (G)。** 埋め込みも編集距離も音素列だけの
+関数なので、同音異表記 (「価格」「架格」「カカク」) はまったく同じベクトルと
+同じ距離を持つ。行ごとに持つと full の 202 万語のうち 146 万ぶんしか情報が
+無いのに全部を保存し、内積も重複して計算することになる。グループ単位にすると
+行が 28% 減り、**索引サイズ・内積の行数・rerank の候補数のすべてに同時に効く**。
+行からグループへは `group_ids`、グループから行へは `group_starts` で写す。
 
 pickle をやめた理由は 2 つ。ロードに 12〜18 秒かかり MCP サーバの起動コスト
 として重すぎたこと、そして任意コード実行を招く形式を配布物に使いたくないこと。
@@ -34,7 +46,11 @@ from .index import Category, IndexEntry
 #:
 #: v4 でベクトルを int8 に量子化した (`_quantize`)。float32 の索引は読めない
 #: ので再構築が要る。
-FORMAT_VERSION = 4
+#:
+#: v5 でベクトルと音素列を**音素列グループ単位**に落とし (`_encode_entries`)、
+#: 語彙メタデータを npz から個別の .npy に分けた (mmap で開くため)。
+#: どちらもファイルの並びが変わるので v4 の索引は読めない。
+FORMAT_VERSION = 5
 
 #: 候補生成に使う空間。
 #:
@@ -44,8 +60,44 @@ FORMAT_VERSION = 4
 #: 増える (匿名メモリは増えない)。
 CANDIDATE_SPACES = ("phonetic",)
 
+#: 索引に保存する空間。
+#:
+#: `embedding.SPACES` の全 5 空間ではなく、**検索が実際に読む 3 つだけ**。
+#: 候補生成が `phonetic`、rerank が `coda` と `vowel` を引く
+#: (`search._score_candidates`)。
+#:
+#: `consonant` と `rhythm` は書いても読まれない。この 2 つを使うのは
+#: `compare` (`search.compare_pronunciations`) だけで、あちらは索引を引かず
+#: **入力 2 語をその場で `embed()` する**ので行列が要らない。full の実測で
+#: consonant 91MB + rhythm 16MB = 107MB、core で 58MB が死蔵されていた。
+#:
+#: **空間を rerank に足すときはここに加える。** 索引の再構築が要る
+#: (`FORMAT_VERSION` を上げる)。
+INDEXED_SPACES = ("phonetic", "coda", "vowel")
+
 _META_FILE = "meta.json"
-_ENTRIES_FILE = "entries.npz"
+
+#: 語彙メタデータの配列。1 つずつ .npy として置き、mmap で開く
+#: (`PhoneticStore.__init__` の項を参照)。
+#:
+#: 語彙 (`*_vocabulary`) は小さく、開いた時点で Python のリストに起こすので
+#: mmap の対象ではないが、置き場所は同じ。
+_ENTRY_ARRAYS = (
+    "surface_blob",
+    "surface_bounds",
+    "reading_blob",
+    "reading_bounds",
+    "pos_vocabulary",
+    "pos_ids",
+    "category_vocabulary",
+    "category_ids",
+    "costs",
+    "mora_counts",
+    "phoneme_vocabulary",
+    "phoneme_ids",
+    "phoneme_bounds",
+    "group_ids",
+)
 
 
 def default_store_path() -> Path:
@@ -181,6 +233,10 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
 
     entries は `_locality_order` で並んでいる前提。`group_ids` (同じ音素列の
     連番) は隣接比較で振るので、並んでいなければ同音異表記が別グループに散る。
+
+    **音素列はグループごとに 1 本だけ持つ** (v5)。同じ (モーラ数, 音素列) の
+    行は定義上まったく同じ音素列なので、行ごとに複製する必要がない。行から
+    音素列を引くときは `group_ids` を挟む。full の実測で 21.7MB -> 17.5MB。
     """
     surface_blob, surface_bounds = _encode_strings([e.surface for e in entries])
     reading_blob, reading_bounds = _encode_strings([e.reading for e in entries])
@@ -191,8 +247,9 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     category_values = sorted({e.category.value for e in entries})
     category_ids = {value: index for index, value in enumerate(category_values)}
 
-    # 音素列も同様に ID 化して連結する。同時に、同じ (モーラ数, 音素列) が
-    # 続く区間へ同じグループ ID を振る (ソート済みなので隣接比較で足りる)。
+    # 音素列を ID 化して連結する。同じ (モーラ数, 音素列) が続く区間へ同じ
+    # グループ ID を振り (ソート済みなので隣接比較で足りる)、音素列そのものは
+    # グループが変わったときだけ書き出す。
     phoneme_ids: list[int] = []
     phoneme_offsets = [0]
     group_ids = np.zeros(len(entries), dtype=np.int32)
@@ -200,13 +257,13 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     group = -1
     previous_key: tuple[int, tuple[str, ...]] | None = None
     for row, entry in enumerate(entries):
-        for symbol in entry.phonemes:
-            phoneme_ids.append(symbols.setdefault(symbol, len(symbols)))
-        phoneme_offsets.append(len(phoneme_ids))
         key = (entry.mora_count, entry.phonemes)
         if key != previous_key:
             group += 1
             previous_key = key
+            for symbol in entry.phonemes:
+                phoneme_ids.append(symbols.setdefault(symbol, len(symbols)))
+            phoneme_offsets.append(len(phoneme_ids))
         group_ids[row] = group
 
     _check_blob_fits("音素 blob", len(phoneme_ids))
@@ -254,8 +311,17 @@ class PhoneticStore:
                 f"期待={FORMAT_VERSION})。`jpr build-index --force` で再構築してください。"
             )
 
-        with np.load(self.path / _ENTRIES_FILE, allow_pickle=False) as archive:
-            self._data = {name: archive[name] for name in archive.files}
+        # 語彙メタデータも mmap で開く。
+        #
+        # **npz にまとめてはいけない。** npz は zip なので mmap できず、
+        # `np.load` が全配列をヒープに展開する。full の実測で 133MB がまるごと
+        # 匿名メモリ (回収不可) に載り、ベクトル行列を mmap にした意味を
+        # 相殺していた。個別の .npy に分けると同じ 133MB がページキャッシュ
+        # (回収可能) に移る — 圧縮していないので**ディスク上の大きさは変わらない**。
+        self._data = {
+            name: np.load(self.path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
+            for name in _ENTRY_ARRAYS
+        }
 
         # 行がモーラ数順であることは v3 の不変条件で、モーラ範囲の連続スライス
         # (`mora_range`) がこれに依存する。壊れた索引が黙って誤った母集団を
@@ -264,6 +330,17 @@ class PhoneticStore:
         if moras.size > 1 and np.any(np.diff(moras) < 0):
             raise ValueError(
                 f"索引の行がモーラ数順に並んでいません: {self.path}\n"
+                "`jpr build-index --force` で再構築してください。"
+            )
+
+        # ベクトルと音素列はグループ単位で持つので (v5)、行数と行列の行数が
+        # 一致しない。グループ ID が行数を超えていないことだけ確かめておく
+        # (壊れた索引が別の語のベクトルを黙って返すのを防ぐ)。
+        groups = self._data["group_ids"]
+        self._group_count = int(groups[-1]) + 1 if groups.size else 0
+        if self._data["phoneme_bounds"].size != self._group_count + 1:
+            raise ValueError(
+                f"音素列の本数がグループ数と一致しません: {self.path}\n"
                 "`jpr build-index --force` で再構築してください。"
             )
 
@@ -278,6 +355,7 @@ class PhoneticStore:
         )
 
         self._vectors: dict[str, np.ndarray] = {}
+        self._group_starts: np.ndarray | None = None
 
     def __len__(self) -> int:
         return self.meta.count
@@ -291,8 +369,9 @@ class PhoneticStore:
         return _decode_string(self._data["reading_blob"], self._data["reading_bounds"], row)
 
     def phonemes(self, row: int) -> tuple[str, ...]:
+        group = int(self._data["group_ids"][row])
         bounds = self._data["phoneme_bounds"]
-        start, end = int(bounds[row]), int(bounds[row + 1])
+        start, end = int(bounds[group]), int(bounds[group + 1])
         vocabulary = self._phoneme_vocabulary
         return tuple(vocabulary[i] for i in self._data["phoneme_ids"][start:end])
 
@@ -302,8 +381,9 @@ class PhoneticStore:
         索引が持つ ID は語彙内で振ったものなので、距離テーブルの ID に写し直す。
         記号のタプルを経由しないので rerank の内側で使える。
         """
+        group = int(self._data["group_ids"][row])
         bounds = self._data["phoneme_bounds"]
-        start, end = int(bounds[row]), int(bounds[row + 1])
+        start, end = int(bounds[group]), int(bounds[group + 1])
         return self._distance_ids[self._data["phoneme_ids"][start:end]]
 
     def phoneme_id_matrix(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -314,8 +394,9 @@ class PhoneticStore:
         開始位置 + 列番号の外積で一度に引けば 2ms で済む (実測 7 倍)。
         """
         bounds = self._data["phoneme_bounds"]
-        starts = bounds[rows]
-        lengths = (bounds[rows + 1] - starts).astype(np.int64)
+        groups = self._data["group_ids"][rows]
+        starts = bounds[groups]
+        lengths = (bounds[groups + 1] - starts).astype(np.int64)
         if rows.size == 0:
             return np.zeros((0, 0), dtype=np.int32), lengths
         width = int(lengths.max())
@@ -335,7 +416,8 @@ class PhoneticStore:
         境界インデックスの差だけなので、音素列そのものを起こさずに済む。
         """
         bounds = self._data["phoneme_bounds"]
-        return (bounds[rows + 1] - bounds[rows]).astype(np.int64)
+        groups = self._data["group_ids"][rows]
+        return (bounds[groups + 1] - bounds[groups]).astype(np.int64)
 
     @property
     def phoneme_csr(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -344,6 +426,10 @@ class PhoneticStore:
         `distance.edit_distance_csr` に渡してパディング行列を経由せずに
         編集距離を計算するための入口。行列を組む処理 (`phoneme_id_matrix`) は
         53 万候補で 102ms かかるので、Rust 側で CSR を直接読めるならその分が消える。
+
+        **境界は行ではなくグループで引く** (v5)。渡す添字は `group_ids[rows]`
+        であって行番号ではない。編集距離は音素列だけで決まるので、同音異表記に
+        同じ計算を繰り返す理由がない。
         """
         return self._data["phoneme_ids"], self._data["phoneme_bounds"], self._distance_ids
 
@@ -394,10 +480,49 @@ class PhoneticStore:
         """行ごとの音素列グループ ID。同じ (モーラ数, 音素列) の行が同じ値を持つ。
 
         行は構築時にグループが隣接するよう並べてあるので (`_locality_order`)、
-        この配列は全体で単調非減少。rerank が同音異表記の編集距離を代表 1 件に
-        畳むのに使う。
+        この配列は全体で単調非減少。**ベクトルと音素列はこの ID で引く** (v5)。
+        rerank が同音異表記の編集距離を代表 1 件に畳むのにも使う。
         """
         return self._data["group_ids"]
+
+    @property
+    def group_count(self) -> int:
+        """音素列グループの数。ベクトル行列と音素 CSR の行数。"""
+        return self._group_count
+
+    @property
+    def group_starts(self) -> np.ndarray:
+        """グループごとの先頭行。グループ -> 行 の展開に使う。
+
+        行はグループが隣接するよう並んでいるので (`_locality_order`)、
+        グループ `g` の行は `[group_starts[g], group_starts[g + 1])` の連続区間。
+        末尾に総行数を置いた長さ `group_count + 1` の配列。
+        """
+        if self._group_starts is None:
+            groups = self._data["group_ids"]
+            starts = np.empty(self._group_count + 1, dtype=np.int64)
+            starts[self._group_count] = groups.size
+            # 各グループの先頭行 = そのグループ ID が初めて現れる位置。
+            # 逆順に書くと同じ ID の中で最も小さい行が最後に残る。
+            starts[groups[::-1]] = np.arange(groups.size - 1, -1, -1, dtype=np.int64)
+            self._group_starts = starts
+        return self._group_starts
+
+    def group_mora_range_of_rows(self, start: int, end: int) -> tuple[int, int]:
+        """行区間 [start, end) を覆うグループの連続区間 [start, end) を返す。
+
+        グループもモーラ数の昇順に並ぶ (行がそう並んでおり、グループは行の
+        連続区間なので)、行区間をグループ ID に写すだけで済む。
+
+        **モーラ範囲の境界はグループを割らない。** グループは同じモーラ数の
+        行だけで構成されるので (キーが (モーラ数, 音素列))、モーラ数で切った
+        行区間はグループ境界にちょうど揃う。
+        """
+        groups = self._data["group_ids"]
+        if start >= end:
+            first = int(groups[start]) if start < groups.size else self._group_count
+            return first, first
+        return int(groups[start]), int(groups[end - 1]) + 1
 
     def mora_range(self, min_mora: int | None, max_mora: int | None) -> tuple[int, int]:
         """モーラ数が範囲に入る行の連続区間 [start, end) を返す。
@@ -416,7 +541,13 @@ class PhoneticStore:
     # --- ベクトル ---------------------------------------------------------
 
     def vectors(self, space: str) -> np.ndarray:
-        """指定した空間の (N, D) int8 行列を mmap で返す。
+        """指定した空間の (G, D) int8 行列を mmap で返す。
+
+        **行は語ではなく音素列グループ** (v5)。埋め込みは音素列だけの関数なので
+        (`embedding.embed` は `Pronunciation` しか見ない)、同音異表記は
+        まったく同じベクトルになる。行ごとに持つと full の 202 万行のうち
+        146 万行ぶんしか情報が無いのに全部を保存し、内積も重複して計算する
+        ことになる。実測で全 5 空間・全 202 万行がグループ先頭と完全一致した。
 
         候補生成も rerank もこの行列だけで足りる。mmap なので匿名メモリに
         載らず、ページキャッシュとして回収できる — ANN のグラフを持っていた
@@ -457,20 +588,23 @@ class PhoneticStore:
         scaled = np.round(np.asarray(vector, dtype=np.float32) / self.scale(space))
         return np.clip(scaled, -127, 127).astype(np.int8)
 
-    def top_rows(self, space: str, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """索引全体と内積を取り、上位 `k` 行とコサイン類似度を返す。
+    def top_groups(self, space: str, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+        """索引全体と内積を取り、上位 `k` グループとコサイン類似度を返す。
+
+        **返るのは行ではなくグループ** (v5)。同音異表記はベクトルが同一なので、
+        行単位で Top-K を取ると上位が同じ音の異表記で埋まる。呼び出し側が
+        `group_starts` で行へ展開する (`search._top_candidates`)。
 
         内積と Top-K の両方を Rust が担う。NumPy に int8 の GEMV 経路が無い
-        ためで、`astype(np.int32)` を挟むと 202 万行ぶんの中間配列
-        (582MB) を実体化してしまう。
+        ためで、`astype(np.int32)` を挟むと索引ぶんの中間配列を実体化してしまう。
         """
         vectors = self.vectors(space)
         quantized = self.quantize_query(space, query)
         scale = self.scale(space)
         return _rust.top_candidates(vectors, quantized, k, scale * scale)
 
-    def dot_rows(self, space: str, query: np.ndarray, start: int, end: int) -> np.ndarray:
-        """連続区間 [start, end) の全行とのコサイン類似度。
+    def dot_groups(self, space: str, query: np.ndarray, start: int, end: int) -> np.ndarray:
+        """連続区間 [start, end) の全**グループ**とのコサイン類似度。
 
         母集団をスライスで渡すので、mmap 上の連続読みになる。
         """
@@ -479,18 +613,18 @@ class PhoneticStore:
         scale = self.scale(space)
         return _rust.dot_all(vectors[start:end], quantized, scale * scale)
 
-    def dot_selected(self, space: str, query: np.ndarray, rows: np.ndarray) -> np.ndarray:
-        """指定した行だけとのコサイン類似度。
+    def dot_selected_groups(self, space: str, query: np.ndarray, groups: np.ndarray) -> np.ndarray:
+        """指定したグループだけとのコサイン類似度。
 
         候補が母集団のごく一部のときだけ使う経路 (`search._space_scores` が
-        件数で切り替える)。`vectors[rows]` が飛び飛びの行を実体化するので、
-        行数が増えるとコストが急伸する — 多いときは連続読みの `dot_rows` が
+        件数で切り替える)。`vectors[groups]` が飛び飛びの行を実体化するので、
+        件数が増えるとコストが急伸する — 多いときは連続読みの `dot_groups` が
         速い。
         """
         vectors = self.vectors(space)
         quantized = self.quantize_query(space, query)
         scale = self.scale(space)
-        return _rust.dot_all(np.ascontiguousarray(vectors[rows]), quantized, scale * scale)
+        return _rust.dot_all(np.ascontiguousarray(vectors[groups]), quantized, scale * scale)
 
 
 def write_store(
@@ -523,24 +657,44 @@ def write_store(
     order = _locality_order(entries)
     entries = [entries[i] for i in order]
     permutation = np.asarray(order, dtype=np.int64)
-    vectors = {name: matrix[permutation] for name, matrix in vectors.items()}
 
     report("語彙メタデータを書き出し中")
-    np.savez(path / _ENTRIES_FILE, **_encode_entries(entries))
+    encoded = _encode_entries(entries)
+    # npz にまとめず 1 配列 1 ファイルで置く。読み手が mmap で開けるように
+    # するため (`PhoneticStore.__init__` の項を参照)。
+    for name in _ENTRY_ARRAYS:
+        np.save(path / f"{name}.npy", encoded[name])
+
+    # ベクトルはグループごとに 1 行だけ書く (v5)。埋め込みは音素列だけの関数
+    # なので同音異表記は同一のベクトルになり、行ごとに持つと full の 202 万行
+    # のうち 146 万行ぶんしか情報が無いのに全部を保存することになる。
+    # グループの先頭行を選べば代表になる (行はグループが隣接するよう並ぶ)。
+    group_ids = encoded["group_ids"]
+    group_count = int(group_ids[-1]) + 1 if group_ids.size else 0
+    leaders = np.empty(group_count, dtype=np.int64)
+    leaders[group_ids[::-1]] = np.arange(group_ids.size - 1, -1, -1, dtype=np.int64)
+    # 並べ替えと代表の選抜を 1 回の fancy indexing にまとめる。
+    representative = permutation[leaders]
 
     # ベクトルは int8 に量子化して保存する。float32 のままだと full で 1.47GB
     # あり、そのままイメージに焼くとコンテナが膨らむ (`_quantize` の項を参照)。
+    # 保存するのは検索が読む空間だけ (`INDEXED_SPACES`)。`consonant` と
+    # `rhythm` は `compare` がその場で埋め込むので索引に要らない。
     scales: dict[str, float] = {}
-    for space, matrix in vectors.items():
+    dims: dict[str, int] = {}
+    for space in INDEXED_SPACES:
+        if space not in vectors:
+            raise ValueError(f"索引に必要な空間が渡されていません: {space}")
         report(f"ベクトルを量子化して書き出し中: {space}")
-        quantized, scale = _quantize(matrix)
+        quantized, scale = _quantize(vectors[space][representative])
         scales[space] = scale
+        dims[space] = int(quantized.shape[1])
         np.save(path / f"vectors-{space}.npy", quantized)
 
     meta = StoreMeta(
         version=FORMAT_VERSION,
         count=len(entries),
-        dims={name: int(vectors[name].shape[1]) for name in vectors},
+        dims=dims,
         dict_type=dict_type,
         scales=scales,
     )
@@ -551,6 +705,7 @@ def write_store(
 __all__ = [
     "CANDIDATE_SPACES",
     "FORMAT_VERSION",
+    "INDEXED_SPACES",
     "SPACES",
     "PhoneticStore",
     "StoreMeta",

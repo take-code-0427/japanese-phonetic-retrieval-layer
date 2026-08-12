@@ -723,7 +723,18 @@ class PhraseComposer:
 
         rows = self._pool.get(width)
         if rows is not None and rows.size:
-            distances = edit_distance_csr(query_ids, rows, blob, bounds, distance_ids)
+            # 音素 CSR はグループで引く (`store.phoneme_csr`)。同音異表記は
+            # 同じ音素列なので、代表 1 件の距離を残りへ配れば済む。行は昇順に
+            # 並ぶので (`_pool` が連続区間から作る)、グループ列も昇順になり
+            # 代表判定は隣接比較だけで済む (`np.unique` のソートが要らない)。
+            groups = self.store.group_ids[rows].astype(np.int64)
+            first = np.empty(groups.size, dtype=bool)
+            first[0] = True
+            np.not_equal(np.diff(groups), 0, out=first[1:])
+            leaders = groups[first]
+            distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)
+            if leaders.size != groups.size:
+                distances = distances[np.cumsum(first) - 1]
             lengths = self.store.phoneme_lengths(rows)
             similarity = _chunk_similarity(distances, query_ids.size, lengths)
 

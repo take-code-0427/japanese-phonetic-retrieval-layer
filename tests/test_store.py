@@ -103,6 +103,68 @@ def test_group_ids_fold_identical_phonemes(tmp_path: Path) -> None:
     assert (np.diff(store.group_ids) >= 0).all()
 
 
+def test_vectors_are_stored_once_per_phoneme_group(tmp_path: Path) -> None:
+    """ベクトルは語ではなく音素列グループごとに 1 行だけ持つ (v5)。
+
+    埋め込みは音素列だけの関数なので同音異表記は同じベクトルになる。
+    行ごとに持つと full の 202 万行のうち 146 万ぶんしか情報が無いのに
+    全部を保存し、内積も重複して計算することになる。
+    """
+    entries = [
+        make_entry("科学", "カガク", cost=2000),
+        make_entry("化学", "カガク", cost=3000),
+        make_entry("下顎", "カガク", cost=8000),
+        make_entry("価格", "カカク", cost=2000),
+    ]
+    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    store = PhoneticStore(tmp_path)
+
+    # カガク 3 件 + カカク 1 件 -> 語は 4、グループは 2。
+    assert len(store) == 4
+    assert store.group_count == 2
+    for space in store.meta.dims:
+        assert store.vectors(space).shape[0] == store.group_count
+
+
+def test_group_starts_expand_back_to_rows(tmp_path: Path) -> None:
+    """`group_starts` の区間が、そのグループに属する行と一致する。
+
+    候補生成はグループで Top-K を取ってからここで行へ展開するので
+    (`search._expand_groups`)、この対応が崩れると別の語のスコアを配る。
+    """
+    entries = [
+        make_entry("科学", "カガク", cost=2000),
+        make_entry("化学", "カガク", cost=3000),
+        make_entry("価格", "カカク", cost=2000),
+        make_entry("空", "ソラ", cost=2000),
+    ]
+    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    store = PhoneticStore(tmp_path)
+
+    starts = store.group_starts
+    assert starts.size == store.group_count + 1
+    assert int(starts[-1]) == len(store)
+    for group in range(store.group_count):
+        rows = range(int(starts[group]), int(starts[group + 1]))
+        assert rows, "空のグループは存在しない"
+        # 区間の行がすべてそのグループに属し、音素列が揃う。
+        assert {int(store.group_ids[row]) for row in rows} == {group}
+        assert len({store.phonemes(row) for row in rows}) == 1
+
+
+def test_phonemes_survive_the_group_indirection(roundtrip: PhoneticStore) -> None:
+    """行から引いた音素列が、その語の読みを解析した結果と一致する。
+
+    音素列はグループごとに 1 本しか持たないので (v5)、行 -> グループの
+    写像を間違えると**別の語の音素列を黙って返す**。復号経路を実際に通す。
+    """
+    for row in range(len(roundtrip)):
+        expected = analyze_reading(roundtrip.reading(row)).phonemes
+        assert roundtrip.phonemes(row) == expected
+        # ID 経路 (rerank が使う) も同じ音素列を指す。
+        assert roundtrip.phoneme_id_array(row).size == len(expected)
+
+
 def test_phoneme_id_matrix_matches_row_by_row(roundtrip: PhoneticStore) -> None:
     """まとめて引いた行列は、1 行ずつ引いたものとパディング以外で一致する。
 
@@ -142,7 +204,8 @@ def test_absent_category_returns_negative(roundtrip: PhoneticStore) -> None:
 def test_vectors_are_memory_mapped(roundtrip: PhoneticStore) -> None:
     vectors = roundtrip.vectors("phonetic")
     assert isinstance(vectors, np.memmap)
-    assert vectors.shape == (4, roundtrip.meta.dims["phonetic"])
+    # 行は語ではなく音素列グループ (v5)。
+    assert vectors.shape == (roundtrip.group_count, roundtrip.meta.dims["phonetic"])
 
 
 def test_no_ann_graph_is_written(roundtrip: PhoneticStore) -> None:
@@ -158,12 +221,13 @@ def test_no_ann_graph_is_written(roundtrip: PhoneticStore) -> None:
 def test_inner_product_ranks_self_first(roundtrip: PhoneticStore) -> None:
     """自身のベクトルで引けば自身が最も近い。候補生成の土台の確認。
 
-    量子化スケールを戻す経路 (`top_rows`) を通す。行列は int8 なので、
-    生の内積を取ると尺度が復元されない。
+    量子化スケールを戻す経路 (`top_groups`) を通す。行列は int8 なので、
+    生の内積を取ると尺度が復元されない。返るのは行ではなくグループ (v5)。
     """
     original = roundtrip.dequantized("phonetic")
-    rows, scores = roundtrip.top_rows("phonetic", original[1], 4)
-    assert int(rows[0]) == 1
+    group = int(roundtrip.group_ids[1])
+    groups, scores = roundtrip.top_groups("phonetic", original[group], roundtrip.group_count)
+    assert int(groups[0]) == group
     # 正規化済みベクトルの自己内積なのでコサイン類似度は 1.0。
     assert scores[0] == pytest.approx(1.0, abs=0.01)
 
@@ -177,22 +241,23 @@ def test_vectors_are_quantized_to_int8(roundtrip: PhoneticStore) -> None:
 def test_quantized_dot_matches_float32(roundtrip: PhoneticStore) -> None:
     """量子化した内積が元の float32 の内積と一致する (誤差の範囲で)。
 
-    候補生成 (`top_rows`)・全走査 (`dot_rows`)・選抜 (`dot_selected`) の
-    3 経路が同じ尺度を返すことを確かめる。ここがずれると rerank の
-    スコア合成が静かに狂う。
+    候補生成 (`top_groups`)・全走査 (`dot_groups`)・選抜
+    (`dot_selected_groups`) の 3 経路が同じ尺度を返すことを確かめる。
+    ここがずれると rerank のスコア合成が静かに狂う。
     """
     original = roundtrip.dequantized("phonetic")
-    query = original[2]
+    query = original[0]
     reference = original @ query
 
-    scanned = roundtrip.dot_rows("phonetic", query, 0, len(roundtrip))
+    scanned = roundtrip.dot_groups("phonetic", query, 0, roundtrip.group_count)
     assert scanned == pytest.approx(reference, abs=0.02)
 
-    selected = roundtrip.dot_selected("phonetic", query, np.array([0, 3]))
-    assert selected == pytest.approx(reference[[0, 3]], abs=0.02)
+    picked = np.array([0, roundtrip.group_count - 1])
+    selected = roundtrip.dot_selected_groups("phonetic", query, picked)
+    assert selected == pytest.approx(reference[picked], abs=0.02)
 
-    rows, scores = roundtrip.top_rows("phonetic", query, len(roundtrip))
-    assert scores == pytest.approx(reference[rows], abs=0.02)
+    groups, scores = roundtrip.top_groups("phonetic", query, roundtrip.group_count)
+    assert scores == pytest.approx(reference[groups], abs=0.02)
 
 
 def test_tied_scores_resolve_to_row_order() -> None:
@@ -229,9 +294,9 @@ def test_bounds_are_int32(roundtrip: PhoneticStore) -> None:
     `edit_distance_csr` が int32 を受け取る前提でもあり、int64 に戻すと
     呼び出しごとに 16MB の変換コピーが走る。
     """
-    with np.load(roundtrip.path / "entries.npz", allow_pickle=False) as archive:
-        for name in ("surface_bounds", "reading_bounds", "phoneme_bounds"):
-            assert archive[name].dtype == np.int32, name
+    for name in ("surface_bounds", "reading_bounds", "phoneme_bounds"):
+        array = np.load(roundtrip.path / f"{name}.npy", allow_pickle=False)
+        assert array.dtype == np.int32, name
 
 
 def test_missing_index_raises(tmp_path: Path) -> None:
@@ -263,8 +328,7 @@ def test_string_encoding_is_compact(tmp_path: Path) -> None:
     ]
     write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
 
-    with np.load(tmp_path / "entries.npz", allow_pickle=False) as archive:
-        surface_bytes = archive["surface_blob"].nbytes
+    surface_bytes = np.load(tmp_path / "surface_blob.npy", allow_pickle=False).nbytes
 
     # 固定幅なら 40 文字 × 4 バイト × 501 行 = 80KB 程度になる。
     fixed_width_estimate = 40 * 4 * len(entries)

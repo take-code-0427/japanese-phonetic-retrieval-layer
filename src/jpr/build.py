@@ -24,7 +24,7 @@ from .index import (
     is_searchable_surface,
 )
 from .phonology import analyze_reading, to_katakana
-from .store import write_store
+from .store import INDEXED_SPACES, write_store
 
 ProgressCallback = Callable[[str], None] | None
 
@@ -88,12 +88,17 @@ def embed_entries(
     *,
     progress: ProgressCallback = None,
 ) -> dict[str, np.ndarray]:
-    """全語彙をすべての空間で埋め込む。"""
+    """全語彙を索引が読む空間で埋め込む。
+
+    作るのは `INDEXED_SPACES` の 3 空間だけ。`consonant` と `rhythm` は索引に
+    保存しないので (`store.INDEXED_SPACES` の項を参照)、ここで行列を確保すると
+    full では 202 万行ぶんの float32 を 2 本 (合計 428MB) 無駄に持つことになる。
+    """
     count = len(entries)
-    matrices = {name: np.zeros((count, dim), dtype=np.float32) for name, dim in SPACES.items()}
+    matrices = {name: np.zeros((count, SPACES[name]), dtype=np.float32) for name in INDEXED_SPACES}
 
     if progress:
-        progress(f"埋め込みを計算中 ({count:,} 語 × {len(SPACES)} 空間)")
+        progress(f"埋め込みを計算中 ({count:,} 語 × {len(INDEXED_SPACES)} 空間)")
 
     for row, entry in enumerate(entries):
         if progress and row and row % 500_000 == 0:
@@ -101,8 +106,9 @@ def embed_entries(
         # 索引には音素列しか持たないが、母音骨格と語尾はモーラ境界を要するため
         # 読みから作り直す。
         pronunciation = analyze_reading(entry.reading)
-        for name, vector in embed(pronunciation).items():
-            matrices[name][row] = vector
+        vectors = embed(pronunciation, INDEXED_SPACES)
+        for name in INDEXED_SPACES:
+            matrices[name][row] = vectors[name]
 
     return matrices
 

@@ -15,10 +15,18 @@ dependencies = [
     "mcp>=2.0.0",
     "numpy>=2.5.1",
     "sudachidict-core>=20260723",
-    "sudachidict-full>=20260723",
     "sudachipy>=0.6.11",
     "uvicorn[standard]>=0.52.1",
 ]
+
+[project.optional-dependencies]
+# full 辞書 (202 万語)。CLI の既定 (`--dict full`) と full 索引の構築に要る。
+#
+# **本体の依存から外してある。** 実行時にどちらを読むかは索引の `dict_type` が
+# 決めるので (`PhoneticSearcher.extractor`)、core の索引で動かすコンテナでは
+# 一度も読まれない。それでいて 344MB あり、索引 (core 148MB) より大きい死荷重に
+# なっていた。`uv sync --extra full` で入る。
+full = ["sudachidict-full>=20260723"]
 
 [project.scripts]
 jpr = "jpr.cli:main"

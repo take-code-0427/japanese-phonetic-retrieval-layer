@@ -51,7 +51,7 @@ from .phrase import (
     PhraseLattice,
 )
 from .reading import ReadingExtractor
-from .store import PhoneticStore
+from .store import INDEXED_SPACES, PhoneticStore
 
 
 @dataclass(frozen=True)
@@ -335,7 +335,9 @@ class PhoneticSearcher:
             return pronunciation, []
 
         active_weights = (weights or self._preset(preset)).normalized()
-        query_vectors = embed(pronunciation)
+        # 索引に載っている空間だけを作る。`consonant` と `rhythm` は索引が
+        # 持たないので (`store.INDEXED_SPACES`)、作っても引く相手がいない。
+        query_vectors = embed(pronunciation, INDEXED_SPACES)
 
         # 候補生成には 2 つの経路がある。モーラ範囲を指定したときだけ
         # ANN を迂回して母集団を全走査する (`_scan_candidates` 参照)。
@@ -495,14 +497,49 @@ class PhoneticSearcher:
         | Rust int8 | 16.8〜28.8ms | 2.6〜10.0ms |
 
         **内積は BLAS と互角** — int8 で読むバイト数が 1/4 になっても、
-        202 万行の走査は DRAM 帯域で決まり、int8 の積和が BLAS の SIMD された
-        f32 積和よりスループットで劣るぶんと相殺される。速度で得しているのは
+        走査は DRAM 帯域で決まり、int8 の積和が BLAS の SIMD された f32 積和
+        よりスループットで劣るぶんと相殺される。速度で得しているのは
         Top-K だけで、**量子化の主目的はサイズ** (索引 1.64GB -> 508MB)。
+
+        **内積を取るのはグループ行列** (v5)。同音異表記はベクトルが同一なので、
+        行単位で Top-K を取ると上位が同じ音の異表記で埋まる。グループで取って
+        から行へ展開すれば、`candidates` 件が「異なる音素列 `candidates` 個」を
+        意味するようになり、rerank に渡る音の多様性が上がる。
         """
-        wanted = min(candidates, len(self.store))
-        return self.store.top_rows(
+        store = self.store
+        wanted = min(candidates, store.group_count)
+        groups, scores = store.top_groups(
             self.candidate_space, query_vectors[self.candidate_space], wanted
         )
+        return self._expand_groups(groups, scores)
+
+    def _expand_groups(
+        self, groups: np.ndarray, scores: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """グループとそのスコアを、所属する行とスコアに展開する。
+
+        グループの行は連続区間なので (`store.group_starts`)、区間長を数えて
+        `repeat` でスコアを配り、区間を連結して行を作る。
+
+        **行は昇順に並べ直す。** 同音異表記の畳み込み (`_group_representatives`)
+        と全走査経路のスライス読み (`_space_scores`) が昇順を前提にしている。
+        グループはスコア降順で返るので、そのまま繋ぐと行が飛び飛びになる。
+        """
+        if groups.size == 0:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=scores.dtype)
+        starts = self.store.group_starts
+        begins = starts[groups]
+        lengths = starts[groups + 1] - begins
+        # 各グループの先頭行を、そのグループの行数だけ繰り返してから
+        # グループ内の連番を足す (連続区間の連結)。
+        repeated = np.repeat(begins, lengths)
+        offsets = np.arange(repeated.size, dtype=np.int64) - np.repeat(
+            np.cumsum(lengths) - lengths, lengths
+        )
+        rows = repeated + offsets
+        row_scores = np.repeat(scores, lengths)
+        order = np.argsort(rows, kind="stable")
+        return rows[order], row_scores[order]
 
     def _scan_candidates(
         self,
@@ -520,16 +557,25 @@ class PhoneticSearcher:
         並べ替える前は「散らばった行の fancy indexing (97 万行で 191ms) を
         避けるために全 202 万行と内積を取ってからマスクする」という迂回を
         していたが (48ms)、連続区間なら範囲の行だけの連続読みで済む (6ms)。
+
+        **内積を取るのは範囲のグループぶんだけ** (v5)。グループもモーラ数順に
+        並ぶので (行がそう並んでおり、グループは行の連続区間なので) 範囲は
+        やはりスライス 1 本で、走査する行数が 28% 減る。スコアは所属する行へ
+        配る — rerank は行ごとの一般性やカテゴリを見るので、候補は行のまま
+        渡す必要がある。
         """
         start, end = bounds
-        rows = np.arange(start, end, dtype=np.int64)
-        if rows.size == 0:
-            return rows, np.zeros(0, dtype=np.float32)
+        if start >= end:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        group_start, group_end = self.store.group_mora_range_of_rows(start, end)
         # 量子化スケールを戻したコサイン類似度が返るので、Top-K 経路と
         # 同じ尺度で揃う。
-        scores = self.store.dot_rows(
-            self.candidate_space, query_vectors[self.candidate_space], start, end
+        group_scores = self.store.dot_groups(
+            self.candidate_space, query_vectors[self.candidate_space], group_start, group_end
         )
+        rows = np.arange(start, end, dtype=np.int64)
+        # 行 -> グループ -> スコア。グループ番号は区間の先頭を 0 に寄せる。
+        scores = group_scores[self.store.group_ids[start:end] - group_start]
         return rows, scores
 
     def _apply_cheap_filters(
@@ -730,39 +776,39 @@ class PhoneticSearcher:
         ユニークな音素列が 58.8% しかなく、距離計算が 4 割減る。
         """
         blob, bounds, distance_ids = self.store.phoneme_csr
-        representatives = self._group_representatives(rows)
+        groups = self.store.group_ids[rows].astype(np.int64)
+        representatives = self._group_representatives(groups)
         if representatives is None:
-            distances = edit_distance_csr(query_ids, rows, blob, bounds, distance_ids)
+            distances = edit_distance_csr(query_ids, groups, blob, bounds, distance_ids)
         else:
             leaders, inverse = representatives
             distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
         return _edit_similarity_array(distances, query_ids.size, self.store.phoneme_lengths(rows))
 
-    def _group_representatives(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-        """候補行を音素列グループの代表行に畳む。
+    def _group_representatives(self, groups: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """候補のグループ列を重複のない代表に畳む。
 
-        戻り値は (代表行, 各候補の代表位置)。代表行の距離を `[inverse]` で
+        戻り値は (代表グループ, 各候補の代表位置)。代表の距離を `[inverse]` で
         gather すれば全候補の距離になる。畳めない・畳む価値がないときは `None`。
 
         索引の行は同じ音素列が隣接するよう並んでいるので (`store.group_ids`
-        は単調非減少)、`rows` が昇順なら代表判定は隣接比較 1 回で済む。
-        昇順でないのは ANN 経路と `_survivors` の標本抽出だが、前者は
-        `_GROUP_DEDUPE_MIN_CANDIDATES` に届かず、後者は抽出後にソートして
-        渡してくる。ここで昇順を確かめるのは、その前提が崩れたときに
-        黙って違う候補の距離を配らないため (確認は候補数に線形で軽い)。
+        は単調非減少)、候補行が昇順ならグループ列も昇順になり、代表判定は
+        隣接比較 1 回で済む。昇順でないのは `_survivors` の標本抽出だけで、
+        そこは抽出後にソートして渡してくる。ここで昇順を確かめるのは、
+        その前提が崩れたときに黙って違う候補の距離を配らないため
+        (確認は候補数に線形で軽い)。
         """
-        if rows.size < max(_GROUP_DEDUPE_MIN_CANDIDATES, 2):
+        if groups.size < max(_GROUP_DEDUPE_MIN_CANDIDATES, 2):
             return None
-        groups = self.store.group_ids[rows]
         deltas = np.diff(groups)
         if np.any(deltas < 0):
             # rows が昇順でない (グループの隣接が保証できない)。
             return None
-        first = np.empty(rows.size, dtype=bool)
+        first = np.empty(groups.size, dtype=bool)
         first[0] = True
         np.not_equal(deltas, 0, out=first[1:])
-        leaders = rows[first]
-        if leaders.size == rows.size:
+        leaders = groups[first]
+        if leaders.size == groups.size:
             return None
         return leaders, np.cumsum(first) - 1
 
@@ -785,13 +831,44 @@ class PhoneticSearcher:
         後の候補は区間の 5 割強を占めるので分岐点のはるか上、ANN 経路
         (`bounds=None`, 候補 2000 件 = 全体の 0.1%) は下。どちらも通るので
         件数で切り替える。
+
+        **引くのはグループのベクトル** (v5)。候補行をグループに写してから
+        内積を取り、結果を行へ配り直す。選抜経路 (`dot_selected_groups`) では
+        重複するグループを畳めるので、実体化する行数がそのぶん減る。
         """
+        store = self.store
         query = query_vectors[space]
-        start, end = bounds if bounds is not None else (0, len(self.store))
-        if rows.size >= self._FULL_SCAN_RATIO * (end - start):
-            positions = rows if start == 0 else rows - start
-            return self.store.dot_rows(space, query, start, end)[positions]
-        return self.store.dot_selected(space, query, rows)
+        groups = store.group_ids[rows]
+        if bounds is not None:
+            group_start, group_end = store.group_mora_range_of_rows(*bounds)
+        else:
+            group_start, group_end = 0, store.group_count
+
+        # 全走査の判定は候補行数で行う。**候補のグループ数を数えるために
+        # `np.unique` を呼んではいけない** — ハッシュ化が候補数に効き、
+        # 97 万候補の 2 空間で 378ms かかって全走査経路が 2 倍に伸びた。
+        # 行数はグループ数の上界なので、判定にはこれで足りる。
+        if rows.size >= self._FULL_SCAN_RATIO * (group_end - group_start):
+            scores = store.dot_groups(space, query, group_start, group_end)
+            return scores[groups - group_start]
+
+        # 選抜経路。候補が少ないときだけ通るので、ここで重複を畳む。
+        #
+        # 候補行は昇順で渡る (`_expand_groups` は並べ替えて返し、`_scan_candidates`
+        # は `arange` を返す)。昇順ならグループ列も昇順なので、隣接比較だけで
+        # 代表が取れる。**その前提が崩れたら畳まない** — 黙って別のグループの
+        # スコアを配るより、重複ぶん引き直すほうがいい。
+        deltas = np.diff(groups)
+        if np.any(deltas < 0):
+            return store.dot_selected_groups(space, query, groups)
+        first = np.empty(groups.size, dtype=bool)
+        first[0] = True
+        np.not_equal(deltas, 0, out=first[1:])
+        leaders = groups[first]
+        selected = store.dot_selected_groups(space, query, leaders)
+        if leaders.size == groups.size:
+            return selected
+        return selected[np.cumsum(first) - 1]
 
     def _materialize(
         self,

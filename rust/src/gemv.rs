@@ -189,10 +189,26 @@ pub fn dot_all<'py>(
         )));
     }
 
+    // スケール復元は積和と同じ並列区間で済ませる。`Vec<i32>` を作ってから
+    // `map` で `Vec<f32>` に移すと、母集団ぶんの配列を 2 本確保したうえで
+    // 単一スレッドの変換を挟むことになる (97 万行で 3.9MB x2)。
     let scores = py.detach(|| {
-        let mut raw = vec![0i32; rows];
-        gemv_i8_into(matrix_slice, query_slice, dim, &mut raw);
-        raw.into_iter().map(|value| value as f32 * scale).collect::<Vec<f32>>()
+        let mut out = vec![0f32; rows];
+        out.par_chunks_mut(GEMV_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_index, chunk)| {
+                let base = chunk_index * GEMV_CHUNK;
+                for (local, slot) in chunk.iter_mut().enumerate() {
+                    let row = base + local;
+                    let values = &matrix_slice[row * dim..row * dim + dim];
+                    let mut accumulator: i32 = 0;
+                    for k in 0..dim {
+                        accumulator += (values[k] as i32) * (query_slice[k] as i32);
+                    }
+                    *slot = accumulator as f32 * scale;
+                }
+            });
+        out
     });
 
     Ok(PyArray1::from_vec(py, scores))

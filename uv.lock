@@ -357,9 +357,13 @@ dependencies = [
     { name = "mcp" },
     { name = "numpy" },
     { name = "sudachidict-core" },
-    { name = "sudachidict-full" },
     { name = "sudachipy" },
     { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+full = [
+    { name = "sudachidict-full" },
 ]
 
 [package.dev-dependencies]
@@ -377,10 +381,11 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "numpy", specifier = ">=2.5.1" },
     { name = "sudachidict-core", specifier = ">=20260723" },
-    { name = "sudachidict-full", specifier = ">=20260723" },
+    { name = "sudachidict-full", marker = "extra == 'full'", specifier = ">=20260723" },
     { name = "sudachipy", specifier = ">=0.6.11" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.1" },
 ]
+provides-extras = ["full"]
 
 [package.metadata.requires-dev]
 dev = [

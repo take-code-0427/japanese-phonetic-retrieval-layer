@@ -6,9 +6,21 @@
 # (「乳首」-> 手首 / 「ワタシノナマエハ」-> 私の名前は)。
 # ANN のグラフを作らなくなったので構築は 496s -> 163s に縮んでいる
 # (`store.py` の CANDIDATE_SPACES と `search.py` の _top_candidates を参照)。
-# さらにベクトルを int8 に量子化したので (`store.py` の `_quantize`)、
-# 索引は core で 855MB -> 274MB、full で 1.64GB -> 508MB になった。
-# イメージは 1.75GB -> 329MB。
+#
+# 索引サイズの推移 (core / full):
+#   855MB / 1.64GB  ->  int8 量子化 (`store.py` の `_quantize`)
+#   274MB / 508MB   ->  音素列グループ化 + 索引 3 空間化 (v5)
+#   148MB / 322MB
+#
+# **`sudachidict-full` を入れない。** 実行時にどちらの辞書を読むかは索引の
+# `dict_type` が決めるので (`PhoneticSearcher.extractor`)、core の索引で動かす
+# このイメージでは full が一度も読まれない。それでいて 344MB あり、索引より
+# 大きい死荷重になっていた。任意の依存にしてあるので `--extra full` を
+# 付けなければ入らない (`pyproject.toml`)。
+#
+# イメージは 641MB (実測)。内訳は venv 363MB (うち sudachidict-core 208MB) +
+# 索引 142MB + Python の基底。**次に大きいのは Sudachi の core 辞書**で、
+# 読みの取得に要るので外せない。
 
 FROM python:3.12-slim AS builder
 

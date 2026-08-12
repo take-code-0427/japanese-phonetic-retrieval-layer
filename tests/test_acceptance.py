@@ -9,12 +9,15 @@ from __future__ import annotations
 import itertools
 import time
 
+import numpy as np
 import pytest
 
 from jpr import search as search_module
+from jpr.embedding import embed
 from jpr.index import Category
+from jpr.phonology import analyze_reading
 from jpr.search import PhoneticSearcher
-from jpr.store import PhoneticStore
+from jpr.store import INDEXED_SPACES, PhoneticStore
 
 # なぞなぞ「乳首みたいなお菓子ってなんだ？」の答えを引くための意味的制約。
 # LLM が「お菓子である」という知識を与える想定。
@@ -286,6 +289,44 @@ def _fingerprint(searcher: PhoneticSearcher, query: str, **kwargs: object) -> li
         )
         for r in results
     ]
+
+
+def test_group_intervals_cover_every_row(real_store: PhoneticStore) -> None:
+    """`group_starts` の区間を展開すると `group_ids` に一致する。
+
+    候補生成はグループで Top-K を取ってから行へ展開するので
+    (`search._expand_groups`)、この対応が 1 行でもずれると**別の語のスコアを
+    配る**。実索引の全行で確かめる (full 202 万行で 30ms 程度)。
+    """
+    starts = real_store.group_starts
+    assert starts.size == real_store.group_count + 1
+    assert int(starts[-1]) == len(real_store)
+    # 空のグループがあると展開の長さが合わなくなる。
+    assert (np.diff(starts) > 0).all()
+
+    expanded = np.repeat(np.arange(real_store.group_count), np.diff(starts))
+    assert np.array_equal(expanded, np.asarray(real_store.group_ids))
+
+
+def test_stored_vectors_match_the_reading(real_store: PhoneticStore) -> None:
+    """索引のベクトルが、その行の読みから作り直した埋め込みと一致する。
+
+    ベクトルは音素列グループごとに 1 本しか持たないので (v5)、行 -> グループの
+    写像を間違えると**別の語のベクトルを黙って返す**。値そのものを突き合わせて
+    確かめる — 行数や形だけの検証では写像のずれが通ってしまう。
+
+    量子化してあるので許容誤差を置く (int8 の再構成誤差は 0.0026)。
+    """
+    generator = np.random.default_rng(0)
+    rows = generator.choice(len(real_store), 200, replace=False)
+
+    for row in rows:
+        row = int(row)
+        expected = embed(analyze_reading(real_store.reading(row)), INDEXED_SPACES)
+        group = int(real_store.group_ids[row])
+        for space in INDEXED_SPACES:
+            stored = real_store.vectors(space)[group].astype(np.float32) * real_store.scale(space)
+            assert stored == pytest.approx(expected[space], abs=0.02), (space, row)
 
 
 @pytest.mark.parametrize("query", _EQUIVALENCE_QUERIES)

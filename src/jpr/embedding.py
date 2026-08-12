@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Final
 
 import numpy as np
@@ -302,33 +303,44 @@ SPACES: Final[dict[str, int]] = {
 }
 
 
-def embed(pronunciation: Pronunciation) -> dict[str, np.ndarray]:
-    """1 語のすべての空間のベクトルを作る。
+def embed(
+    pronunciation: Pronunciation, spaces: Sequence[str] | None = None
+) -> dict[str, np.ndarray]:
+    """1 語のベクトルを作る。
+
+    `spaces` を渡すとその空間だけを作る。索引構築は 3 空間しか保存しないので
+    (`store.INDEXED_SPACES`)、200 万語ぶんの `consonant` と `rhythm` を捨てる
+    ために計算する理由がない。既定 (`None`) は全 5 空間で、`compare` が使う。
 
     phonetic と consonant は同じ素性行列から作れるので、行列引きを 1 回に
     まとめる。索引構築では 200 万語を処理するのでこの差が効く。
     """
-    phonemes = pronunciation.phonemes
-    rows = [PHONEME_INDEX[p] for p in phonemes if p in PHONEME_INDEX]
-    features = PHONEME_FEATURES[rows] if rows else np.zeros((0, PHONEME_DIM), dtype=np.float32)
+    wanted = SPACES.keys() if spaces is None else spaces
+    out: dict[str, np.ndarray] = {}
 
-    phonetic = _normalize(_bin_pool(features).reshape(-1))
+    if "phonetic" in wanted:
+        phonemes = pronunciation.phonemes
+        rows = [PHONEME_INDEX[p] for p in phonemes if p in PHONEME_INDEX]
+        features = PHONEME_FEATURES[rows] if rows else np.zeros((0, PHONEME_DIM), dtype=np.float32)
+        out["phonetic"] = _normalize(_bin_pool(features).reshape(-1))
 
-    # 子音空間は素性行列の子音ブロックだけを、子音の行に限って畳み込む。
-    consonant_rows = [PHONEME_INDEX[p] for p in phonemes if p in CONSONANTS]
-    if consonant_rows:
-        consonant_features = PHONEME_FEATURES[consonant_rows][:, :_CONSONANT_DIM]
-        consonant = _normalize(_bin_pool(consonant_features).reshape(-1))
-    else:
-        consonant = np.zeros(CONSONANT_DIM, dtype=np.float32)
+    if "consonant" in wanted:
+        # 子音空間は素性行列の子音ブロックだけを、子音の行に限って畳み込む。
+        consonant_rows = [PHONEME_INDEX[p] for p in pronunciation.phonemes if p in CONSONANTS]
+        if consonant_rows:
+            consonant_features = PHONEME_FEATURES[consonant_rows][:, :_CONSONANT_DIM]
+            out["consonant"] = _normalize(_bin_pool(consonant_features).reshape(-1))
+        else:
+            out["consonant"] = np.zeros(CONSONANT_DIM, dtype=np.float32)
 
-    return {
-        "phonetic": phonetic,
-        "consonant": consonant,
-        "vowel": vowel_vector(pronunciation),
-        "coda": coda_vector(pronunciation),
-        "rhythm": rhythm_vector(pronunciation),
-    }
+    if "vowel" in wanted:
+        out["vowel"] = vowel_vector(pronunciation)
+    if "coda" in wanted:
+        out["coda"] = coda_vector(pronunciation)
+    if "rhythm" in wanted:
+        out["rhythm"] = rhythm_vector(pronunciation)
+
+    return out
 
 
 def embed_many(pronunciations: list[Pronunciation]) -> dict[str, np.ndarray]:

@@ -324,7 +324,7 @@ class PhoneticSearcher:
     def extractor(self) -> ReadingExtractor:
         """読み取得器。Sudachi のロードが重いので初回参照まで遅延させる。"""
         if self._extractor is None:
-            self._extractor = ReadingExtractor(dict_type=self.store.meta.dict_type)
+            self._extractor = ReadingExtractor()
         return self._extractor
 
     def pronounce(self, text: str) -> Pronunciation:

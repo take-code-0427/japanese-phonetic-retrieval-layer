@@ -37,20 +37,13 @@ from .distance import PAD_ID, PHONEME_TO_ID, UNKNOWN_PHONEME_ID
 from .embedding import SPACES
 from .index import Category, IndexEntry
 
-#: 索引形式のバージョン。エントリの持ち方や行の並びを変えたら上げる。
+#: 索引形式のバージョン。`PhoneticStore.__init__` が不一致を検出してエラーにする。
 #:
-#: ANN のグラフを作らなくなったときは**上げていない**。読み込み側は
-#: `hnsw-*.bin` を参照しないので、グラフが残っている古い索引もそのまま動く
-#: (無駄なファイルが残るだけ)。バージョンを上げると再構築を強いることになり、
-#: full なら 5.5 分かかる — 動くものを動かなくする理由がない。
-#:
-#: v4 でベクトルを int8 に量子化した (`_quantize`)。float32 の索引は読めない
-#: ので再構築が要る。
-#:
-#: v5 でベクトルと音素列を**音素列グループ単位**に落とし (`_encode_entries`)、
-#: 語彙メタデータを npz から個別の .npy に分けた (mmap で開くため)。
-#: どちらもファイルの並びが変わるので v4 の索引は読めない。
-FORMAT_VERSION = 5
+#: **上げる基準は「古い索引を読ませると黙って間違うか」。** 配列の並びやエントリの
+#: 持ち方が変わったときは上げる (読めば壊れる)。読み方だけを変えたときは上げない —
+#: 再構築は 10 分かかるので、動くものを動かなくする理由がない。索引の内容そのものが
+#: 変わったとき (語彙の範囲など) も上げる。形式は読めても結果が説明できなくなる。
+FORMAT_VERSION = 7
 
 #: 候補生成に使う空間。
 #:
@@ -110,7 +103,6 @@ class StoreMeta:
     version: int
     count: int
     dims: dict[str, int]
-    dict_type: str
     #: 空間ごとの量子化スケール。int8 の値にこれを掛けると元の float32 に戻る。
     scales: dict[str, float]
 
@@ -120,7 +112,6 @@ class StoreMeta:
                 "version": self.version,
                 "count": self.count,
                 "dims": self.dims,
-                "dict_type": self.dict_type,
                 "scales": self.scales,
             },
             ensure_ascii=False,
@@ -134,7 +125,6 @@ class StoreMeta:
             version=payload["version"],
             count=payload["count"],
             dims=payload["dims"],
-            dict_type=payload.get("dict_type", "full"),
             scales=payload["scales"],
         )
 
@@ -710,7 +700,6 @@ def write_store(
     entries: Sequence[IndexEntry],
     vectors: dict[str, np.ndarray],
     *,
-    dict_type: str = "full",
     progress: object = None,
 ) -> None:
     """索引をディスクに書く。
@@ -773,7 +762,6 @@ def write_store(
         version=FORMAT_VERSION,
         count=len(entries),
         dims=dims,
-        dict_type=dict_type,
         scales=scales,
     )
     (path / _META_FILE).write_text(meta.to_json(), encoding="utf-8")

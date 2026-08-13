@@ -432,7 +432,6 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         return {
             "path": str(store.path),
             "format_version": store.meta.version,
-            "dict_type": store.meta.dict_type,
             "count": len(store),
             "spaces": [
                 {

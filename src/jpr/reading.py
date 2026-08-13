@@ -23,10 +23,10 @@ class ReadingExtractor:
     Sudachi の辞書ロードは重いので、インスタンスを使い回すこと。
     """
 
-    def __init__(self, dict_type: str = "full", split_mode: SplitMode = SplitMode.C) -> None:
-        self._dict_type = dict_type
+    def __init__(self, split_mode: SplitMode = SplitMode.C) -> None:
         self._split_mode = split_mode
-        self._dictionary = Dictionary(dict=dict_type)
+        # 辞書は full 一本 (`pyproject.toml`)。SudachiPy の既定は core なので明示する。
+        self._dictionary = Dictionary(dict="full")
         self._tokenizer = self._dictionary.create()
         # Sudachi の Tokenizer は解析用バッファを内部に持つので複数スレッドから
         # 同時に呼べない (Rust 側が `RuntimeError: Already borrowed` を投げる)。

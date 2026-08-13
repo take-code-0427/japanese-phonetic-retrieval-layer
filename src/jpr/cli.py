@@ -245,7 +245,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     from .reading import ReadingExtractor
     from .search import compare_pronunciations
 
-    extractor = ReadingExtractor(dict_type=args.dict)
+    extractor = ReadingExtractor()
     comparison = compare_pronunciations(
         args.a,
         args.b,
@@ -291,7 +291,7 @@ def cmd_pronounce(args: argparse.Namespace) -> int:
     """読みと音素列だけを表示する。索引を必要としない。"""
     from .reading import ReadingExtractor
 
-    extractor = ReadingExtractor(dict_type=args.dict)
+    extractor = ReadingExtractor()
     for text in args.text:
         pronunciation = analyze_reading(extractor.reading_of(text))
         moras = " ".join(m.kana or m.special for m in pronunciation.moras)
@@ -322,7 +322,6 @@ def cmd_build_index(args: argparse.Namespace) -> int:
 
     count = build_index(
         path,
-        dict_type=args.dict,
         min_mora=args.min_mora,
         max_mora=args.max_mora,
         progress=report,
@@ -340,7 +339,6 @@ def cmd_info(args: argparse.Namespace) -> int:
 
     print(f"索引: {store.path}")
     print(f"形式バージョン: {store.meta.version}")
-    print(f"辞書: SudachiDict {store.meta.dict_type}")
     print(f"語数: {len(store):,}")
     print("\n埋め込み空間:")
     for name, dim in store.meta.dims.items():
@@ -466,17 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
     compare = subparsers.add_parser("compare", help="2 語の音韻類似度を計算する")
     compare.add_argument("a")
     compare.add_argument("b")
-    compare.add_argument("--dict", default="full", help="SudachiDict の種類 (既定: %(default)s)")
     compare.add_argument("--json", action="store_true", help="JSON で出力する")
     compare.set_defaults(func=cmd_compare)
 
     pronounce = subparsers.add_parser("pronounce", help="読みと音素列を表示する")
     pronounce.add_argument("text", nargs="+")
-    pronounce.add_argument("--dict", default="full", help="SudachiDict の種類 (既定: %(default)s)")
     pronounce.set_defaults(func=cmd_pronounce)
 
     build = subparsers.add_parser("build-index", help="索引を構築する")
-    build.add_argument("--dict", default="full", help="SudachiDict の種類 (既定: %(default)s)")
     build.add_argument("--min-mora", type=int, default=2, help="索引する最小モーラ数")
     build.add_argument("--max-mora", type=int, default=12, help="索引する最大モーラ数")
     build.add_argument("--force", action="store_true", help="既存の索引を上書きする")

@@ -12,7 +12,7 @@ from jpr.build import embed_entries
 from jpr.distance import PAD_ID
 from jpr.index import Category, IndexEntry
 from jpr.phonology import analyze_reading
-from jpr.store import FORMAT_VERSION, PhoneticStore, write_store
+from jpr.store import FORMAT_VERSION, INDEXED_SPACES, PhoneticStore, write_store
 
 
 def make_entry(surface: str, reading: str, **kwargs) -> IndexEntry:
@@ -37,14 +37,18 @@ def roundtrip(tmp_path: Path) -> PhoneticStore:
         make_entry("東京特許許可局", "トウキョウトッキョキョカキョク", cost=9000),
         make_entry("ラーメン", "ラーメン", cost=1400),
     ]
-    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    write_store(tmp_path, entries, embed_entries(entries))
     return PhoneticStore(tmp_path)
 
 
 def test_metadata_roundtrip(roundtrip: PhoneticStore) -> None:
     assert roundtrip.meta.version == FORMAT_VERSION
     assert roundtrip.meta.count == 4
-    assert roundtrip.meta.dict_type == "core"
+    # 索引に載る空間ぶんの次元と量子化スケールが揃っている。スケールを取り違えると
+    # 内積が黙って別の尺度になるので、往復でここを見る。
+    assert set(roundtrip.meta.dims) == set(INDEXED_SPACES)
+    assert set(roundtrip.meta.scales) == set(INDEXED_SPACES)
+    assert all(scale > 0.0 for scale in roundtrip.meta.scales.values())
 
 
 def test_entries_roundtrip_exactly(roundtrip: PhoneticStore) -> None:
@@ -90,7 +94,7 @@ def test_group_ids_fold_identical_phonemes(tmp_path: Path) -> None:
         make_entry("下顎", "カガク", cost=8000),
         make_entry("化学", "カガク", cost=3000),
     ]
-    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    write_store(tmp_path, entries, embed_entries(entries))
     store = PhoneticStore(tmp_path)
 
     groups: dict[tuple[str, ...], set[int]] = {}
@@ -116,7 +120,7 @@ def test_vectors_are_stored_once_per_phoneme_group(tmp_path: Path) -> None:
         make_entry("下顎", "カガク", cost=8000),
         make_entry("価格", "カカク", cost=2000),
     ]
-    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    write_store(tmp_path, entries, embed_entries(entries))
     store = PhoneticStore(tmp_path)
 
     # カガク 3 件 + カカク 1 件 -> 語は 4、グループは 2。
@@ -138,7 +142,7 @@ def test_group_starts_expand_back_to_rows(tmp_path: Path) -> None:
         make_entry("価格", "カカク", cost=2000),
         make_entry("空", "ソラ", cost=2000),
     ]
-    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    write_store(tmp_path, entries, embed_entries(entries))
     store = PhoneticStore(tmp_path)
 
     starts = store.group_starts
@@ -326,7 +330,7 @@ def test_string_encoding_is_compact(tmp_path: Path) -> None:
     entries = [make_entry("あ" * 40, "ア" * 40)] + [
         make_entry(f"語{i}", "アイ") for i in range(500)
     ]
-    write_store(tmp_path, entries, embed_entries(entries), dict_type="core")
+    write_store(tmp_path, entries, embed_entries(entries))
 
     surface_bytes = np.load(tmp_path / "surface_blob.npy", allow_pickle=False).nbytes
 

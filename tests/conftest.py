@@ -61,7 +61,7 @@ def sample_store(tmp_path_factory: pytest.TempPathFactory) -> PhoneticStore:
 
     path = tmp_path_factory.mktemp("index")
     entries = _sample_entries()
-    write_store(path, entries, embed_entries(entries), dict_type="core")
+    write_store(path, entries, embed_entries(entries))
     return PhoneticStore(path)
 
 

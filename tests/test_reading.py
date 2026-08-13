@@ -12,8 +12,8 @@ from jpr.reading import ReadingExtractor
 
 @pytest.fixture(scope="module")
 def extractor() -> ReadingExtractor:
-    # core 辞書で足りるテストのみを置く。full は索引構築側で使う。
-    return ReadingExtractor(dict_type="core")
+    # 辞書は full 一本 (`pyproject.toml`)。ロードが重いのでモジュール単位で使い回す。
+    return ReadingExtractor()
 
 
 @pytest.mark.parametrize(
@@ -86,7 +86,7 @@ def test_concurrent_access_does_not_break_the_tokenizer() -> None:
     """
     import threading
 
-    local = ReadingExtractor(dict_type="core")
+    local = ReadingExtractor()
     words = ["科学", "乳首", "布団", "手首", "価格", "東京特許許可局"]
     errors: list[BaseException] = []
 

@@ -31,13 +31,12 @@ ProgressCallback = Callable[[str], None] | None
 
 def collect_entries(
     *,
-    dict_type: str = "full",
     min_mora: int = 2,
     max_mora: int = 12,
     progress: ProgressCallback = None,
 ) -> list[IndexEntry]:
     """辞書から索引対象の語彙を集める。"""
-    dictionary = SystemDictionary(find_system_dic(dict_type))
+    dictionary = SystemDictionary(find_system_dic())
     if progress:
         progress(f"辞書を走査中 ({len(dictionary):,} 語)")
 
@@ -116,23 +115,14 @@ def embed_entries(
 def build_index(
     path: Path | str,
     *,
-    dict_type: str = "full",
     min_mora: int = 2,
     max_mora: int = 12,
     progress: ProgressCallback = None,
 ) -> int:
     """索引を構築してディスクに書く。戻り値は索引した語数。"""
-    entries = collect_entries(
-        dict_type=dict_type, min_mora=min_mora, max_mora=max_mora, progress=progress
-    )
+    entries = collect_entries(min_mora=min_mora, max_mora=max_mora, progress=progress)
     vectors = embed_entries(entries, progress=progress)
-    write_store(
-        path,
-        entries,
-        vectors,
-        dict_type=dict_type,
-        progress=progress,
-    )
+    write_store(path, entries, vectors, progress=progress)
     return len(entries)
 
 

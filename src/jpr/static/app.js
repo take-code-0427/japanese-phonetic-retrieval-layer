@@ -1134,7 +1134,6 @@ async function loadInfo() {
     meta.replaceChildren(
       ...[
         ["語数", data.count.toLocaleString("ja-JP")],
-        ["辞書", `SudachiDict ${data.dict_type}`],
         ["形式バージョン", `v${data.format_version}`],
         ["場所", data.path],
       ].map(([label, value]) => {
@@ -1372,8 +1371,7 @@ async function main() {
   // 検索を試みたときに 503 の理由が出るので、ここでは静かに諦める。
   try {
     const info = await getJSON("/api/info");
-    $("corpus-note").textContent =
-      `${info.count.toLocaleString("ja-JP")} 語 / SudachiDict ${info.dict_type}`;
+    $("corpus-note").textContent = `${info.count.toLocaleString("ja-JP")} 語 / SudachiDict full`;
     $("candidates").value = String(info.default_candidates);
     renderCategoryChips(info.categories);
     // 分割合成の既定値もサーバから受け取る。phrase.py の定数を変えたときに

@@ -12,12 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## コマンド
 
 ```bash
-uv sync --extra full                       # Rust 拡張もここでビルドされる
-uv run jpr build-index                     # 索引構築。full 辞書で約 10 分 / 2.6GB
-uv run jpr build-index --dict core --force # 小さい辞書で素早く作り直す
+uv sync                          # Rust 拡張もここでビルドされる
+uv run jpr build-index           # 索引構築。約 10 分
+uv run jpr build-index --force   # 既存の索引を作り直す
 
-uv run jpr similar 乳首                     # 1 語 -> 音が近い語
-uv run jpr phrase わたしのなまえは            # 1 フレーズ -> 語 + 助詞の連なり (空耳)
+uv run jpr similar 乳首           # 1 語 -> 音が近い語
+uv run jpr phrase わたしのなまえは  # 1 フレーズ -> 語 + 助詞の連なり (空耳)
 ```
 
 **Rust ツールチェインが必要。** 編集距離は `rust/` の拡張が計算するので
@@ -25,11 +25,10 @@ uv run jpr phrase わたしのなまえは            # 1 フレーズ -> 語 + 
 maturin 経由でビルドする — `[tool.uv.sources]` で `rust/` をローカル依存にしてある。
 Rust 側を編集したら `uv sync --reinstall-package jpr-distance` で入れ直す。
 
-**`sudachidict-full` は任意の依存** (`[project.optional-dependencies]` の `full`)。
-CLI の既定 (`--dict full`) と full 索引の構築に要るので開発では入れるが、**実行時に
-どちらを読むかは索引の `dict_type` が決める**ので (`PhoneticSearcher.extractor`)、
-core の索引で動かすコンテナでは一度も読まれない。それでいて 344MB あり、索引
-(core 148MB) より大きい死荷重になっていたので本体の依存から外した。
+**辞書は `sudachidict-full` (202 万語 / 344MB) 一本で、選択肢を持たない。**
+包含検索 (`_containment`) の供給源は複合語と固有名詞なので、語彙を削ると質が直接
+落ちる (実測で「電話」に対する「エア電話」が、語彙を半分にすると 1 位から 8 位へ)。
+辞書が 1 つなので索引は `dict_type` を持たない。
 
 索引は `~/.cache/jpr/index` (`default_store_path()`)。`--index DIR` で切り替えられる。
 
@@ -107,7 +106,7 @@ core の索引で動かすコンテナでは一度も読まれない。それで
 #### ANN をやめた理由 (`_top_candidates`)
 
 **hnswlib の `load_index` はグラフをヒープに実体化する** (mmap のオプションが
-無いことを確認済み)。core (111 万語) で匿名メモリ 652MB、内訳はグラフ 346MB と
+無いことを確認済み)。111 万語で匿名メモリ 652MB、内訳はグラフ 346MB と
 **ベクトルの複製 306MB**。後者は `vectors-phonetic.npy` と同じデータの二重持ちで、
 `M` を下げても消えない。実測:
 
@@ -123,13 +122,13 @@ M=4 まで削っても 408MB が下限で、そこでは recall が 0.758 に崩
 `argpartition` 3〜7ms)、recall は 1.0。M=24 の 16ms と同等なので**速度を落とさず
 メモリだけが消えた**。2GB の本番が OOM killed になった主因はこれだった。
 
-かつては「総当たりは ANN より遅い (21〜30ms 対 15ms)」「大きく上げるなら ANN を
-やめる判断のほうが筋が通る」と書いていた。前者は full (202 万語) での測定で、
-core では逆転している。**語数が変われば測り直す。**
+**速度の比較は語数で逆転する。** 上の表は 111 万語での測定で、そこでは総当たりが
+ANN と並ぶ。202 万語では総当たりが 21〜30ms 対 15ms で負ける。**語数が変われば
+測り直す。**
 
-`candidates` (K) の意味も変わった。**内積は全行に対して取るので K を増やしても
-候補生成は重くならない**。伸びるのは rerank だけで、「Top-K に入らない語を
-rerank が拾えない」という取りこぼしも無くなった (ANN 時代は k=5000 で総当たりとの
+`candidates` (K) の意味も ANN 時代とは違う。**内積は全行に対して取るので K を
+増やしても候補生成は重くならない**。伸びるのは rerank だけで、「Top-K に入らない
+語を rerank が拾えない」という取りこぼしも無い (ANN では k=5000 で総当たりとの
 top10 一致率が 0.73 しかなかった)。
 
 embedding 単独に任せないのは「なぜ近いのか」が曖昧になるため。最終スコアの重みは
@@ -460,7 +459,7 @@ weighted phonetic edit distance) → ビーム探索で連結。
   `coda` と `vowel`。**索引に保存するのはこの 3 つだけ** (`store.INDEXED_SPACES`)。
 - **`consonant` と `rhythm` は索引に持たない。** 引くのは `compare` だけで、あちらは
   索引を引かず入力 2 語をその場で `embed()` するため。5 空間ぶん保存していた頃は
-  full で 107MB・core で 58MB が読まれないまま置かれていた。
+  107MB が読まれないまま置かれていた。
 - ベクトル行列は mmap で読むので、**索引に載せる空間を増やしてもディスクだけが増える**
   (匿名メモリは増えない)。ただし読まない空間を載せる理由はない。
 
@@ -660,12 +659,8 @@ full (202 万語) の実測:
 全 5 空間・全 202 万行がグループ先頭のベクトルと**完全一致する**ことを実測で確かめて
 ある (`tests/test_store.py::test_vectors_are_stored_once_per_phoneme_group`)。
 
-| | 行 | グループ | 比 |
-|---|---|---|---|
-| full | 2023395 | 1459159 | 0.721 |
-| core | 1114517 | 637353 | 0.572 |
-
-**core のほうが重複が多い。** 語数が少ないぶん異表記の比率が上がるため。
+202 万行が 146 万グループに畳まれる (0.721)。**比は語数で変わる** — 語彙を減らすと
+異表記の比率が上がるので、重複も増える。
 
 行からグループへは `group_ids`、グループから行へは `group_starts` で写す。候補生成は
 グループで Top-K を取ってから行へ展開する (`search._expand_groups`)。これは
@@ -681,8 +676,8 @@ full (202 万語) の実測:
 **v5 の変更。** `embedding.SPACES` は 5 空間あるが、索引から読まれるのは
 `phonetic` (候補生成) と `coda` / `vowel` (rerank) の 3 つだけ。`consonant` と
 `rhythm` を引く経路は `compare` (`compare_pronunciations`) しかなく、**あちらは索引を
-引かず入力 2 語をその場で `embed()` する**ので行列が要らない。full で 91MB + 16MB、
-core で 58MB が死蔵されていた。
+引かず入力 2 語をその場で `embed()` する**ので行列が要らない。載せていた頃は
+consonant 91MB + rhythm 16MB が死蔵されていた。
 
 **rerank に空間を足すときはここに加える** (索引の再構築が要る)。`embed()` は
 `spaces` 引数で作る空間を選べるので、構築側も 200 万語ぶんの捨てるベクトルを
@@ -882,37 +877,23 @@ SudachiDict full は地名 49 万・人名 24 万を含み索引の 7 割を占�
 
 ## デプロイ (`Dockerfile` / `fly.toml`)
 
-**Serverless には載らない。** 索引が core で 274MB・full で 508MB あり、Vercel /
-Lambda の関数サイズ上限 (250MB) を超える。圧縮しても解凍後サイズで判定されるので
-回避できない。加えて Rust 拡張のビルド (`jpr_distance` が無いと import に失敗する) と
-mmap 常駐の前提があり、**この 3 つはいずれもコンテナを要求する**。だから
-コンテナ系 PaaS (Fly.io) を選んでいる。
+**Serverless には載らない。** 理由が 3 つあり、いずれもコンテナを要求する。
 
-**v5 で core が 148MB になり、索引は上限 250MB を初めて下回った** (量子化前 855MB ->
-int8 で 274MB -> グループ化と 3 空間化で 148MB)。**サイズはもう Serverless を
-阻んでいない。** ただし残り 2 つの理由 — Rust 拡張のビルドと mmap 常駐 — は消えて
-いないので、載せるならその 2 つを解く必要がある。
+1. 索引が 322MB あり Vercel / Lambda の関数サイズ上限 (250MB) を超える。圧縮しても
+   解凍後サイズで判定されるので回避できない。
+2. Rust 拡張のビルドが要る (`jpr_distance` が無いと import に失敗する)。
+3. 索引を mmap で常駐させる前提になっている。
+
+だからコンテナ系 PaaS (Fly.io) を選んでいる。
 
 **索引はイメージに焼き込む** (Volume に置かない)。Volume だと「初回に索引を用意する」
 手順がデプロイと別に必要になり、`fly deploy` 一発で動く状態にならない。ビルド時に
 `build-index` を走らせる代償はイメージ 2.77GB・ビルド 8 分だが、Fly の上限 8GB には
 収まる。
 
-**辞書は core。** 索引の実測 (v5):
-
-| | v4 | v5 | 内訳 (v5) |
-|---|---|---|---|
-| full (202 万語) | 508MB | **322MB** | ベクトル 188MB + メタ 133MB |
-| core (111 万語) | 274MB | **148MB** | ベクトル 82MB + メタ 66MB |
-
-v4 -> v5 の削減はベクトル側だけで、**グループ化 (-28%) と 3 空間化 (-29%) の積**。
-メタデータは npz を個別 .npy に分けただけなので大きさが変わらない (mmap のために
-分けたので、効くのは匿名メモリのほう)。
-
-core に落としても検索品質は保たれることを実測した —
-「乳首」→ 手首、「わたしのなまえは」→ 私の名前は が同じ順位で出て、検索 16〜22ms・
-`compose` 281ms・索引のロード 0.4 秒。full の 202 万語が効くのは稀な語の再現性なので、
-公開デモでは core で足りる。**内積が語数に比例するので、full にすると検索が伸びる。**
+**索引は 322MB** (ベクトル 188MB + メタ 133MB)。ベクトルは int8 量子化 +
+音素列グループ化 (-28%) + 3 空間化 (-29%) を重ねた結果。メタデータは npz ではなく
+個別 .npy で置くが、これは mmap で開くためでサイズは変わらない (効くのは匿名メモリ)。
 
 **`hnsw-*.bin` を持ち込まないこと。** ANN をやめたので `build-index` は
 グラフを生成しないが (`_top_candidates` の項を参照)、古い索引ディレクトリには
@@ -972,42 +953,14 @@ npz は zip なので mmap できず、`np.load` が 133MB をヒープに展開
 **2GB 制限のコンテナで検証済み**: 全走査を混ぜた 70 リクエストを 12 並列で
 投げて失敗 0 件、ピーク 682MiB (33%)、`OOMKilled=false` (量子化前の測定)。
 
-v5 のイメージ内実測 (core / 2GB 制限、`docker run -m 2g`):
-
-| | RssAnon | RssFile |
-|---|---|---|
-| store を開いた直後 | 19MB | 19MB |
-| 検索 20 回 | 69MB | 130MB |
-| 全走査 + compose まで | **83MB** | 148MB |
-
-v6 のイメージ内実測 (core / 2GB 制限、HTTP 経由で検索 8 語 x6 + `phrase`):
-
-| | 実測 |
-|---|---|
-| コンテナ全体 | **119MiB / 2GiB (5.8%)** |
-| プロセスの RssAnon / RssFile | 113MB / 149MB |
-| `/api/similar` (HTTP 込み) | **11.9ms** |
-| `/api/phrase` | **94ms** |
-
-`phrase` が v5 本番の 432ms より速いのは、区間ごとの照合が `search` と
-同じ経路を通るため — **候補生成の帯とアクセサの改善がこちらにも効く**。
-
-**イメージは 618MB** (v6 の実測)。内訳は venv 340MB (うち sudachidict-core
-208MB) + 索引 142MB + Python の基底。推移は ANN のグラフを焼いていた頃が
-2.77GB、グラフをやめて 1.75GB、int8 量子化で 329MB、その後 `sudachidict-full`
-が依存に入って 1GB まで戻り、v5 で索引を半分にして full 辞書を任意依存に
-外して 641MB、**v6 で `uvicorn[standard]` をやめて 618MB**。
-
 **`uvicorn` に `[standard]` を付けない。** あれは uvloop (16MB) / httptools /
 websockets / watchfiles を連れてくるが、`web.py` は `uvicorn.run` を素で
 呼ぶだけで WebSocket も本番リロードも使わないので**一度も読まれない**。
-外して venv 362MB -> 340MB。実サーバを起動して `/api/similar` が同じ結果を
-返すことを確認済み。
 
-**残りの主役は Sudachi の core 辞書 (208MB) で、索引 (142MB) より大きい。**
-**これは外せない** — `ReadingExtractor` はかな入力なら解析を経ないが
-(`_is_all_kana`)、漢字を含むクエリの読みと `normalize` は Sudachi でしか
-取れず、索引に入っているのは語彙の読みであってクエリの読みではない。
+**イメージの主役は Sudachi の辞書 (344MB) と索引 (322MB) で、どちらも外せない。**
+索引は検索の本体、辞書は漢字を含むクエリの読みと `normalize` に要る
+(`ReadingExtractor` はかな入力なら解析を経ないが (`_is_all_kana`)、索引が
+持つのは語彙の読みであってクエリの読みではない)。
 
 次に大きいのは numpy (32MB + libs 27MB) と **cryptography (15MB)**。後者は
 `mcp` -> `pyjwt[crypto]` の**必須依存**なので、MCP の窓を持つ限り外せない
@@ -1025,43 +978,11 @@ websockets / watchfiles を連れてくるが、`web.py` は `uvicorn.run` を�
 上限を 16 に緩めると `assert 8 < 8` で落ちることを確認してある。
 
 **0 台に落とさない** (`auto_stop_machines = "suspend"` + `min_machines_running = 1`)。
-停止すると次のリクエストが索引ロードを払う (core 1.0 秒 / full 9.6 秒)。
+停止すると次のリクエストが索引ロードを払う (実測 9.6 秒)。
 
-**v5 デプロイ後の本番実測 (nrt / core)**:
-
-| | v4 | v5 |
-|---|---|---|
-| `MemAvailable` | 949MB | **1699MB** |
-| `Cached` | 997MB | 225MB |
-| プロセスの RssAnon / RssFile | — | **107MB / 143MB** |
-| 検索 | 33〜56ms | 22ms |
-| `phrase` | 371ms | 432ms |
-
-**空きメモリが 750MB 増えた。** `Cached` が減っているのは索引が 274MB -> 148MB に
-なってページキャッシュに載る量そのものが減ったため (mmap は必要なページしか
-読まないので、これは性能低下ではない)。`min_machines_running = 1` が効いているので
-通常運用でコールドスタートは起きない。
-
-**v6 デプロイ後の本番実測 (nrt / core)**:
-
-| | v5 | v6 |
-|---|---|---|
-| `MemAvailable` | 1699MB | **1718MB** |
-| `Cached` | 225MB | 218MB |
-| プロセスの RssAnon / RssFile | 107MB / 143MB | **99MB / 142MB** |
-| 検索 (サーバ内) | 22ms | **15.3ms** |
-| `phrase` (サーバ内) | 432ms | **123ms** |
-
-**メモリはほぼ横ばい。** v6 の変更は速度が主で、`memoryview` はページを mmap の
-まま参照するので匿名メモリを動かさない (`_byte_view` の項)。減った 8MB は
-`uvicorn[standard]` を外したぶん。
-
-**`phrase` が 3.5 倍速い。** 区間ごとの照合が `search` と同じ経路を通るので、
-候補生成の帯とアクセサの改善がそのまま効く。
-
-**測るときはサーバ内とクライアント側を分ける。** 日本から HTTPS で叩くと
-検索 39ms・`phrase` 155ms になるが、差は往復とプロキシのぶん。`flyctl ssh
-console` から `127.0.0.1:8080` を叩けばアプリの処理時間だけが取れる。
+**測るときはサーバ内とクライアント側を分ける。** 日本から HTTPS で叩くと往復と
+プロキシのぶんが乗る (実測でサーバ内 15.3ms に対しクライアント 39ms)。
+`flyctl ssh console` から `127.0.0.1:8080` を叩けばアプリの処理時間だけが取れる。
 
 **全マシンを手で suspend すると復帰の初回が 48 秒になる。** これは索引ロードでは
 なく Fly のプロキシが `machine was recently stopped and is unavailable to service

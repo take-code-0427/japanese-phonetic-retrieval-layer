@@ -2,25 +2,9 @@
 # 「初回に索引を用意する」手順がデプロイと別に要る。ビルド時に構築すれば
 # デプロイした時点で動く状態になる。
 #
-# 辞書は core を使う。実測で品質は保たれる
-# (「乳首」-> 手首 / 「ワタシノナマエハ」-> 私の名前は)。
-# ANN のグラフを作らなくなったので構築は 496s -> 163s に縮んでいる
-# (`store.py` の CANDIDATE_SPACES と `search.py` の _top_candidates を参照)。
-#
-# 索引サイズの推移 (core / full):
-#   855MB / 1.64GB  ->  int8 量子化 (`store.py` の `_quantize`)
-#   274MB / 508MB   ->  音素列グループ化 + 索引 3 空間化 (v5)
-#   148MB / 322MB
-#
-# **`sudachidict-full` を入れない。** 実行時にどちらの辞書を読むかは索引の
-# `dict_type` が決めるので (`PhoneticSearcher.extractor`)、core の索引で動かす
-# このイメージでは full が一度も読まれない。それでいて 344MB あり、索引より
-# 大きい死荷重になっていた。任意の依存にしてあるので `--extra full` を
-# 付けなければ入らない (`pyproject.toml`)。
-#
-# イメージは 641MB (実測)。内訳は venv 363MB (うち sudachidict-core 208MB) +
-# 索引 142MB + Python の基底。**次に大きいのは Sudachi の core 辞書**で、
-# 読みの取得に要るので外せない。
+# 辞書は full (202 万語 / 344MB)、索引は 322MB。イメージの主役はこの 2 つで、
+# **どちらも外せない**。索引は検索の本体、辞書は漢字を含むクエリの読みと
+# `normalize` に要る (索引が持つのは語彙の読みであってクエリの読みではない)。
 
 FROM python:3.12-slim AS builder
 
@@ -48,10 +32,9 @@ RUN uv sync --frozen --no-install-project --no-dev
 COPY src/ ./src/
 RUN uv sync --frozen --no-dev
 
-# 索引の構築。sudachidict-full も依存に入っているが、ここでは core だけを
-# 使う (上のコメント参照)。
+# 索引の構築。辞書は full 一本なので選ぶ余地がない。
 ENV JPR_INDEX=/opt/jpr-index
-RUN uv run jpr build-index --dict core --index "$JPR_INDEX"
+RUN uv run jpr build-index --index "$JPR_INDEX"
 
 
 FROM python:3.12-slim

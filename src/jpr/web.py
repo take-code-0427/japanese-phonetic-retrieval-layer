@@ -41,16 +41,31 @@ from .store import CANDIDATE_SPACES, PhoneticStore, default_store_path
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-#: 1 リクエストで返す件数の上限。件数に比例して `store.entry()` の呼び出しと
-#: JSON のシリアライズが増える (2000 件で 40ms)。limit=0 で無制限にでき、
-#: そのときは MAX_UNLIMITED で切る。
-MAX_LIMIT = 200
+#: 件数に上限を持たない。母集団を切るのは `min_score` の役目で、既定の
+#: 画面 (スコア下限 0.8 / 件数無制限) は「基準を満たす語を全部見る」ための
+#: ものなので、件数で切ると基準を満たした語が黙って消える。
+#:
+#: 既定経路では母集団が候補生成の Top-K (グループ) に限られるので、返る件数は
+#: 行に展開した 1 万件程度が上界になる。**歯止めが効かないのは全走査経路のほう**
+#: (5 モーラで 30 万語)。そこは `min_score` を 0 にすると数百 MB になり得るが、
+#: 範囲指定は呼び出し側が意図を持って入れるものなので、件数で勝手に切らない。
 
-#: limit=0 (無制限) のときに実際に返す件数の上限。5 モーラの全走査は
-#: 30 万語が母集団になるので、min_score を付けずに無制限を要求されると
-#: レスポンスが数百 MB になる。ブラウザが受け取れる量で切り、切ったことは
-#: `truncated` で伝える。本当に全件が要るなら CLI を使う。
-MAX_UNLIMITED = 5_000
+#: 検索結果を返すスコアの下限。
+#:
+#: 件数ではなくスコアで切るのが既定。上位 N 件で切ると「N 件目と N+1 件目の
+#: スコアが同じ」ときに片方だけが消え、順位の読み比べができなくなる。基準を
+#: 決めて満たすものを全部出すほうが、何を見ているかが画面から読める。
+#:
+#: 0.8 は rerank 後のスコアで「音が近いと言える」線。上位は 0.90〜0.98 に
+#: 密集するので (`static/app.js` のスコア棒の項)、0.8 は裾まで含む緩めの基準。
+DEFAULT_MIN_SCORE = 0.8
+
+#: 下限を満たす語が 1 件も無いときに、下限を外して返す件数。
+#:
+#: ここだけは件数で切る。下限を外した以上「基準を満たす全部」という意味が
+#: 無いので、切る位置に根拠を求められない。20 は最も近い語がどれかを読むのに
+#: 足りる数。
+FALLBACK_LIMIT = 20
 
 #: 候補生成から取る件数の上限。ここを大きくすると rerank のコストが線形に
 #: 増える (DEFAULT_CANDIDATES の項も参照)。内積は全行に対して取るので、
@@ -159,10 +174,10 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
     @app.get("/api/similar")
     def api_similar(
         q: str = Query(..., min_length=1, description="検索語 (漢字・かな・カタカナ)"),
-        limit: int = Query(20, ge=0, le=MAX_LIMIT, description="0 で無制限"),
+        limit: int = Query(0, ge=0, description="0 で無制限"),
         preset: str = Query(DEFAULT_PRESET),
         candidates: int = Query(DEFAULT_CANDIDATES, ge=1, le=MAX_CANDIDATES),
-        min_score: float = Query(0.0, ge=0.0, le=1.0),
+        min_score: float = Query(DEFAULT_MIN_SCORE, ge=0.0, le=1.0),
         categories: str | None = Query(None, description="カンマ区切り"),
         min_mora: int | None = Query(None, ge=1, le=32, description="モーラ数の下限"),
         max_mora: int | None = Query(None, ge=1, le=32, description="モーラ数の上限"),
@@ -188,6 +203,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         # 全走査は母集団ぶんの一時配列を作るので、並行で走らせるとメモリが
         # 溢れる (`MAX_CONCURRENT_SCANS` 参照)。Top-K の経路は軽いので
         # 門を通さない。
+        parsed_categories = _parse_categories(categories)
         with limit_scans() if scanning else nullcontext():
             pronunciation, results = engine.search(
                 q,
@@ -195,15 +211,33 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                 preset=preset,
                 candidates=candidates,
                 min_score=min_score,
-                categories=_parse_categories(categories),
+                categories=parsed_categories,
                 min_mora=min_mora,
                 max_mora=max_mora,
             )
-        total = len(results)
-        truncated = total > MAX_UNLIMITED
-        if truncated:
-            results = results[:MAX_UNLIMITED]
+            # スコアの下限は絶対的な基準として使えない。**スコアはクエリの
+            # 長さに依存する** — 長い語ほど完全一致でない限り編集距離の減点が
+            # 積み上がるので、既定の 0.8 に最近傍すら届かないクエリが実在する
+            # (実測で「わたしのなまえ」7 拍の最高が 0.791、「ありがとうござい
+            # ます」10 拍で 0.807)。件数で切らない以上そのまま空の画面になる。
+            #
+            # 下限を長さで動かす案は取らない — 「0.8 以上」の意味が
+            # クエリごとに変わると、画面に出た数値が何を表すのか読めなくなる。
+            # 基準は固定したまま、満たす語が無いときだけ下限を外して近い順に
+            # 見せ、外したことを `below_floor` で伝える。
+            fell_back = not results and min_score > 0.0
+            if fell_back:
+                _, results = engine.search(
+                    q,
+                    limit=FALLBACK_LIMIT,
+                    preset=preset,
+                    candidates=candidates,
+                    categories=parsed_categories,
+                    min_mora=min_mora,
+                    max_mora=max_mora,
+                )
         return {
+            "below_floor": fell_back,
             "query": q,
             "reading": pronunciation.reading,
             "phonemes": list(pronunciation.phonemes),
@@ -211,8 +245,6 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             "mora_count": pronunciation.mora_count,
             "preset": preset,
             "scanned": scanned,
-            "total": total,
-            "truncated": truncated,
             "results": [
                 {
                     "word": r.surface,
@@ -449,6 +481,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             "presets": sorted(PRESETS),
             "default_preset": DEFAULT_PRESET,
             "default_candidates": DEFAULT_CANDIDATES,
+            "default_min_score": DEFAULT_MIN_SCORE,
             # 分割合成の既定値。フロントに固定表を持たせると phrase.py を
             # 変えたときに黙ってずれるので、サーバ側の値を配る。
             "phrase": {

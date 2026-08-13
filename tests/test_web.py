@@ -161,24 +161,65 @@ def test_similar_requires_query(client: TestClient) -> None:
     assert client.get("/api/similar", params={"q": ""}).status_code == 422
 
 
-def test_similar_caps_limit(client: TestClient) -> None:
-    """件数の上限を超える要求は弾く。件数に比例して復号とシリアライズが増えるため。"""
-    assert client.get("/api/similar", params={"q": "乳首", "limit": 10_000}).status_code == 422
+def test_similar_has_no_result_cap(client: TestClient) -> None:
+    """件数に上限を持たない。母集団を切るのは min_score の役目。"""
+    assert client.get("/api/similar", params={"q": "乳首", "limit": 10_000}).status_code == 200
     # 負の件数は依然として弾く (0 だけを無制限の合図にする)。
     assert client.get("/api/similar", params={"q": "乳首", "limit": -1}).status_code == 422
 
 
-def test_similar_limit_zero_is_unlimited(client: TestClient) -> None:
-    """limit=0 は上限なし。切り詰めていないことを truncated で確かめる。"""
-    payload = client.get("/api/similar", params={"q": "チョコビ", "limit": 0}).json()
+def test_similar_returns_everything_above_the_score_floor(client: TestClient) -> None:
+    """既定は「下限を満たす語を全部」。件数で切らないので limit の指定も要らない。"""
+    payload = client.get("/api/similar", params={"q": "チョコビ", "min_score": 0.0}).json()
+    # 下限 0 は候補全件。件数で切らないので、limit を明示した側より多く返る。
+    capped = client.get("/api/similar", params={"q": "チョコビ", "min_score": 0.0, "limit": 3})
+    assert len(capped.json()["results"]) == 3
+    assert len(payload["results"]) > 3
+    # 下限を上げれば減る。母集団を決めているのが min_score だということ。
+    strict = client.get("/api/similar", params={"q": "チョコビ", "min_score": 0.7}).json()
+    assert strict["below_floor"] is False
+    assert 0 < len(strict["results"]) < len(payload["results"])
+    assert all(r["score"] >= 0.7 for r in strict["results"])
+
+
+def test_similar_falls_back_when_nothing_meets_the_floor(client: TestClient) -> None:
+    """下限を満たす語が無ければ下限を外して近い順を返す。
+
+    スコアはクエリの長さに依存するので、下限に最近傍すら届かないクエリが実在する
+    (実測で「わたしのなまえ」7 拍の最高が 0.791)。件数で切らない以上そのまま
+    空の画面になるため、外したことを below_floor で伝えて近い順を見せる。
+    """
+    payload = client.get("/api/similar", params={"q": "チョコビ", "min_score": 1.0}).json()
+    assert payload["below_floor"] is True
     assert payload["results"]
-    assert payload["truncated"] is False
-    assert payload["total"] == len(payload["results"])
+    # 外した結果なので、下限を下回るスコアが並ぶ。
+    assert payload["results"][0]["score"] < 1.0
+
+
+def test_similar_does_not_flag_a_fallback_when_the_floor_is_met(client: TestClient) -> None:
+    payload = client.get("/api/similar", params={"q": "チョコビ", "min_score": 0.0}).json()
+    assert payload["below_floor"] is False
+
+
+def test_similar_defaults_to_the_advertised_score_floor(client: TestClient) -> None:
+    """既定の下限は /api/info が配る値と一致する。フロントはこれを写して初期値にする。"""
+    floor = client.get("/api/info").json()["default_min_score"]
+    payload = client.get("/api/similar", params={"q": "チョコビ"}).json()
+    # 下限を明示した結果と一致する。sample_store の 18 語では既定の下限に
+    # 届かず below_floor に落ちるので、そちらの経路まで含めて同じであることを見る。
+    explicit = client.get("/api/similar", params={"q": "チョコビ", "min_score": floor}).json()
+    assert payload["below_floor"] == explicit["below_floor"]
+    assert [r["word"] for r in payload["results"]] == [r["word"] for r in explicit["results"]]
+    if not payload["below_floor"]:
+        assert all(r["score"] >= floor for r in payload["results"])
 
 
 def test_similar_accepts_a_mora_range(client: TestClient) -> None:
     payload = client.get(
-        "/api/similar", params={"q": "チョコビ", "min_mora": 4, "max_mora": 5, "limit": 20}
+        # 見るのは範囲の絞り込みなので、既定のスコア下限は外す (sample_store の
+        # 18 語では 0.8 を超える語が無く、範囲の検証にならない)。
+        "/api/similar",
+        params={"q": "チョコビ", "min_mora": 4, "max_mora": 5, "min_score": 0.0},
     ).json()
     assert payload["results"]
     assert all(4 <= r["mora_count"] <= 5 for r in payload["results"])

@@ -82,8 +82,8 @@
       <div class="knobs">
         <label class="knob">
           <span class="field-label">件数</span>
-          <input id="limit" type="number" value="20" min="0" max="200">
-          <span class="hint">0 で無制限。スコア下限と併せて使う</span>
+          <input id="limit" type="number" value="0" min="0">
+          <span class="hint">0 で無制限。既定は下限を満たす語を全部出す</span>
         </label>
         <label class="knob">
           <span class="field-label">ANN 候補数</span>
@@ -92,7 +92,8 @@
         </label>
         <label class="knob">
           <span class="field-label">スコア下限</span>
-          <input id="min-score" type="number" value="0" min="0" max="1" step="0.05">
+          <input id="min-score" type="number" value="0.8" min="0" max="1" step="0.05">
+          <span class="hint">母集団はここで切る。下げるほど件数が伸びる</span>
         </label>
         <label class="knob">
           <span class="field-label">モーラ範囲</span>

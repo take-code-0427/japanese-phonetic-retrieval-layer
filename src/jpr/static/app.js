@@ -33,6 +33,10 @@ const SPECIAL_LABELS = { R: "長音", Q: "促音", N: "撥音" };
 /** 音素の素性表と IPA。/api/phonemes で埋める。 */
 let features = { consonants: {}, vowels: {}, special: {} };
 
+/** スコア下限の既定。/api/info で埋める。URL に載せるかの判定に使うので、
+ *  フロントに固定値を持たせず web.py の DEFAULT_MIN_SCORE を写す。 */
+let defaultMinScore = null;
+
 /** 音素チップに IPA を併記するか。チップは色・title で既に情報を持っており、
  *  結果行ごとに並ぶので、常時併記すると密度が上がりすぎる。既定は off。 */
 let showIpa = false;
@@ -594,18 +598,22 @@ async function runSearch(event) {
     renderResults(data.results, data.phonemes, data.mora_count, range);
 
     if (!data.results.length) {
-      // 全走査では候補数を増やしても何も変わらないので、助言を変える。
+      // スコア下限は助言に出さない。満たす語が無ければサーバが下限を外して
+      // 近い順を返す (`below_floor`) ので、ここに来る 0 件は母集団そのものが
+      // 空だということ。全走査では候補数を増やしても何も変わらない。
       const advice = data.scanned == null
         ? "候補数を増やすか、カテゴリの絞り込みを外す"
-        : "モーラ範囲かスコア下限をゆるめる";
+        : "モーラ範囲を広げるか、カテゴリの絞り込みを外す";
       setStatus(status, `該当なし (${elapsed}ms) — ${advice}`);
     } else {
       const parts = [`${data.results.length} 件`, `${elapsed}ms`];
       if (data.scanned != null) {
         parts.push(`${data.scanned.toLocaleString("ja-JP")} 語を全走査`);
       }
-      if (data.truncated) {
-        parts.push(`全 ${data.total.toLocaleString("ja-JP")} 件中の先頭のみ`);
+      // 下限を外して返ってきたときは、画面の件数が「基準を満たした数」では
+      // ないことを言う。黙って出すと 0.8 未満のスコアが並ぶ理由が読めない。
+      if (data.below_floor) {
+        parts.push(`スコア ${$("min-score").value} 以上が無いので近い順`);
       }
       setStatus(status, `${parts.join(" / ")} — 行をクリックすると音素の対応が開く`);
     }
@@ -614,7 +622,14 @@ async function runSearch(event) {
     const shared = new URLSearchParams({ q: query, preset: activePreset });
     if ($("min-mora").value) shared.set("min_mora", $("min-mora").value);
     if ($("max-mora").value) shared.set("max_mora", $("max-mora").value);
-    if ($("limit").value !== "20") shared.set("limit", $("limit").value);
+    // 既定と違う値だけ載せる。既定はサーバから配られるので、そのときの
+    // 既定と突き合わせる (定数を変えたときに URL が長くなるだけで済む)。
+    if ($("limit").value !== "0") shared.set("limit", $("limit").value);
+    // スコア下限は母集団を決める主役なので、共有した URL で再現できないと
+    // 「同じ画面」にならない。
+    if ($("min-score").value !== String(defaultMinScore)) {
+      shared.set("min_score", $("min-score").value);
+    }
     history.replaceState(null, "", `?${shared}`);
   } catch (error) {
     setStatus(status, error.message, true);
@@ -1373,6 +1388,8 @@ async function main() {
     const info = await getJSON("/api/info");
     $("corpus-note").textContent = `${info.count.toLocaleString("ja-JP")} 語 / SudachiDict full`;
     $("candidates").value = String(info.default_candidates);
+    defaultMinScore = info.default_min_score;
+    $("min-score").value = String(defaultMinScore);
     renderCategoryChips(info.categories);
     // 分割合成の既定値もサーバから受け取る。phrase.py の定数を変えたときに
     // 画面の初期値が黙ってずれないようにする (音素の色と同じ理由)。
@@ -1403,6 +1420,10 @@ async function main() {
   // これが効かないと共有された URL が同じ画面を再現しない。
   const limit = params.get("limit");
   if (limit) $("limit").value = limit;
+  // スコア下限も同じ理由で復元する。**info の後に読む** — あちらが既定を
+  // 書き込むので、順序を逆にすると共有された値が既定で上書きされる。
+  const minScore = params.get("min_score");
+  if (minScore) $("min-score").value = minScore;
   // 共有された URL でモーラ範囲が効いているなら、絞り込みを開いて見せる。
   // **検索ビューの中を指定する** — `.advanced` は分割合成ビューにもあるので、
   // 文書全体から引くと先に出てくる別のビューの詳細が開く。

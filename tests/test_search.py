@@ -7,9 +7,11 @@ import pytest
 from jpr.distance import (
     WORST_SUBSTITUTION_COST,
     similarity_normalizer,
+    vowel_skeleton_similarity,
     weighted_edit_distance,
 )
 from jpr.index import Category
+from jpr.phonology import analyze_reading
 from jpr.search import PRESETS, PhoneticSearcher, ScoreWeights
 
 
@@ -114,6 +116,25 @@ def test_reported_similarity_matches_the_reference_implementation(
         )
         expected = max(0.0, 1.0 - distance / denominator)
         assert result.phonetic_similarity == pytest.approx(expected, abs=5e-5), result.surface
+
+
+def test_reported_vowel_similarity_matches_the_reference_implementation(
+    sample_searcher: PhoneticSearcher,
+) -> None:
+    """検索が返す母音軸が、記号ベースの実装から求めた値と一致する。
+
+    rerank は索引の母音骨格 CSR を Rust の DP に渡す (`_vowel_scores`)。
+    参照実装は `distance.vowel_skeleton_similarity`。骨格の作り方 (長音の
+    反復・特殊モーラの扱い) が構築側と検索側でずれると、ここが落ちる。
+    """
+    query = "乳首"
+    query_pronunciation = sample_searcher.pronounce(query)
+    _, results = sample_searcher.search(query, limit=10)
+    assert results
+
+    for result in results:
+        expected = vowel_skeleton_similarity(query_pronunciation, analyze_reading(result.reading))
+        assert result.vowel_similarity == pytest.approx(expected, abs=5e-5), result.surface
 
 
 @pytest.mark.parametrize("preset", sorted(PRESETS))

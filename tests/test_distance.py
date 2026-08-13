@@ -22,6 +22,7 @@ from jpr.distance import (
     phoneme_ids,
     phoneme_ipa,
     phonetic_similarity,
+    vowel_skeleton_similarity,
     weighted_edit_distance,
 )
 from jpr.phonology import analyze_reading
@@ -29,6 +30,44 @@ from jpr.phonology import analyze_reading
 
 def similarity(a: str, b: str) -> float:
     return phonetic_similarity(analyze_reading(a), analyze_reading(b))
+
+
+def vowel_similarity(a: str, b: str) -> float:
+    return vowel_skeleton_similarity(analyze_reading(a), analyze_reading(b))
+
+
+def test_identical_vowel_skeleton_is_maximally_similar() -> None:
+    """母音列が同じ語は子音が違っても母音軸では最大類似になる。
+
+    ダジャレ・韻のコーパス研究の第一法則 (Kawahara 2007)。「シャチョウ」と
+    「サショウ」(a,o,u = a,o,u) がダジャレとして成立するのはこの性質による。
+    """
+    assert vowel_similarity("チクビ", "シクミ") == pytest.approx(1.0)
+    assert vowel_similarity("シャチョウ", "サショウ") == pytest.approx(1.0)
+
+
+def test_vowel_skeleton_penalizes_length_mismatch() -> None:
+    """長さの違う母音列は挿入コストが積み上がって明確に下がる。
+
+    プーリングした内積だった頃は「カイギ」(a,i,i) と「カタギリシキ」
+    (a,a,i,i,i,i) に 0.99 を与えていた。列の照合ならダジャレとして成立する
+    近傍 (カイキ) と長さ違いが分離できる。
+    """
+    matching = vowel_similarity("カイギ", "カイキ")
+    stretched = vowel_similarity("カイギ", "カタギリシキ")
+    assert matching == pytest.approx(1.0)
+    assert stretched < 0.7
+
+
+def test_vowel_skeleton_separates_different_vowel_patterns() -> None:
+    assert vowel_similarity("チクビ", "チョコビ") < vowel_similarity("チクビ", "テクビ")
+
+
+def test_vowel_skeleton_keeps_special_moras() -> None:
+    """促音・撥音は拍を成すので骨格に残る。「フトン」と「フットン」は
+    促音の挿入ぶんだけ下がるが、特殊モーラの挿入は安い (0.45) ので近い。"""
+    value = vowel_similarity("フトン", "フットン")
+    assert 0.8 < value < 1.0
 
 
 def test_identical_phonemes_have_zero_distance() -> None:

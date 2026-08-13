@@ -628,7 +628,32 @@ def align_phonemes(a: tuple[str, ...], b: tuple[str, ...]) -> list[AlignedPair]:
 
 def phonetic_similarity(a: Pronunciation, b: Pronunciation) -> float:
     """音韻類似度を 0.0〜1.0 で返す。"""
-    pa, pb = a.phonemes, b.phonemes
+    return _sequence_similarity(a.phonemes, b.phonemes)
+
+
+def vowel_skeleton_similarity(a: Pronunciation, b: Pronunciation) -> float:
+    """母音骨格 (母音 + 特殊モーラの列) の類似度を 0.0〜1.0 で返す。
+
+    ダジャレ・韻のコーパス研究は一貫して「母音列の一致が日本語の音類似の
+    第一法則で、子音の違いは類似度に応じて許容される」ことを示している
+    (Kawahara 2007, Kawahara & Shinohara 2009)。この性質は列の照合であって、
+    ビンにプーリングしたベクトルの内積では表現できない — プーリングは長さの
+    情報を捨てるので、「カイギ」(a,i,i) と「カタギリシキ」(a,a,i,i,i,i) の
+    ような長さ違いに 0.99 を与えてしまった。
+
+    骨格の記号 (a/i/u/e/o/N/Q) はすべて音素なので、DP・コスト表・正規化は
+    音素列の類似度とそのまま共有する。長さの不一致は挿入コストとして積み上がり、
+    列が完全一致なら 1.0 になる。
+
+    検索の rerank が通るのは索引の母音骨格 CSR + Rust の
+    `edit_distance_csr` で、**こちらは記号のまま書いた参照実装**
+    (`tests/test_search.py` が両者の一致を検証する)。
+    """
+    return _sequence_similarity(a.vowel_skeleton, b.vowel_skeleton)
+
+
+def _sequence_similarity(pa: tuple[str, ...], pb: tuple[str, ...]) -> float:
+    """音素記号列の重み付き編集距離を長さで正規化した類似度。"""
     if not pa and not pb:
         return 1.0
     if not pa or not pb:

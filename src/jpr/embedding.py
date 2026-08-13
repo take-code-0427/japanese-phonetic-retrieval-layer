@@ -216,7 +216,6 @@ def _feature_matrix(phonemes: tuple[str, ...]) -> np.ndarray:
 
 PHONETIC_DIM: Final = PHONEME_DIM * POSITION_BINS
 CONSONANT_DIM: Final = _CONSONANT_DIM * POSITION_BINS
-VOWEL_DIM: Final = _VOWEL_DIM * POSITION_BINS
 CODA_DIM: Final = PHONEME_DIM * CODA_MORAS
 # リズム: モーラ数 (連続) + 特殊モーラの比率 3 種 + 位置ごとの特殊モーラ有無
 RHYTHM_DIM: Final = 1 + 3 + RHYTHM_BINS
@@ -237,21 +236,6 @@ def consonant_vector(phonemes: tuple[str, ...]) -> np.ndarray:
     if not rows:
         return np.zeros(CONSONANT_DIM, dtype=np.float32)
     features = PHONEME_FEATURES[rows][:, :_CONSONANT_DIM]
-    return _normalize(_bin_pool(features).reshape(-1))
-
-
-def vowel_vector(pronunciation: Pronunciation) -> np.ndarray:
-    """母音の骨格 (韻) を表すベクトル。
-
-    長音は直前の母音の伸長なので、母音列としては直前母音の繰り返しとみなす。
-    `Pronunciation.vowel_skeleton` がその解釈を持つのでそれを使う。
-    """
-    skeleton = pronunciation.vowel_skeleton
-    rows = [PHONEME_INDEX[v] for v in skeleton if v in VOWELS]
-    if not rows:
-        return np.zeros(VOWEL_DIM, dtype=np.float32)
-    start = _CONSONANT_DIM
-    features = PHONEME_FEATURES[rows][:, start : start + _VOWEL_DIM]
     return _normalize(_bin_pool(features).reshape(-1))
 
 
@@ -297,7 +281,6 @@ def rhythm_vector(pronunciation: Pronunciation) -> np.ndarray:
 SPACES: Final[dict[str, int]] = {
     "phonetic": PHONETIC_DIM,
     "consonant": CONSONANT_DIM,
-    "vowel": VOWEL_DIM,
     "coda": CODA_DIM,
     "rhythm": RHYTHM_DIM,
 }
@@ -308,9 +291,9 @@ def embed(
 ) -> dict[str, np.ndarray]:
     """1 語のベクトルを作る。
 
-    `spaces` を渡すとその空間だけを作る。索引構築は 3 空間しか保存しないので
+    `spaces` を渡すとその空間だけを作る。索引構築は 2 空間しか保存しないので
     (`store.INDEXED_SPACES`)、200 万語ぶんの `consonant` と `rhythm` を捨てる
-    ために計算する理由がない。既定 (`None`) は全 5 空間で、`compare` が使う。
+    ために計算する理由がない。既定 (`None`) は全 4 空間で、`compare` が使う。
 
     phonetic と consonant は同じ素性行列から作れるので、行列引きを 1 回に
     まとめる。索引構築では 200 万語を処理するのでこの差が効く。
@@ -333,8 +316,6 @@ def embed(
         else:
             out["consonant"] = np.zeros(CONSONANT_DIM, dtype=np.float32)
 
-    if "vowel" in wanted:
-        out["vowel"] = vowel_vector(pronunciation)
     if "coda" in wanted:
         out["coda"] = coda_vector(pronunciation)
     if "rhythm" in wanted:
@@ -371,5 +352,4 @@ __all__ = [
     "embed_many",
     "phonetic_vector",
     "rhythm_vector",
-    "vowel_vector",
 ]

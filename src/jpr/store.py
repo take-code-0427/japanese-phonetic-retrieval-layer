@@ -36,6 +36,7 @@ import numpy as np
 from .distance import PAD_ID, PHONEME_TO_ID, UNKNOWN_PHONEME_ID
 from .embedding import SPACES
 from .index import Category, IndexEntry
+from .phonology import vowel_skeleton_of
 
 #: 索引形式のバージョン。`PhoneticStore.__init__` が不一致を検出してエラーにする。
 #:
@@ -43,7 +44,7 @@ from .index import Category, IndexEntry
 #: 持ち方が変わったときは上げる (読めば壊れる)。読み方だけを変えたときは上げない —
 #: 再構築は 10 分かかるので、動くものを動かなくする理由がない。索引の内容そのものが
 #: 変わったとき (語彙の範囲など) も上げる。形式は読めても結果が説明できなくなる。
-FORMAT_VERSION = 7
+FORMAT_VERSION = 8
 
 #: 候補生成に使う空間。
 #:
@@ -55,9 +56,11 @@ CANDIDATE_SPACES = ("phonetic",)
 
 #: 索引に保存する空間。
 #:
-#: `embedding.SPACES` の全 5 空間ではなく、**検索が実際に読む 3 つだけ**。
-#: 候補生成が `phonetic`、rerank が `coda` と `vowel` を引く
-#: (`search._score_candidates`)。
+#: `embedding.SPACES` の全空間ではなく、**検索が実際に読む 2 つだけ**。
+#: 候補生成が `phonetic`、rerank が `coda` を引く (`search._score_candidates`)。
+#: rerank の母音軸はベクトル空間ではなく母音骨格 CSR (`vowel_csr`) を引く —
+#: 母音の類似は列の照合であって、プーリングした内積では長さの違いが消える
+#: (v8、`distance.vowel_skeleton_similarity` の項を参照)。
 #:
 #: `consonant` と `rhythm` は書いても読まれない。この 2 つを使うのは
 #: `compare` (`search.compare_pronunciations`) だけで、あちらは索引を引かず
@@ -66,7 +69,7 @@ CANDIDATE_SPACES = ("phonetic",)
 #:
 #: **空間を rerank に足すときはここに加える。** 索引の再構築が要る
 #: (`FORMAT_VERSION` を上げる)。
-INDEXED_SPACES = ("phonetic", "coda", "vowel")
+INDEXED_SPACES = ("phonetic", "coda")
 
 _META_FILE = "meta.json"
 
@@ -89,6 +92,8 @@ _ENTRY_ARRAYS = (
     "phoneme_vocabulary",
     "phoneme_ids",
     "phoneme_bounds",
+    "vowel_ids",
+    "vowel_bounds",
     "group_ids",
 )
 
@@ -138,7 +143,7 @@ def _quantize(matrix: np.ndarray) -> tuple[np.ndarray, float]:
     `rhythm` だけは正規化しないので絶対量が大きいが (ノルム最大 2.24)、
     空間ごとに最大値を取るこの形なら自動的に追従する。
 
-    量子化の誤差は内積で最大 0.012 (全 5 空間の実測)。順位を分ける
+    量子化の誤差は内積で最大 0.012 (全空間の実測)。順位を分ける
     スコア差は Top-K 境界でも 0.0002 程度あるので、この誤差は候補生成の
     順位をわずかに揺らす。`search.DEFAULT_CANDIDATES` を広げて吸収する
     (`_top_candidates` の項を参照)。
@@ -256,8 +261,14 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
     # 音素列を ID 化して連結する。同じ (モーラ数, 音素列) が続く区間へ同じ
     # グループ ID を振り (ソート済みなので隣接比較で足りる)、音素列そのものは
     # グループが変わったときだけ書き出す。
+    #
+    # 母音骨格も同じグループ単位で持つ (v8)。骨格は音素列だけの関数なので
+    # (`phonology.vowel_skeleton_of`)、同音異表記はまったく同じ骨格を持つ。
+    # rerank の母音軸がこの CSR を `edit_distance_csr` に渡す。
     phoneme_ids: list[int] = []
     phoneme_offsets = [0]
+    vowel_ids: list[int] = []
+    vowel_offsets = [0]
     group_ids = np.zeros(len(entries), dtype=np.int32)
     symbols: dict[str, int] = {}
     group = -1
@@ -270,9 +281,13 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
             for symbol in entry.phonemes:
                 phoneme_ids.append(symbols.setdefault(symbol, len(symbols)))
             phoneme_offsets.append(len(phoneme_ids))
+            for symbol in vowel_skeleton_of(entry.phonemes):
+                vowel_ids.append(symbols.setdefault(symbol, len(symbols)))
+            vowel_offsets.append(len(vowel_ids))
         group_ids[row] = group
 
     _check_blob_fits("音素 blob", len(phoneme_ids))
+    _check_blob_fits("母音骨格 blob", len(vowel_ids))
 
     phoneme_vocabulary = [""] * len(symbols)
     for symbol, index in symbols.items():
@@ -292,6 +307,8 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
         "phoneme_vocabulary": np.array(phoneme_vocabulary, dtype=np.str_),
         "phoneme_ids": np.array(phoneme_ids, dtype=np.uint8),
         "phoneme_bounds": np.asarray(phoneme_offsets, dtype=np.int32),
+        "vowel_ids": np.array(vowel_ids, dtype=np.uint8),
+        "vowel_bounds": np.asarray(vowel_offsets, dtype=np.int32),
         "group_ids": group_ids,
     }
 
@@ -347,6 +364,11 @@ class PhoneticStore:
         if self._data["phoneme_bounds"].size != self._group_count + 1:
             raise ValueError(
                 f"音素列の本数がグループ数と一致しません: {self.path}\n"
+                "`jpr build-index --force` で再構築してください。"
+            )
+        if self._data["vowel_bounds"].size != self._group_count + 1:
+            raise ValueError(
+                f"母音骨格の本数がグループ数と一致しません: {self.path}\n"
                 "`jpr build-index --force` で再構築してください。"
             )
 
@@ -457,6 +479,23 @@ class PhoneticStore:
         同じ計算を繰り返す理由がない。
         """
         return self._data["phoneme_ids"], self._data["phoneme_bounds"], self._distance_ids
+
+    def vowel_lengths(self, rows: np.ndarray) -> np.ndarray:
+        """指定した行の母音骨格の長さ。類似度の正規化に使う。"""
+        bounds = self._data["vowel_bounds"]
+        groups = self._data["group_ids"][rows]
+        return (bounds[groups + 1] - bounds[groups]).astype(np.int64)
+
+    @property
+    def vowel_csr(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """母音骨格の CSR 表現 (連結 ID, 境界, 距離テーブルへの写像)。
+
+        rerank の母音軸がここを `distance.edit_distance_csr` に渡す (v8)。
+        骨格の記号 (母音 + 促音・撥音) はすべて音素なので、ID の語彙も距離
+        テーブルへの写像も音素列の CSR とそのまま共有する。添字がグループで
+        あることも `phoneme_csr` と同じ。
+        """
+        return self._data["vowel_ids"], self._data["vowel_bounds"], self._distance_ids
 
     def entry(self, row: int) -> IndexEntry:
         return IndexEntry(
@@ -596,7 +635,7 @@ class PhoneticStore:
         (`embedding.embed` は `Pronunciation` しか見ない)、同音異表記は
         まったく同じベクトルになる。行ごとに持つと full の 202 万行のうち
         146 万行ぶんしか情報が無いのに全部を保存し、内積も重複して計算する
-        ことになる。実測で全 5 空間・全 202 万行がグループ先頭と完全一致した。
+        ことになる。実測で全空間・全 202 万行がグループ先頭と完全一致した。
 
         候補生成も rerank もこの行列だけで足りる。mmap なので匿名メモリに
         載らず、ページキャッシュとして回収できる — ANN のグラフを持っていた

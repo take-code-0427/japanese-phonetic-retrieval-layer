@@ -146,6 +146,29 @@ class Mora:
         return (self.vowel,)
 
 
+def vowel_skeleton_of(phonemes: tuple[str, ...]) -> tuple[str, ...]:
+    """音素列から母音・特殊モーラのみの列を作る。
+
+    埋め込みや編集距離と同じく**音素列だけの関数**にしてある。索引は音素列を
+    グループ単位で持つので (`store._encode_entries`)、モーラ構造を経由すると
+    グループから骨格を導けなくなる。
+
+    長音は直前の母音の伸長なので直前の骨格記号の繰り返しとみなす (語頭の
+    長音は先行する母音が無いので落とす)。促音・撥音はそれ自身が拍を成すので
+    独立した記号として残す。
+    """
+    out: list[str] = []
+    for p in phonemes:
+        if p in VOWELS:
+            out.append(p)
+        elif p == LONG:
+            if out:
+                out.append(out[-1])
+        elif p in SPECIAL_PHONEMES:
+            out.append(p)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Pronunciation:
     """読みの音韻表現。"""
@@ -164,15 +187,7 @@ class Pronunciation:
     @property
     def vowel_skeleton(self) -> tuple[str, ...]:
         """母音・特殊モーラのみの列。韻の判定に使う。"""
-        out: list[str] = []
-        for m in self.moras:
-            if m.special == LONG and out:
-                out.append(out[-1])
-            elif m.special:
-                out.append(m.special)
-            else:
-                out.append(m.vowel)
-        return tuple(out)
+        return vowel_skeleton_of(self.phonemes)
 
     def phoneme_string(self) -> str:
         return " ".join(self.phonemes)

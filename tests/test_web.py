@@ -266,9 +266,11 @@ def test_info_reports_index_metadata(client: TestClient, sample_store: PhoneticS
     assert payload["format_version"] == sample_store.meta.version
     assert {space["name"] for space in payload["spaces"]} == set(sample_store.meta.dims)
     # 候補生成に使うのは 1 空間だけ。他は rerank でスコアを足すのに使う。
+    # 母音軸はベクトル空間ではなく骨格 CSR なのでここには載らない (v8)。
     roles = {space["name"]: space["role"] for space in payload["spaces"]}
     assert roles["phonetic"] == "候補生成 + rerank"
-    assert roles["vowel"] == "rerank のみ"
+    assert roles["coda"] == "rerank のみ"
+    assert "vowel" not in roles
     assert payload["presets"] == ["mishearing", "pun", "rhyme"]
 
 

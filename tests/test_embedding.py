@@ -24,7 +24,7 @@ def test_all_spaces_have_declared_dimensions() -> None:
         assert result[name].shape == (dim,)
 
 
-@pytest.mark.parametrize("space", ["phonetic", "consonant", "vowel", "coda"])
+@pytest.mark.parametrize("space", ["phonetic", "consonant", "coda"])
 def test_inner_product_spaces_are_l2_normalized(space: str) -> None:
     """内積を類似度として使う空間は正規化されている必要がある。"""
     norm = float(np.linalg.norm(vectors("チクビ")[space]))
@@ -69,15 +69,6 @@ def test_phonetic_space_separates_related_from_unrelated() -> None:
 def test_consonant_space_ignores_vowels() -> None:
     """子音が同一で母音だけ違う語は、子音空間では最大類似になる。"""
     assert cosine("チクビ", "チョコビ", "consonant") == pytest.approx(1.0, abs=1e-5)
-
-
-def test_vowel_space_ignores_consonants() -> None:
-    """母音列が同じ語は、母音空間では最大類似になる。"""
-    assert cosine("チクビ", "シクミ", "vowel") == pytest.approx(1.0, abs=1e-5)
-
-
-def test_vowel_space_separates_different_vowel_patterns() -> None:
-    assert cosine("チクビ", "チョコビ", "vowel") < cosine("チクビ", "テクビ", "vowel")
 
 
 def test_coda_space_rewards_matching_tail() -> None:

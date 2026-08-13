@@ -169,6 +169,23 @@ def test_phonemes_survive_the_group_indirection(roundtrip: PhoneticStore) -> Non
         assert roundtrip.phoneme_id_array(row).size == len(expected)
 
 
+def test_vowel_skeleton_survives_the_group_indirection(roundtrip: PhoneticStore) -> None:
+    """母音骨格 CSR が、その語の読みから作った骨格と一致する。
+
+    骨格は構築時に音素列から導いて保存する (v8)。導出 (`vowel_skeleton_of`)
+    が検索側の参照実装 (`Pronunciation.vowel_skeleton`) とずれると、rerank の
+    母音軸が黙って別の値を返す。
+    """
+    blob, bounds, _distance_ids = roundtrip.vowel_csr
+    vocabulary = np.asarray(roundtrip._phoneme_vocabulary)
+    for row in range(len(roundtrip)):
+        expected = analyze_reading(roundtrip.reading(row)).vowel_skeleton
+        group = int(roundtrip.group_ids[row])
+        stored = tuple(vocabulary[blob[bounds[group] : bounds[group + 1]]])
+        assert stored == expected, roundtrip.surface(row)
+        assert roundtrip.vowel_lengths(np.array([row]))[0] == len(expected)
+
+
 def test_phoneme_id_matrix_matches_row_by_row(roundtrip: PhoneticStore) -> None:
     """まとめて引いた行列は、1 行ずつ引いたものとパディング以外で一致する。
 

@@ -29,6 +29,7 @@ from .distance import (
     edit_distance_csr,
     phoneme_ids,
     phonetic_similarity,
+    vowel_skeleton_similarity,
     weighted_edit_distance,
 )
 from .embedding import embed
@@ -838,7 +839,11 @@ class PhoneticSearcher:
         # ベクトルの内積とモーラ数・一般性は配列演算でまとめて出す。
         # 編集距離より 2 桁安いので、絞り込む前に全候補ぶん出しておく。
         coda = np.clip(self._space_scores("coda", rows, query_vectors, bounds), 0.0, None)
-        vowel = np.clip(self._space_scores("vowel", rows, query_vectors, bounds), 0.0, None)
+        # 母音軸はベクトル空間ではなく母音骨格の編集距離 (v8)。母音の類似は
+        # 列の照合であって、プーリングした内積では長さの違いが消える
+        # (`distance.vowel_skeleton_similarity` の項を参照)。骨格は音素列の
+        # 半分程度の長さしかないので、DP でも全候補に払える。
+        vowel = self._vowel_scores(rows, phoneme_ids(pronunciation.vowel_skeleton))
         embedding = np.clip(embedding_scores, 0.0, None)
         candidate_moras = store.mora_counts[rows].astype(np.int32)
         mora = _mora_similarity_array(pronunciation.mora_count, candidate_moras)
@@ -996,6 +1001,24 @@ class PhoneticSearcher:
             leaders, inverse = representatives
             distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
         return _edit_similarity_array(distances, query_ids.size, self.store.phoneme_lengths(rows))
+
+    def _vowel_scores(self, rows: np.ndarray, query_ids: np.ndarray) -> np.ndarray:
+        """候補行の母音骨格の類似度。`_phonetic_scores` の母音版。
+
+        DP・コスト表・正規化は音素列と共有し、読む CSR だけが違う
+        (`store.vowel_csr`)。記号版の参照実装は
+        `distance.vowel_skeleton_similarity` で、**2 者は同じ値を返さなければ
+        ならない** (`tests/test_search.py` が一致を検証する)。
+        """
+        blob, bounds, distance_ids = self.store.vowel_csr
+        groups = self.store.group_ids[rows].astype(np.int64)
+        representatives = self._group_representatives(groups)
+        if representatives is None:
+            distances = edit_distance_csr(query_ids, groups, blob, bounds, distance_ids)
+        else:
+            leaders, inverse = representatives
+            distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
+        return _edit_similarity_array(distances, query_ids.size, self.store.vowel_lengths(rows))
 
     def _group_representatives(self, groups: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         """候補のグループ列を重複のない代表に畳む。
@@ -1247,6 +1270,9 @@ def compare_pronunciations(
             spaces[name] = round(max(0.0, 1.0 - gap), 4)
         else:
             spaces[name] = round(float(va[name] @ vb[name]), 4)
+    # 母音は埋め込み空間ではなく骨格列の照合 (v8)。検索の rerank と同じ定義を
+    # 出す — 名前が同じ軸が窓によって違う値を返すと、内訳から順位を検算できない。
+    spaces["vowel"] = round(vowel_skeleton_similarity(a, b), 4)
 
     return ComparisonResult(
         a_text=a_text,

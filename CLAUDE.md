@@ -957,10 +957,18 @@ npz は zip なので mmap できず、`np.load` が 133MB をヒープに展開
 websockets / watchfiles を連れてくるが、`web.py` は `uvicorn.run` を素で
 呼ぶだけで WebSocket も本番リロードも使わないので**一度も読まれない**。
 
-**イメージの主役は Sudachi の辞書 (344MB) と索引 (322MB) で、どちらも外せない。**
-索引は検索の本体、辞書は漢字を含むクエリの読みと `normalize` に要る
+**イメージは 934MB。主役は Sudachi の辞書 (344MB) と索引 (322MB) で、どちらも
+外せない。** 索引は検索の本体、辞書は漢字を含むクエリの読みと `normalize` に要る
 (`ReadingExtractor` はかな入力なら解析を経ないが (`_is_all_kana`)、索引が
 持つのは語彙の読みであってクエリの読みではない)。
+
+**2GB 制限のコンテナで検証済み** (`docker run -m 2g`):
+
+| | RssAnon | RssFile |
+|---|---|---|
+| 索引を開いた直後 | 173MB | 261MB |
+| 検索 48 回 + `phrase` | 202MB | 378MB |
+| 全走査 (4〜6 モーラ) まで | **209MB** | 283MB |
 
 次に大きいのは numpy (32MB + libs 27MB) と **cryptography (15MB)**。後者は
 `mcp` -> `pyjwt[crypto]` の**必須依存**なので、MCP の窓を持つ限り外せない
@@ -983,6 +991,25 @@ websockets / watchfiles を連れてくるが、`web.py` は `uvicorn.run` を�
 **測るときはサーバ内とクライアント側を分ける。** 日本から HTTPS で叩くと往復と
 プロキシのぶんが乗る (実測でサーバ内 15.3ms に対しクライアント 39ms)。
 `flyctl ssh console` から `127.0.0.1:8080` を叩けばアプリの処理時間だけが取れる。
+
+**本番実測 (nrt / 202 万語 / サーバ内)**:
+
+| | 実測 |
+|---|---|
+| `MemTotal` / `MemAvailable` | 2016MB / **1561MB** |
+| `Cached` | 448MB |
+| プロセスの RssAnon / RssFile | **210MB / 358MB** |
+| 検索 | 中央値 **50.5ms** (45〜57ms) |
+| `phrase` | **147ms** |
+| `phrase/lattice` | 163ms |
+| 全走査 (4〜6 モーラ) | 260ms |
+
+**検索が 15.3ms から 50.5ms に伸びた。** 語彙が 111 万から 202 万に増えたので
+候補生成の内積がそのぶん重い。**包含のために払っている代償はここ。**
+
+空きは 1561MB あるので 2GB に対して余裕がある。`Cached` が 218MB から 448MB に
+増えているのは索引と辞書がそれぞれ倍近くになったぶん (mmap は必要なページしか
+読むので性能低下ではない)。
 
 **全マシンを手で suspend すると復帰の初回が 48 秒になる。** これは索引ロードでは
 なく Fly のプロキシが `machine was recently stopped and is unavailable to service

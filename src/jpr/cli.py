@@ -117,6 +117,7 @@ def cmd_similar(args: argparse.Namespace) -> int:
                         "embedding_similarity": r.embedding_similarity,
                         "coda_similarity": r.coda_similarity,
                         "vowel_similarity": r.vowel_similarity,
+                        "containment": r.containment,
                         "mora_count": r.mora_count,
                         "category": r.category.value,
                         "pos": r.pos,
@@ -144,15 +145,20 @@ def cmd_similar(args: argparse.Namespace) -> int:
 
     # モーラ範囲で絞った結果を読むにはモーラ数が要る。既定の検索でも
     # 候補がどの長さに寄っているかが見えるので、常に出す。
+    # 包含は列ではなく印で出す。列を足すと横に伸びるうえ、値が 0 の行が
+    # 大半になるので読む情報量が印と変わらない。占有率は JSON 出力で見る。
     print(f"\n{'score':>6}  {'音韻':>5}  {'語尾':>5}  {'拍':>3}  {'語':<16} {'読み':<14} カテゴリ")
     for result in results:
+        mark = "*" if result.containment else " "
         print(
-            f"{result.score:6.3f}  "
+            f"{result.score:6.3f}{mark} "
             f"{result.phonetic_similarity:5.3f}  "
             f"{result.coda_similarity:5.3f}  "
             f"{result.mora_count:3d}  "
             f"{result.surface:<16} {result.reading:<14} {result.category.value}"
         )
+    if any(r.containment for r in results):
+        print("\n* = クエリの音が完全な形で入っている語")
     return 0
 
 

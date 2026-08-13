@@ -553,6 +553,16 @@ main {
 }
 .tag-mora { font-family: var(--mono); }
 
+/* 包含 (クエリの音が丸ごと入っている) だけは地の色から起こす。カードの中で
+ * 一番説明が要る性質なので、他のタグと同じ淡さでは見つけられない。
+ * 音素の色 (--p-* / --v-*) は素性表が決めるものなので使わない。 */
+.tag.is-contained {
+  color: var(--ink);
+  border-color: var(--ink-dim);
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
 /* 一般性は 4 段の塊で示す。Sudachi のコスト由来の弱い指標なので
  * 連続値のバーにすると精度を偽ることになる。 */
 .fam { display: flex; gap: 2px; align-items: center; }

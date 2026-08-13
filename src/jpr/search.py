@@ -25,6 +25,7 @@ import numpy as np
 from .distance import (
     INDEL_COST,
     WORST_SUBSTITUTION_COST,
+    containment_scan,
     edit_distance_csr,
     phoneme_ids,
     phonetic_similarity,
@@ -61,6 +62,8 @@ class ScoreWeights:
     `phoneme` は精密な編集距離、`embedding` は ANN 空間での近さ、
     `mora` はモーラ数の一致、`coda` は語尾の一致、`vowel` は母音列 (韻) の一致。
     `familiarity` は語の一般性で、音韻的に同等な候補の順序を決めるのに使う。
+    `containment` はクエリの音が候補に完全な形で入っていること
+    (`distance.containment_ratio`)。
     """
 
     phoneme: float = 0.55
@@ -69,10 +72,17 @@ class ScoreWeights:
     coda: float = 0.10
     vowel: float = 0.05
     familiarity: float = 0.05
+    containment: float = 0.00
 
     def normalized(self) -> ScoreWeights:
         total = (
-            self.phoneme + self.embedding + self.mora + self.coda + self.vowel + self.familiarity
+            self.phoneme
+            + self.embedding
+            + self.mora
+            + self.coda
+            + self.vowel
+            + self.familiarity
+            + self.containment
         )
         if total <= 0:
             raise ValueError("重みの合計が 0 です")
@@ -83,6 +93,7 @@ class ScoreWeights:
             coda=self.coda / total,
             vowel=self.vowel / total,
             familiarity=self.familiarity / total,
+            containment=self.containment / total,
         )
 
 
@@ -91,15 +102,46 @@ class ScoreWeights:
 #: pun        ダジャレ・なぞなぞ。音韻全体の近さと、知られた語であることを重視。
 #: rhyme      韻を踏む語。語尾と母音列を重視し、語頭の一致は求めない。
 #: mishearing 聞き間違い・ASR 補正。全体の音韻とリズムの一致を最重視。
+#:
+#: `containment` は「クエリの音が完全な形で入っている」度合い。pun と
+#: mishearing に入れて rhyme には入れない — **韻は語尾の一致を見るので、
+#: 語頭に余分が付いているかどうかが関係しない**。「りんご」に対する
+#: 「ラリンゴ」は韻としては「リンゴ」と同じ扱いでよく、包含を足すと
+#: `coda` と競合して語尾の弱い包含語が混ざる。
+#:
+#: **0.06 は「上位に入るが埋め尽くさない」線。** 包含候補は編集距離を 1.0 と
+#: 見るので (`_score_candidates`)、この重みは丸ごと上乗せになる。5 クエリ x
+#: 上位 8 件での包含語の件数:
+#:
+#:     containment  0.04  0.06  0.08  0.10
+#:     りんご        2/8   4/8   5/8   7/8
+#:     科学         2/8   2/8   3/8   5/8
+#:
+#: 0.10 では「クリンゴン語」「グリンゴッツ」のような稀語が本来の近傍
+#: (リンボ・ディンゴ) を押し出し、0.04 では「科学」の包含語が 4 位より下に
+#: しか来ない。稀語が上位に残ること自体は `familiarity` が抑える
+#: (実測で「微倫吾」0.50・「カワテブクロ」0.55)。
 PRESETS: dict[str, ScoreWeights] = {
     "pun": ScoreWeights(
-        phoneme=0.50, embedding=0.15, mora=0.05, coda=0.10, vowel=0.05, familiarity=0.15
+        phoneme=0.50,
+        embedding=0.15,
+        mora=0.05,
+        coda=0.10,
+        vowel=0.05,
+        familiarity=0.15,
+        containment=0.06,
     ),
     "rhyme": ScoreWeights(
         phoneme=0.20, embedding=0.10, mora=0.10, coda=0.35, vowel=0.20, familiarity=0.05
     ),
     "mishearing": ScoreWeights(
-        phoneme=0.65, embedding=0.20, mora=0.10, coda=0.03, vowel=0.02, familiarity=0.00
+        phoneme=0.65,
+        embedding=0.20,
+        mora=0.10,
+        coda=0.03,
+        vowel=0.02,
+        familiarity=0.00,
+        containment=0.06,
     ),
 }
 
@@ -201,6 +243,9 @@ class SearchResult:
     coda_similarity: float
     #: 母音列 (韻) の一致度。
     vowel_similarity: float
+    #: クエリの音が完全な形で入っている度合い (`distance.containment_ratio`)。
+    #: 含まないなら 0.0、含むならクエリが候補の音素列に占める割合。
+    containment: float
     mora_count: int
     pos: str
     category: Category
@@ -244,6 +289,7 @@ class _ScoredCandidates:
     coda: np.ndarray
     vowel: np.ndarray
     familiarity: np.ndarray
+    containment: np.ndarray
 
     @property
     def count(self) -> int:
@@ -349,12 +395,49 @@ class PhoneticSearcher:
         if rows.size == 0:
             return pronunciation, []
 
+        # 包含候補を拾う。既定経路では**候補生成に合流させる** — 包含は
+        # phonetic 空間の近さと相関しないので Top-K に入らない
+        # (`_containment` 参照)。範囲指定の経路では母集団が既に区間の全行なので
+        # 合流させる先がなく、占有率を配るだけでよい。
+        containment_rows, containment_ratios = (
+            self._containment(pronunciation)
+            if active_weights.containment > 0.0
+            else (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32))
+        )
+
+        if bounds is not None and containment_rows.size:
+            # **区間の外へは出さない。** 呼び出し側がモーラ範囲を明示している
+            # 経路なので、包含だからといって範囲外の語を返してよい理由がない。
+            # 下流も `rows` が区間の `arange` であることを前提にしている
+            # (`_apply_cheap_filters` と `_space_scores` のスライス読み)。
+            inside = (containment_rows >= bounds[0]) & (containment_rows < bounds[1])
+            containment_rows = containment_rows[inside]
+            containment_ratios = containment_ratios[inside]
+
         rows, embedding_scores = self._apply_cheap_filters(
             rows,
             embedding_scores,
             pronunciation,
             categories,
             bounds=bounds,
+        )
+
+        if bounds is None and containment_rows.size:
+            # 合流させる行にも同じ条件を掛ける。合流をカテゴリフィルタの後に
+            # 置くのは、前だと全走査経路のスライス読みが崩れるため。
+            containment_rows, containment_ratios = self._apply_cheap_filters(
+                containment_rows,
+                containment_ratios,
+                pronunciation,
+                categories,
+                # モーラ帯を適用しない。包含は余分の多さが本質なので、帯で切ると
+                # 「りんご」に対する「リンゴジュース」(6 モーラ) が落ちる。歯止めは
+                # 占有率がスコア側で掛ける減点のほう。
+                apply_mora_gap=False,
+            )
+
+        rows, embedding_scores, containment = self._merge_containment(
+            rows, embedding_scores, containment_rows, containment_ratios
         )
         if rows.size == 0:
             return pronunciation, []
@@ -379,6 +462,7 @@ class PhoneticSearcher:
         scored = self._score_candidates(
             rows=rows,
             embedding_scores=embedding_scores,
+            containment=containment,
             pronunciation=pronunciation,
             query_vectors=query_vectors,
             weights=active_weights,
@@ -540,6 +624,46 @@ class PhoneticSearcher:
         )
         return self._expand_groups(groups, scores)
 
+    def _containment(self, pronunciation: Pronunciation) -> tuple[np.ndarray, np.ndarray]:
+        """クエリを完全な形で含むグループを索引全体から拾い、行に展開する。
+
+        戻り値は (行, 占有率)。行は昇順。
+
+        **候補生成に合流させる経路**であって、後段のフィルタではない。包含は
+        phonetic 空間の近さと相関しないので、Top-K に入った候補を絞るだけでは
+        拾えない — 実測で「りんご」を含む 204 グループのうち Top-8000 に入るのは
+        48 件、モーラ帯に限っても 123 件のうち 48 件しかなかった。だから
+        `_scan_candidates` と同じく候補生成そのものを足す。
+
+        **モーラ帯 (`_MAX_MORA_GAP`) の外も拾う。** 包含は「余分がどれだけ
+        付いているか」が本質なので、帯で切ると長い複合語が落ちる (「りんご」
+        3 モーラに対する「リンゴジュース」6 モーラ)。代わりに占有率が余分の
+        多さを減点するので、帯の代わりの歯止めはスコア側にある。
+
+        走査は索引全体の音素 CSR (full で 17MB / 146 万グループ) に対して行い、
+        **実測 5.4〜7.6ms** (load 6、15 回の最小値)。既定経路の内積 (4ms) と
+        同程度だが、**検索全体では埋もれる** — 8 クエリの中央値が包含あり
+        20.3ms・なし 20.3ms で差が出なかった。rayon が走査を並列化するので、
+        rerank と結果の実体化に隠れる。
+
+        **1 グループを 1 タスクにしてはいけない。** 最初そう書いたら同じ走査が
+        19〜37ms かかった (rayon のスケジューリングが支配的)。1 件の判定は音素
+        12 個の比較で数十ナノ秒しかないので、8192 件ずつの塊にする
+        (`rust/src/lib.rs` の `containment_scan`)。
+        """
+        blob, bounds, distance_ids = self.store.phoneme_csr
+        groups, ratios = containment_scan(
+            phoneme_ids(pronunciation.phonemes),
+            blob,
+            bounds,
+            distance_ids,
+            0,
+            self.store.group_count,
+        )
+        if groups.size == 0:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        return self._expand_groups(groups, ratios)
+
     def _expand_groups(
         self, groups: np.ndarray, scores: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -605,6 +729,42 @@ class PhoneticSearcher:
         scores = group_scores[self.store.group_ids[start:end] - group_start]
         return rows, scores
 
+    def _merge_containment(
+        self,
+        rows: np.ndarray,
+        embedding_scores: np.ndarray,
+        containment_rows: np.ndarray,
+        containment_ratios: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """既定経路の候補と包含候補の和集合を取り、行ごとの占有率を並べる。
+
+        戻り値は (行, 内積スコア, 占有率) で、行は昇順。**昇順は後段の前提**
+        (`_group_representatives` と `_space_scores` が隣接比較で重複を畳む)。
+
+        包含だけで拾われた行には内積スコアが無い。改めて引くと 1 行ごとの
+        fancy indexing が増えるので、**0.0 を入れて `embedding` 成分を捨てる**。
+        包含候補は占有率と編集距離で評価されるべきもので、内積の値は
+        `_top_candidates` が既に「上位ではない」と判定している。
+        """
+        if containment_rows.size == 0:
+            return rows, embedding_scores, np.zeros(rows.size, dtype=np.float32)
+        if rows.size == 0:
+            return (
+                containment_rows,
+                np.zeros(containment_rows.size, dtype=embedding_scores.dtype),
+                containment_ratios,
+            )
+
+        merged = np.union1d(rows, containment_rows)
+        # 既定経路の内積スコアを新しい並びに配る。`rows` は昇順なので
+        # `searchsorted` が使える。
+        positions = np.searchsorted(merged, rows)
+        scores = np.zeros(merged.size, dtype=embedding_scores.dtype)
+        scores[positions] = embedding_scores
+        containment = np.zeros(merged.size, dtype=np.float32)
+        containment[np.searchsorted(merged, containment_rows)] = containment_ratios
+        return merged, scores, containment
+
     def _apply_cheap_filters(
         self,
         rows: np.ndarray,
@@ -613,12 +773,17 @@ class PhoneticSearcher:
         categories: Iterable[Category] | None,
         *,
         bounds: tuple[int, int] | None = None,
+        apply_mora_gap: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
         """編集距離の前に、配列演算で済む条件で候補を削る。
 
         `bounds` は全走査経路の連続区間。渡されたときは `rows` がその区間の
         `arange` そのものなので、列配列をスライスで読める (97 万行の
         fancy indexing を 1 回省く)。
+
+        `apply_mora_gap=False` はモーラ差の安全網を外す。包含候補
+        (`_containment`) だけが通る — あちらは余分の多さを占有率で減点するので、
+        帯で切る必要がない。
         """
         wanted = tuple(categories) if categories is not None else tuple(DEFAULT_CATEGORIES)
         wanted_ids = [self.store.category_id(c) for c in wanted]
@@ -640,7 +805,7 @@ class PhoneticSearcher:
         # ただしこれは ANN の候補生成が粗いことを補う安全網なので、呼び出し側が
         # モーラ範囲を明示したとき (`bounds` あり) は適用しない。3 モーラの
         # クエリに 7 モーラを要求すると、ギャップ 4 で全件落ちてしまう。
-        if bounds is None:
+        if bounds is None and apply_mora_gap:
             gap = np.abs(self._mora_counts[rows].astype(np.int32) - pronunciation.mora_count)
             keep &= gap <= self._MAX_MORA_GAP
 
@@ -653,6 +818,7 @@ class PhoneticSearcher:
         *,
         rows: np.ndarray,
         embedding_scores: np.ndarray,
+        containment: np.ndarray,
         pronunciation: Pronunciation,
         query_vectors: dict[str, np.ndarray],
         weights: ScoreWeights,
@@ -684,6 +850,7 @@ class PhoneticSearcher:
             + weights.coda * coda
             + weights.vowel * vowel
             + weights.familiarity * familiarity
+            + weights.containment * containment
         )
 
         # 編集距離だけは候補数に対して重い (53 万件で 48ms、他の成分の合計の
@@ -694,6 +861,7 @@ class PhoneticSearcher:
             partial = partial[survivors]
             coda, vowel = coda[survivors], vowel[survivors]
             embedding, familiarity = embedding[survivors], familiarity[survivors]
+            containment = containment[survivors]
 
         # 編集距離は残った候補を 1 度の DP でまとめて計算する。索引の CSR を
         # Rust にそのまま渡すのでパディング行列を組む処理が不要になり、
@@ -707,6 +875,22 @@ class PhoneticSearcher:
             if missing.size:
                 phonetic[missing] = self._phonetic_scores(rows[missing], query_ids)
 
+        # 包含が成立した候補は編集距離を 1.0 と見る。**同じ「余分」を 2 つの
+        # 成分が二重に数えるのを避けるため。** クエリが完全な形で入っている以上
+        # 一致部分の距離は 0 で、距離が減っているのは余分ぶんだけ。その余分は
+        # `containment` の占有率がすでに減点している。
+        #
+        # 二重に数えると加点が打ち消される。実測で「りんご」->「ラリンゴ」は
+        # 占有率 0.714 で +0.093 得るのに、編集距離が 0.735 と非包含語
+        # (0.93〜0.98) より低くて -0.087 失い、重みを 0.25 まで上げないと
+        # 順位が動かなかった。**重みで押すのではなく役割を分ける** —
+        # 一致したかどうかは `phonetic`、余分の多寡は `containment` が持つ。
+        #
+        # `_survivors` の枝刈りは `weights.phoneme` を距離の上限として使うので、
+        # 1.0 に固定してもその上限をちょうど達成するだけで、順位の保証は崩れない。
+        if weights.containment > 0.0:
+            phonetic = np.where(containment > 0.0, 1.0, phonetic)
+
         scores = partial + weights.phoneme * phonetic
 
         return _ScoredCandidates(
@@ -717,6 +901,7 @@ class PhoneticSearcher:
             coda=coda,
             vowel=vowel,
             familiarity=familiarity,
+            containment=containment,
         )
 
     def _survivors(
@@ -943,6 +1128,7 @@ class PhoneticSearcher:
                     embedding_similarity=round(float(scored.embedding[position]), 4),
                     coda_similarity=round(float(scored.coda[position]), 4),
                     vowel_similarity=round(float(scored.vowel[position]), 4),
+                    containment=round(float(scored.containment[position]), 4),
                     mora_count=entry.mora_count,
                     pos=entry.pos,
                     category=entry.category,

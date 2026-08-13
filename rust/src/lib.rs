@@ -186,6 +186,157 @@ fn edit_distance_csr<'py>(
     Ok(PyArray1::from_vec(py, distances))
 }
 
+/// クエリの音素列を「完全な形で」含むグループを索引全体から拾う。
+///
+/// 編集距離では表現できない性質を測るために別の経路にしてある。距離は挿入を
+/// 一律に減点するので、クエリを丸ごと含む語 (riNgo in riNgoku、類似度 0.735) が
+/// 1 音素だけ違う同じ長さの語 (riNbo、0.933) に必ず負ける。「入っているかどうか」は
+/// 連続一致という離散的な性質なので、距離の重みを緩めて近似するのではなく
+/// 判定として持つ。
+///
+/// **特殊モーラ (長音・促音・撥音) の挿入だけは無料。** 「リンゴー」「リンゴッ」は
+/// 音として riNgo を完全に含んでいるが、記号列としては一致しない。この 3 つは
+/// 単独で音素を成さず後続や前続の伸縮として実現するので、挿入されていても
+/// 「元の音が完全な形で入っている」という感覚は保たれる。それ以外の音素が
+/// 挟まれば別の音になるので即失敗させる。
+///
+/// 返すのは (グループ ID, 占有率)。占有率はクエリの音素数を候補の音素数で
+/// 割った値で、余分が多い語ほど下がる。`riNgo` は `riNgoku` (7 音素) で 0.71、
+/// `riNgojuRsu` (10 音素) で 0.50。長い地名がクエリを含むだけで上位に来るのを
+/// 抑える。**一致に消費した長さではなく候補全体の長さで割る** — 分母を一致長に
+/// すると特殊モーラを挟んだ語が 1.0 になり、余分の多寡が消える。
+///
+/// 走査は索引の音素 CSR 全体に対して行う。**候補生成の Top-K では拾えない** —
+/// 実測で「りんご」を含む 204 グループのうち phonetic 空間の Top-8000 に
+/// 入るのは 48 件しかない。モーラ帯に限っても 123 件のうち 48 件で、
+/// 包含は phonetic 空間の近さと相関しないため。
+#[pyfunction]
+fn containment_scan<'py>(
+    py: Python<'py>,
+    query_ids: PyReadonlyArray1<'py, i32>,
+    phoneme_ids: PyReadonlyArray1<'py, u8>,
+    phoneme_bounds: PyReadonlyArray1<'py, i32>,
+    distance_ids: PyReadonlyArray1<'py, i32>,
+    // 特殊モーラ (長音・促音・撥音) の距離テーブル ID。挿入を無料にする対象。
+    elastic_ids: PyReadonlyArray1<'py, i32>,
+    group_start: usize,
+    group_end: usize,
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
+    let query = query_ids.as_slice()?;
+    let phoneme_ids = phoneme_ids.as_slice()?;
+    let bounds = phoneme_bounds.as_slice()?;
+    let distance_ids = distance_ids.as_slice()?;
+    let elastic = elastic_ids.as_slice()?;
+
+    if query.is_empty() || group_start >= group_end {
+        return Ok((
+            PyArray1::from_vec(py, Vec::new()),
+            PyArray1::from_vec(py, Vec::new()),
+        ));
+    }
+
+    let (groups, ratios) = py.detach(|| {
+        // 索引 ID のまま比較できるよう、クエリを索引側の ID に写しておく。
+        // 内側のループで `distance_ids` を引かずに済む (索引の音素語彙は 37 個
+        // しかないので、逆引き表は真偽配列 1 本で足りる)。
+        //
+        // 索引の語彙に無い音素をクエリが含むなら、その音素は索引のどの語にも
+        // 現れないので包含は成立しない。写せない時点で空を返す。
+        // 添字は距離テーブルの ID なので、索引語彙数ではなくその最大値で取る。
+        let table_size = distance_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        let mut index_of: Vec<Option<u8>> = vec![None; table_size];
+        let mut is_elastic = vec![false; distance_ids.len()];
+        for (index, &id) in distance_ids.iter().enumerate() {
+            index_of[id as usize] = Some(index as u8);
+            if elastic.contains(&id) {
+                is_elastic[index] = true;
+            }
+        }
+        let mut needle: Vec<u8> = Vec::with_capacity(query.len());
+        for &qp in query {
+            match index_of.get(qp as usize).copied().flatten() {
+                Some(id) => needle.push(id),
+                None => return (Vec::new(), Vec::new()),
+            }
+        }
+
+        // **グループ 1 件を 1 タスクにしてはいけない。** 1 件の判定は音素 12 個
+        // 程度の比較で数十ナノ秒しかないので、rayon のスケジューリングが
+        // 支配的になる。編集距離側 (`compute`) と同じ理由で塊にする。
+        const CHUNK: usize = 8192;
+
+        let total = group_end - group_start;
+        (0..total.div_ceil(CHUNK))
+            .into_par_iter()
+            .map(|chunk| {
+                let first = group_start + chunk * CHUNK;
+                let last = (first + CHUNK).min(group_end);
+                let mut groups: Vec<i64> = Vec::new();
+                let mut ratios: Vec<f32> = Vec::new();
+                for group in first..last {
+                    let start = bounds[group] as usize;
+                    let end = bounds[group + 1] as usize;
+                    let candidate = &phoneme_ids[start..end];
+                    if candidate.len() < needle.len() {
+                        continue;
+                    }
+                    // 開始位置を総当たりする。クエリの先頭音素と一致する位置だけ
+                    // 試す。特殊モーラの挿入を許すので一致は needle.len() より
+                    // 長くなりうるが、開始位置の上限を
+                    // candidate.len() - needle.len() で切ってよい — それより
+                    // 後ろから始めても残りが足りない。
+                    for offset in 0..=(candidate.len() - needle.len()) {
+                        if candidate[offset] != needle[0] {
+                            continue;
+                        }
+                        let mut position = offset;
+                        let mut matched = 0usize;
+                        while matched < needle.len() && position < candidate.len() {
+                            let symbol = candidate[position];
+                            if symbol == needle[matched] {
+                                matched += 1;
+                                position += 1;
+                            } else if matched > 0 && is_elastic[symbol as usize] {
+                                // 途中に挟まった特殊モーラは飛ばす。先頭より前の
+                                // 特殊モーラは開始位置の走査が担うので、ここでは
+                                // matched > 0 のときだけ許す。
+                                position += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if matched == needle.len() {
+                            groups.push(group as i64);
+                            ratios.push(needle.len() as f32 / candidate.len() as f32);
+                            break;
+                        }
+                    }
+                }
+                (groups, ratios)
+            })
+            // **チャンクの順に連結する。** `collect` は入力の順序を保つので
+            // グループ ID が昇順で返る。`reduce` は結合順が実行ごとに変わりうる
+            // ので使えない — 呼び出し側 (`search._expand_groups`) が行の昇順を
+            // 前提にしており、崩れると同音異表記の畳み込みが黙って別のグループの
+            // 値を配る。
+            .collect::<Vec<(Vec<i64>, Vec<f32>)>>()
+            .into_iter()
+            .fold(
+                (Vec::new(), Vec::new()),
+                |mut all: (Vec<i64>, Vec<f32>), part| {
+                    all.0.extend(part.0);
+                    all.1.extend(part.1);
+                    all
+                },
+            )
+    });
+
+    Ok((
+        PyArray1::from_vec(py, groups),
+        PyArray1::from_vec(py, ratios),
+    ))
+}
+
 /// 候補方向を rayon で並列化して距離を出す。
 ///
 /// 候補ごとの DP は互いに独立なので分割の仕方を選ぶ必要がない。DP の作業配列だけ
@@ -236,6 +387,7 @@ fn compute(
 fn jpr_distance(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(edit_distance_batch, module)?)?;
     module.add_function(wrap_pyfunction!(edit_distance_csr, module)?)?;
+    module.add_function(wrap_pyfunction!(containment_scan, module)?)?;
     module.add_function(wrap_pyfunction!(gemv::top_candidates, module)?)?;
     module.add_function(wrap_pyfunction!(gemv::dot_all, module)?)?;
     Ok(())

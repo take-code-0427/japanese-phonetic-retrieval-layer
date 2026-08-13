@@ -9,9 +9,12 @@ from jpr.distance import (
     _ALL_PHONEMES,
     _IPA,
     PAD_ID,
+    PHONEME_TO_ID,
     SUBSTITUTION_COSTS,
     WORST_SUBSTITUTION_COST,
     align_phonemes,
+    containment_ratio,
+    containment_scan,
     edit_distance_batch,
     edit_distance_csr,
     ipa_transcription,
@@ -216,6 +219,127 @@ def test_csr_matches_padded_path() -> None:
     )
     expected = [weighted_edit_distance(analyze_reading("チクビ").phonemes, p) for p in candidates]
     assert actual == pytest.approx(expected, abs=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("query", "candidate", "expected"),
+    [
+        # 完全一致は占有率 1.0。
+        ("リンゴ", "リンゴ", 1.0),
+        # 語頭・語末・両端の余分。
+        ("リンゴ", "リンゴク", 5 / 7),
+        ("リンゴ", "ゴリンゴ", 5 / 7),
+        ("リンゴ", "アオリンゴ", 5 / 7),
+        # 余分が多いほど占有率が下がる。
+        ("リンゴ", "リンゴジュース", 5 / 10),
+        # 特殊モーラの挿入は「完全な形」を壊さない。
+        ("リンゴ", "リンゴー", 5 / 6),
+        ("カガク", "カンガク", 6 / 7),
+        # 特殊モーラ以外が挟まれば別の音。
+        ("リンゴ", "リンボ", 0.0),
+        ("リンゴ", "レンゴ", 0.0),
+        ("リンゴ", "リンガゴ", 0.0),
+        # 候補のほうが短ければ含みようがない。
+        ("リンゴ", "リン", 0.0),
+    ],
+)
+def test_containment_ratio(query: str, candidate: str, expected: float) -> None:
+    """包含判定は連続一致 + 特殊モーラの伸縮だけを許す。
+
+    編集距離では表現できない性質なので独立した成分にしてある
+    (`search.ScoreWeights.containment`)。距離は挿入を一律に減点するため、
+    クエリを丸ごと含む語が 1 音素だけ違う同じ長さの語に必ず負ける。
+    """
+    ratio = containment_ratio(analyze_reading(query).phonemes, analyze_reading(candidate).phonemes)
+    assert ratio == pytest.approx(expected)
+
+
+def test_containment_scan_matches_the_symbolic_reference() -> None:
+    """Rust の走査と記号版の判定が一致する。**検索が通るのは Rust 側。**
+
+    記号版 (`containment_ratio`) が基準で、走査はそれを索引全体に対して
+    並列に回すもの。索引 ID から距離テーブル ID への写像を挟むので、
+    そこがずれると包含が黙って成立しなくなる (加点が消えるだけで例外に
+    ならないため、テストでしか捕まらない)。
+    """
+    words = [
+        "リンゴ",
+        "リンゴク",
+        "ゴリンゴ",
+        "リンゴー",
+        "リンゴジュース",
+        "リンボ",
+        "レンゴ",
+        "リン",
+        "カンガク",
+        "アオリンゴ",
+    ]
+    candidates = [analyze_reading(w).phonemes for w in words]
+    query = analyze_reading("リンゴ").phonemes
+
+    blob: list[int] = []
+    bounds = np.zeros(len(candidates) + 1, dtype=np.int32)
+    for row, phonemes in enumerate(candidates):
+        blob.extend(int(i) for i in phoneme_ids(phonemes))
+        bounds[row + 1] = len(blob)
+    identity = np.arange(SUBSTITUTION_COSTS.shape[0], dtype=np.int32)
+
+    groups, ratios = containment_scan(
+        phoneme_ids(query),
+        np.array(blob, dtype=np.uint8),
+        bounds,
+        identity,
+        0,
+        len(candidates),
+    )
+
+    actual = dict(zip(groups.tolist(), ratios.tolist(), strict=True))
+    for row, phonemes in enumerate(candidates):
+        expected = containment_ratio(query, phonemes)
+        if expected > 0.0:
+            assert actual[row] == pytest.approx(expected, abs=1e-6), words[row]
+        else:
+            assert row not in actual, words[row]
+
+
+def test_containment_scan_matches_on_random_inputs() -> None:
+    """ランダムな音素列でも両実装が一致する。
+
+    手で選んだ対では特殊モーラの飛ばしが絡む経路 (途中で失敗して開始位置を
+    やり直す場合) を網羅できない。長短を混ぜた乱数で突き合わせる。
+    """
+    rng = np.random.default_rng(20260813)
+    symbols = sorted(PHONEME_TO_ID)
+
+    for _ in range(200):
+        query = tuple(rng.choice(symbols, size=int(rng.integers(1, 6))))
+        count = int(rng.integers(1, 30))
+        candidates = [
+            tuple(rng.choice(symbols, size=int(rng.integers(1, 12)))) for _ in range(count)
+        ]
+
+        blob: list[int] = []
+        bounds = np.zeros(count + 1, dtype=np.int32)
+        for row, phonemes in enumerate(candidates):
+            blob.extend(int(i) for i in phoneme_ids(phonemes))
+            bounds[row + 1] = len(blob)
+        identity = np.arange(SUBSTITUTION_COSTS.shape[0], dtype=np.int32)
+
+        groups, ratios = containment_scan(
+            phoneme_ids(query),
+            np.array(blob, dtype=np.uint8),
+            bounds,
+            identity,
+            0,
+            count,
+        )
+        actual = dict(zip(groups.tolist(), ratios.tolist(), strict=True))
+        for row, phonemes in enumerate(candidates):
+            expected = containment_ratio(query, phonemes)
+            if expected > 0.0:
+                assert actual[row] == pytest.approx(expected, abs=1e-6), (query, phonemes)
+            else:
+                assert row not in actual, (query, phonemes)
 
 
 def test_batch_handles_empty_query_and_no_candidates() -> None:

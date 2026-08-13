@@ -184,6 +184,19 @@ function familiarityMeter(value) {
   return wrap;
 }
 
+/** 包含の印。クエリの音がこの語に完全な形で入っていることを示す。
+ *
+ * **占有率を数値で出さない。** 意味は「クエリが語全体の何割を占めるか」で、
+ * 読み手が知りたいのは「入っているかどうか」と「余分がどれだけあるか」。
+ * 後者は読み (`result.reading`) を見れば直接わかるので、数値は title に置く。 */
+function containmentTag(ratio) {
+  const tag = document.createElement("span");
+  tag.className = "tag is-contained";
+  tag.textContent = "音が丸ごと入る";
+  tag.title = `クエリの音がこの語の ${Math.round(ratio * 100)}% を占める`;
+  return tag;
+}
+
 /** スコア棒の長さ。結果内の最小〜最大に張り直す。
  *
  * 音韻スコアは上位が 0.90〜0.98 に密集するので、0〜1 をそのまま幅に写すと
@@ -251,7 +264,13 @@ function resultRow(result, queryPhonemes, rank, range) {
   const category = document.createElement("span");
   category.className = "tag";
   category.textContent = CATEGORY_LABELS[result.category] || result.category;
-  tags.append(category, familiarityMeter(result.familiarity));
+  tags.append(category);
+  // クエリの音が完全な形で入っている語には印を出す。**カードの中で一番
+  // 説明が要る性質**なので、他のタグと同じ地味さでは見つけられない。
+  if (result.containment) {
+    tags.append(containmentTag(result.containment));
+  }
+  tags.append(familiarityMeter(result.familiarity));
 
   button.append(head, bar, wordCell, tags);
   li.append(button);

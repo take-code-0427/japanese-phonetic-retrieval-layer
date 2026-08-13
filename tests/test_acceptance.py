@@ -117,10 +117,18 @@ def test_mora_range_reaches_words_the_ann_cannot(real_searcher: PhoneticSearcher
     この経路が存在する理由そのもの。ANN の候補生成は phonetic 空間の Top-K
     なので、モーラ数の違う語は近傍に入らない。「乳首」(3 モーラ) に対して
     5 モーラの語は、候補数を 20000 に増やしても 1 件も上位に来なかった。
+
+    **包含経路 (`_containment`) で届く語だけは例外。** あちらは音素列を索引
+    全体で走査するのでモーラ帯を越えるが、拾えるのは「クエリを完全な形で
+    含む語」(乳首券 = チクビケン) に限られる。それ以外の 5 モーラ語 —
+    「筑前煮」のような音が近いだけの語 — は今も届かないので、範囲指定が
+    要る理由は変わっていない。
     """
     _, plain = real_searcher.search("乳首", limit=100, candidates=20_000)
-    assert not any(r.mora_count == 5 for r in plain), (
-        "ANN 経路で 5 モーラ語が届くなら、この機能の前提が変わっている"
+    stray = [r for r in plain if r.mora_count == 5 and not r.containment]
+    assert not stray, (
+        "包含以外の経路で 5 モーラ語が届くなら、この機能の前提が変わっている: "
+        f"{[r.surface for r in stray]}"
     )
 
     _, ranged = real_searcher.search("乳首", min_mora=5, max_mora=5, limit=50)
@@ -389,6 +397,10 @@ def test_mora_band_only_drops_rows_the_filter_would_reject(
     (実測で「乳首」の 8 位が 低み 0.8914 -> シクベ 0.8818 に落ちた)。帯は
     取りこぼしを減らす方向に働くので、対照に取れるのは「結果の全件がそもそも
     帯の中にある」ことのほう。
+
+    **包含候補 (`_containment`) だけは帯の外から来る。** あちらは音素列を索引
+    全体で走査するので帯を無視し、代わりに占有率が余分の多さを減点する。
+    帯の主張はこの経路を除いた分について立てる。
     """
     searcher = PhoneticSearcher(real_store)
     pronunciation, results = searcher.search(query, limit=30, preset=preset)
@@ -396,7 +408,127 @@ def test_mora_band_only_drops_rows_the_filter_would_reject(
 
     gap = searcher._MAX_MORA_GAP
     for result in results:
+        if result.containment:
+            continue
         assert abs(result.mora_count - pronunciation.mora_count) <= gap, result
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # 語頭に余分が付く形 (axxx)。
+        ("りんご", "ラリンゴ"),
+        # 語末に余分が付く形 (xxxbbb)。
+        ("科学", "外科学"),
+        # 両端に余分が付く形。
+        ("電話", "エア電話"),
+    ],
+)
+def test_containment_reaches_words_the_top_k_cannot(
+    real_searcher: PhoneticSearcher,
+    query: str,
+    expected: str,
+) -> None:
+    """クエリを完全な形で含む語が上位に来る。**この機能の存在理由。**
+
+    2 つのことを同時に主張している。
+
+    1. **候補生成の Top-K では拾えない。** 包含は phonetic 空間の近さと
+       相関しないので、`candidates` をいくら増やしても届かない (実測で
+       「りんご」を含む 204 グループのうち Top-8000 に入るのは 48 件、
+       モーラ帯に限っても 123 件のうち 48 件)。だから `_containment` は
+       後段のフィルタではなく候補生成そのものを足している。
+    2. **編集距離の重みでは代わりにならない。** 距離は挿入を一律に減点する
+       ので、包含語 (riNgo in rariNgo で 0.735) が 1 音素だけ違う同じ長さの語
+       (riNbo で 0.933) に必ず負ける。
+    """
+    _, results = real_searcher.search(query, limit=10)
+    surfaces = [r.surface for r in results]
+    assert expected in surfaces, f"包含語が上位 10 件に入らない: {surfaces}"
+
+    # 包含として認識されている (偶然音が近くて上がったのではない)。
+    found = next(r for r in results if r.surface == expected)
+    assert found.containment > 0.0
+
+    # 重みを切ると届かなくなる = Top-K だけでは拾えていない。
+    weights = search_module.PRESETS["pun"]
+    without = search_module.ScoreWeights(
+        phoneme=weights.phoneme,
+        embedding=weights.embedding,
+        mora=weights.mora,
+        coda=weights.coda,
+        vowel=weights.vowel,
+        familiarity=weights.familiarity,
+        containment=0.0,
+    )
+    _, plain = real_searcher.search(query, limit=10, weights=without, candidates=20_000)
+    assert expected not in [r.surface for r in plain], (
+        "包含の重みなしで届くなら、この経路の前提が変わっている"
+    )
+
+
+def test_containment_does_not_double_count_the_surplus(
+    real_searcher: PhoneticSearcher,
+) -> None:
+    """包含した候補の編集距離は 1.0 になる (`_score_candidates`)。
+
+    同じ「余分」を `phonetic` と `containment` が二重に数えると加点が
+    打ち消される。実測で「りんご」->「ラリンゴ」は占有率 0.714 で +0.093
+    得るのに、編集距離が 0.735 と非包含語 (0.93〜0.98) より低くて -0.087
+    失い、重みを 0.25 まで上げないと順位が動かなかった。**役割を分けて
+    いる** — 一致したかどうかは `phonetic`、余分の多寡は `containment`。
+    """
+    _, results = real_searcher.search("りんご", limit=20)
+    contained = [r for r in results if r.containment]
+    assert contained, "包含語が 1 件も上位に来ていない"
+    for result in contained:
+        assert result.phonetic_similarity == 1.0, result
+
+
+def test_containment_is_scaled_by_how_much_of_the_word_it_covers(
+    real_searcher: PhoneticSearcher,
+) -> None:
+    """占有率が余分の多さを減点する。
+
+    一律 1.0 にすると、短いクエリを含む長い地名や複合語が同じ強さで上がる。
+    分母は**候補全体の音素数**で、一致に消費した長さではない (そちらにすると
+    特殊モーラを挟んだ語が 1.0 になり、余分の多寡が消える)。
+    """
+    _, results = real_searcher.search("電話", limit=50)
+    contained = {r.surface: r for r in results if r.containment}
+    assert "エア電話" in contained and "テレビ電話" in contained
+
+    # エアデンワ (7 音素) は 5/7、テレビデンワ (11 音素) は 5/11。
+    assert contained["エア電話"].containment > contained["テレビ電話"].containment
+
+
+def test_containment_stays_inside_an_explicit_mora_range(
+    real_searcher: PhoneticSearcher,
+) -> None:
+    """モーラ範囲を明示したら包含も範囲の外へ出ない。
+
+    包含はモーラ帯 (`_MAX_MORA_GAP`) を無視するが、それは「安全網が候補生成の
+    粗さを補うためのもの」だから。呼び出し側が範囲を明示した経路では意図が
+    あるので、包含だからといって範囲外を返してよい理由がない。
+    """
+    _, results = real_searcher.search("科学", min_mora=4, max_mora=4, limit=50)
+    assert results
+    assert all(r.mora_count == 4 for r in results)
+    # 4 モーラの包含語 (カガクブ・ゲカガク など) は範囲内なので届く。
+    assert any(r.containment for r in results)
+
+
+def test_rhyme_does_not_use_containment(real_searcher: PhoneticSearcher) -> None:
+    """rhyme プリセットは包含を見ない。
+
+    韻は語尾の一致を見るので、語頭に余分が付いているかどうかが関係しない。
+    「りんご」に対する「ラリンゴ」は韻としては「リンゴ」と同じ扱いでよく、
+    包含を足すと `coda` と競合して語尾の弱い包含語が混ざる。
+    """
+    assert search_module.PRESETS["rhyme"].containment == 0.0
+    _, results = real_searcher.search("りんご", limit=20, preset="rhyme")
+    assert results
+    assert all(r.containment == 0.0 for r in results)
 
 
 # ---------- 分割合成 (空耳) ----------

@@ -486,6 +486,85 @@ def edit_distance_csr(
     )
 
 
+#: 包含判定で挿入を無料にする音素 (長音・促音・撥音)。
+#:
+#: この 3 つは単独で音素を成さず、前続や後続の伸縮として実現する。「リンゴー」
+#: 「リンゴッ」は記号列としては riNgo と一致しないが、音としては riNgo を
+#: 完全に含んでいる。それ以外の音素が挟まれば別の音になるので許さない。
+ELASTIC_PHONEMES = (LONG, GEMINATE, MORAIC_N)
+
+_ELASTIC_IDS = np.array([PHONEME_TO_ID[symbol] for symbol in ELASTIC_PHONEMES], dtype=np.int32)
+
+
+def containment_ratio(query: tuple[str, ...], candidate: tuple[str, ...]) -> float:
+    """`candidate` が `query` を完全な形で含むなら占有率、含まないなら 0.0。
+
+    **編集距離では表現できない性質**を測る。距離は挿入を一律に減点するので、
+    クエリを丸ごと含む語 (riNgo in riNgoku、類似度 0.735) が 1 音素だけ違う
+    同じ長さの語 (riNbo、0.933) に必ず負ける。「入っているかどうか」は連続一致
+    という離散的な性質なので、距離の重みを緩めて近似するのではなく判定として持つ。
+
+    占有率はクエリの音素数を**候補全体の音素数**で割った値。余分が多い語ほど
+    下がるので、短いクエリを含む長い地名が上位に来るのを抑える。分母を
+    「一致に消費した長さ」にすると特殊モーラを挟んだ語が 1.0 になり、余分の
+    多寡が消えてしまう。
+
+    特殊モーラの挿入だけは無料 (`ELASTIC_PHONEMES`)。
+
+    **Rust 版 (`containment_scan`) と同じ判定を返さなければならない**
+    (`tests/test_distance.py` が対応を検証する)。こちらは記号のまま書いた
+    参照実装で、検索が通るのは Rust 側。
+    """
+    if not query or len(candidate) < len(query):
+        return 0.0
+    elastic = frozenset(ELASTIC_PHONEMES)
+    for offset in range(len(candidate) - len(query) + 1):
+        if candidate[offset] != query[0]:
+            continue
+        matched = 0
+        position = offset
+        while matched < len(query) and position < len(candidate):
+            symbol = candidate[position]
+            if symbol == query[matched]:
+                matched += 1
+                position += 1
+            elif matched > 0 and symbol in elastic:
+                # 途中に挟まった特殊モーラは飛ばす。先頭より前の特殊モーラは
+                # 開始位置の走査が担うので、ここでは matched > 0 のときだけ許す。
+                position += 1
+            else:
+                break
+        if matched == len(query):
+            return len(query) / len(candidate)
+    return 0.0
+
+
+def containment_scan(
+    query_ids: np.ndarray,
+    phoneme_ids_blob: np.ndarray,
+    phoneme_bounds: np.ndarray,
+    distance_ids: np.ndarray,
+    group_start: int,
+    group_end: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """索引の CSR を走査し、クエリを完全な形で含むグループと占有率を返す。
+
+    **候補生成の Top-K では拾えないので別の経路にしてある。** 実測で「りんご」
+    を含む 204 グループのうち phonetic 空間の Top-8000 に入るのは 48 件しか
+    ない (モーラ帯に限っても 123 件のうち 48 件)。包含は phonetic 空間の
+    近さと相関しないため、候補を後段で絞る形では解決しない。
+    """
+    return _rust.containment_scan(
+        np.ascontiguousarray(query_ids, dtype=np.int32),
+        np.ascontiguousarray(phoneme_ids_blob, dtype=np.uint8),
+        np.ascontiguousarray(phoneme_bounds, dtype=np.int32),
+        np.ascontiguousarray(distance_ids, dtype=np.int32),
+        _ELASTIC_IDS,
+        int(group_start),
+        int(group_end),
+    )
+
+
 def similarity_normalizer(len_a: int, len_b: int, worst: float = -1.0) -> float:
     """類似度の分母 = その長さの組が取り得る最悪の距離。
 

@@ -222,6 +222,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
                     "embedding_similarity": r.embedding_similarity,
                     "coda_similarity": r.coda_similarity,
                     "vowel_similarity": r.vowel_similarity,
+                    "containment": r.containment,
                     "mora_count": r.mora_count,
                     "category": r.category.value,
                     "pos": r.pos,

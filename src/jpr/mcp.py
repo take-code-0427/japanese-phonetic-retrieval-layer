@@ -35,7 +35,12 @@ _SEARCH_DESCRIPTION = """\
 
 「もっと長い語で」「4 モーラ以上で」のようにモーラ数 (拍) を指定された場合は
 min_mora / max_mora を使う。通常の検索は音韻空間の近傍を引くので、モーラ数の
-違う語は近傍に入らず出てこない。"""
+違う語は近傍に入らず出てこない。
+
+結果の `containment` は「クエリの音がその語に完全な形で入っている」度合い
+(0 なら入っていない)。「りんご」に対する「ラリンゴ」「五輪後」のような語が
+これに当たり、値はクエリが語全体に占める割合なので余分が多いほど低い。
+「〜が入っている語」「〜を含む語」を問われたときはこのフィールドで絞る。"""
 
 _COMPOSE_DESCRIPTION = """\
 長い入力を「複数の語 + 助詞」の連なりに置き換える (空耳・替え歌)。
@@ -186,6 +191,9 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                     "score": r.score,
                     "phonetic_similarity": r.phonetic_similarity,
                     "coda_similarity": r.coda_similarity,
+                    # クエリの音が完全な形で入っているか (0 なら入っていない)。
+                    # 値はクエリが候補の音素列に占める割合で、余分が多いほど低い。
+                    "containment": r.containment,
                     "mora_count": r.mora_count,
                     "category": r.category.value,
                     "familiarity": r.familiarity,

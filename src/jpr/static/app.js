@@ -320,9 +320,16 @@ function resultRow(result, queryPhonemes, rank, range) {
  * 「本当はどれだけ要るか」が取れる。
  *
  * **右端の列では左へ伸ばす。** パネルは列の左端から右へ広がるので、最後の
- * モーラ数の列で開くと画面外へ出る (実測で 7 モーラの帯が右端 1480px ·
+ * モーラ数の列で開くと見える範囲の外へ出る (実測で 7 モーラの帯が右端 1480px ·
  * ビューポート 1440px)。溢れたぶんだけ負の margin で引き戻す — 行の中の
- * 位置は変えず、描画だけを左へずらす。 */
+ * 位置は変えず、描画だけを左へずらす。
+ *
+ * **基準はビューポートではなく `.mora-columns` の可視範囲。** あちらは
+ * `overflow-x: auto` で自分がスクロールコンテナなので、画面に収まっていても
+ * コンテナの外に出たぶんは読めない。ビューポートだけを見ていたとき、765px 幅で
+ * 右端の列を開くと左端が -121px となり**帯の頭が隠れた** (右への溢れを
+ * 640px 引き戻した結果、今度は左へ突き抜けた)。左右どちらの側も
+ * はみ出させない。 */
 function sizePanelToTrack(panel) {
   const track = panel.querySelector(".align-track");
   if (!track) return;
@@ -338,8 +345,14 @@ function sizePanelToTrack(panel) {
 
   // 幅が確定してから溢れを測る。ずらす前を基準にしたいので、前回ぶんは戻す。
   panel.style.marginLeft = "";
-  const overflow = panel.getBoundingClientRect().right - document.documentElement.clientWidth;
-  if (overflow > 0) panel.style.marginLeft = `${-Math.ceil(overflow)}px`;
+  const viewport = panel.closest(".mora-columns");
+  if (!viewport) return;
+  const bounds = viewport.getBoundingClientRect();
+  const rect = panel.getBoundingClientRect();
+  // 右の溢れを引き戻す。ただしパネルのほうが可視範囲より広いときは、
+  // 引き戻すと左が切れるだけなので左端を優先して揃える (帯は左から読む)。
+  const shift = Math.min(rect.right - bounds.right, rect.left - bounds.left);
+  if (shift > 0) panel.style.marginLeft = `${-Math.ceil(shift)}px`;
 }
 
 /** 署名要素: 音素の対応付けを縦 2 段で並べ、対ごとの素性距離を縦棒で示す。 */

@@ -56,9 +56,22 @@ STATIC_DIR = Path(__file__).parent / "static"
 #: スコアが同じ」ときに片方だけが消え、順位の読み比べができなくなる。基準を
 #: 決めて満たすものを全部出すほうが、何を見ているかが画面から読める。
 #:
-#: 0.8 は rerank 後のスコアで「音が近いと言える」線。上位は 0.90〜0.98 に
-#: 密集するので (`static/app.js` のスコア棒の項)、0.8 は裾まで含む緩めの基準。
-DEFAULT_MIN_SCORE = 0.8
+#: 0.7 は rerank 後のスコアで「音が近いと言える」線。裾まで含む緩めの基準。
+#:
+#: **v9 で 0.8 から下げた。** 一般性を Wikipedia の出現記事数に変えたとき
+#: (`frequency`)、指標の尺度そのものが動いてスコアの絶対値が 0.05〜0.09 沈んだ。
+#: 旧指標 (連接コストの反転) は既定カテゴリの平均が 0.8 付近だったのに対し、
+#: 新指標は 0.26 — 頻度表に無い語が 8 割あり、そこが `UNKNOWN_FAMILIARITY`
+#: (0.25) に寄るため。**順位は改善しているがスコアの絶対値は下がる**ので、
+#: 0.8 のままだと「ラーメン」「電話」「パソコン」が 0 件になり、常に
+#: フォールバック経路 (下の `FALLBACK_LIMIT`) に落ちていた。
+#:
+#: 実測の該当件数 (>= 0.7): ラーメン 70 / 乳首 39 / 科学 186 / 電話 42 /
+#: りんご 63 / 東京 279 / パソコン 22 / 明日 291。
+#:
+#: **スコアの重み構成を変えたらここも測り直す。** 下限は絶対値の基準なので、
+#: 成分の尺度が動くと意味が変わる。
+DEFAULT_MIN_SCORE = 0.7
 
 #: 下限を満たす語が 1 件も無いときに、下限を外して返す件数。
 #:
@@ -227,9 +240,12 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             # 見せ、外したことを `below_floor` で伝える。
             fell_back = not results and min_score > 0.0
             if fell_back:
+                # 件数は呼び出し側の `limit` を優先する。`FALLBACK_LIMIT` は
+                # 「無制限 (limit=0) で来たときに何件で切るか」であって、
+                # 明示された上限を上書きする理由がない。
                 _, results = engine.search(
                     q,
-                    limit=FALLBACK_LIMIT,
+                    limit=FALLBACK_LIMIT if limit == 0 else min(limit, FALLBACK_LIMIT),
                     preset=preset,
                     candidates=candidates,
                     categories=parsed_categories,

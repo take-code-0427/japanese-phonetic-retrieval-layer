@@ -165,16 +165,20 @@ def test_mora_range_scan_is_tolerable(real_searcher: PhoneticSearcher) -> None:
 def test_threshold_then_take_everything(real_searcher: PhoneticSearcher) -> None:
     """閾値で母集団を切って全件取る、という使い方が成り立つ。
 
-    `limit` の上限で切られると「スコア 0.9 以上を全部見る」ができない。
+    `limit` の上限で切られると「スコア 0.7 以上を全部見る」ができない。
+
+    **下限は `web.DEFAULT_MIN_SCORE` と同じ 0.7 を使う。** スコアの絶対値は
+    重みの構成に依存するので (v9 で一般性の尺度が変わって 0.05〜0.09 沈んだ)、
+    ここに独自の数値を置くと画面の既定と食い違ったまま気付けない。
     """
-    _, results = real_searcher.search("ラーメン", limit=None, min_score=0.8)
-    assert all(r.score >= 0.8 for r in results)
+    _, results = real_searcher.search("ラーメン", limit=None, min_score=0.7)
+    assert all(r.score >= 0.7 for r in results)
     # 既定の limit (10) や選抜幅 (limit * _RERANK_MARGIN = 80) で
-    # 頭打ちになっていない。実測で 95 件返る。
-    assert len(results) > 80, f"{len(results)} 件では上限で切られている疑いがある"
+    # 頭打ちになっていない。実測で 70 件返る。
+    assert len(results) > 40, f"{len(results)} 件では上限で切られている疑いがある"
 
     # 閾値を上げれば件数は減る。上限ではなくスコアが件数を決めている。
-    _, stricter = real_searcher.search("ラーメン", limit=None, min_score=0.9)
+    _, stricter = real_searcher.search("ラーメン", limit=None, min_score=0.75)
     assert 0 < len(stricter) < len(results)
 
 
@@ -418,8 +422,9 @@ def test_mora_band_only_drops_rows_the_filter_would_reject(
     [
         # 語頭に余分が付く形 (axxx)。
         ("りんご", "ラリンゴ"),
-        # 語末に余分が付く形 (xxxbbb)。
-        ("科学", "外科学"),
+        # 語末に余分が付く形 (xxxbbb)。「外科学」ではなく「医科学」なのは
+        # 占有率の差 (0.857 対 0.750) で、どちらも同じ形の包含語。
+        ("科学", "医科学"),
         # 両端に余分が付く形。
         ("電話", "エア電話"),
     ],
@@ -583,12 +588,13 @@ def test_phrase_segments_are_readable_words(real_searcher: PhoneticSearcher) -> 
 
 
 def test_phrase_prefers_known_words_over_rare_kanji(real_searcher: PhoneticSearcher) -> None:
-    """コスト 0 の語 (活用の断片・稀な異表記) が上位を埋めない。
+    """稀語 (活用の断片・稀な異表記) が上位を埋めない。
 
-    `index.familiarity_of` はコストの反転なので `cost <= 0` を一般性 1.0 と
-    見るが、full 辞書の該当 51732 件は「炮り」「合ん」「アがん」のような
-    断片で実際には一般的でない。`phrase.UNKNOWN_COST_FAMILIARITY` で
-    「わからない」として扱っている。これが 1.0 のままだと
+    一般性は Wikipedia の出現記事数から引く (`frequency`)。「炮り」「合ん」
+    「アがん」のような断片は頻度表に無いので `UNKNOWN_FAMILIARITY` に落ち、
+    「私」「名前」のような実際に使われる語に勝てない。**Sudachi の連接コストを
+    反転していた頃はここが逆転していた** — コストが小さいのは短く品詞的に単純な
+    語であって知られた語ではないので、cost 0 の断片が一般性 1.0 を得て
     「わたしのなまえは」が「分か死の七異派」になった (実測)。
     """
     _, candidates = real_searcher.compose("わたしのなまえは", limit=5)

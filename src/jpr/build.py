@@ -16,6 +16,7 @@ import numpy as np
 
 from .dictionary import SystemDictionary, find_system_dic
 from .embedding import SPACES, embed
+from .frequency import familiarity_lookup
 from .index import (
     EXCLUDED_POS,
     IndexEntry,
@@ -39,6 +40,11 @@ def collect_entries(
     dictionary = SystemDictionary(find_system_dic())
     if progress:
         progress(f"辞書を走査中 ({len(dictionary):,} 語)")
+
+    # 一般性は Wikipedia の出現記事数から引く (`frequency`)。表は NFKC 正規化
+    # 済みだが、**こちらで正規化はしない** — 索引の見出しは既に正規形で、
+    # 実測で NFKC を通して増える一致は 289057 行の標本中 7 件 (0.00%) しかない。
+    familiarity_of_surface = familiarity_lookup()
 
     entries: list[IndexEntry] = []
     seen: set[tuple[str, str]] = set()
@@ -74,6 +80,7 @@ def collect_entries(
                 pos=entry.pos[1] if len(entry.pos) > 1 else (entry.pos[0] if entry.pos else ""),
                 category=classify(entry.pos),
                 cost=entry.cost,
+                familiarity=familiarity_of_surface(entry.surface),
             )
         )
 

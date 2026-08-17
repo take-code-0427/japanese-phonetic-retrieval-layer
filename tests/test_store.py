@@ -25,6 +25,7 @@ def make_entry(surface: str, reading: str, **kwargs) -> IndexEntry:
         pos=kwargs.get("pos", "普通名詞"),
         category=kwargs.get("category", Category.COMMON),
         cost=kwargs.get("cost", 5000),
+        familiarity=kwargs.get("familiarity", 0.5),
     )
 
 

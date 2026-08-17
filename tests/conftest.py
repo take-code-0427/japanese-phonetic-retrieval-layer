@@ -12,33 +12,44 @@ from jpr.search import PhoneticSearcher
 from jpr.store import PhoneticStore, default_store_path, write_store
 
 # 検索の挙動を検証するための小さな語彙。実際の辞書を引かずに済ませる。
-# (表層, 読み, 品詞, カテゴリ, コスト)
+#
+# 一般性は本番では Wikipedia の出現記事数から引くが (`frequency`)、ここでは
+# 直に与える。表を引くと索引の中身がデータの版に左右され、テストが「頻度表が
+# こう言っている」ことの検証になってしまう。値は実際の表を写したもので、
+# 順位を人為的に作らない。
+#
+# **「仕組み」と「仕組」だけは実際の値 (0.792 / 0.439) を使わず同値にする。**
+# 代表選びが表層の符号順に落ちる決定性
+# (`search._representative_rank`) を検証するテストがあり、一般性で差が付くと
+# その経路を通らなくなる。
+#
+# (表層, 読み, 品詞, カテゴリ, コスト, 一般性)
 _SAMPLE_VOCABULARY = [
-    ("チョコビ", "チョコビ", "固有名詞", Category.PRODUCT, 15000),
-    ("チョコボール", "チョコボール", "固有名詞", Category.PRODUCT, 8000),
-    ("チョコパイ", "チョコパイ", "固有名詞", Category.PRODUCT, 8000),
-    ("地球儀", "チキュウギ", "普通名詞", Category.COMMON, 7000),
-    ("手首", "テクビ", "普通名詞", Category.COMMON, 4000),
-    ("仕組み", "シクミ", "普通名詞", Category.COMMON, 4500),
-    ("竹輪", "チクワ", "普通名詞", Category.COMMON, 6000),
-    ("ラーメン", "ラーメン", "普通名詞", Category.COMMON, 1400),
-    ("ローメン", "ローメン", "普通名詞", Category.COMMON, 9000),
-    ("電車", "デンシャ", "普通名詞", Category.COMMON, 3000),
-    ("松茸", "マツタケ", "普通名詞", Category.COMMON, 6500),
-    ("空", "ソラ", "普通名詞", Category.COMMON, 3000),
-    ("科学", "カガク", "普通名詞", Category.COMMON, 2000),
-    ("価格", "カカク", "普通名詞", Category.COMMON, 2000),
-    ("東京", "トウキョウ", "固有名詞", Category.PLACE, 2800),
-    ("田中", "タナカ", "固有名詞", Category.PERSON, 3000),
+    ("チョコビ", "チョコビ", "固有名詞", Category.PRODUCT, 15000, 0.101),
+    ("チョコボール", "チョコボール", "固有名詞", Category.PRODUCT, 8000, 0.250),
+    ("チョコパイ", "チョコパイ", "固有名詞", Category.PRODUCT, 8000, 0.250),
+    ("地球儀", "チキュウギ", "普通名詞", Category.COMMON, 7000, 0.250),
+    ("手首", "テクビ", "普通名詞", Category.COMMON, 4000, 0.654),
+    ("仕組み", "シクミ", "普通名詞", Category.COMMON, 4500, 0.500),
+    ("竹輪", "チクワ", "普通名詞", Category.COMMON, 6000, 0.281),
+    ("ラーメン", "ラーメン", "普通名詞", Category.COMMON, 1400, 0.692),
+    ("ローメン", "ローメン", "普通名詞", Category.COMMON, 9000, 0.115),
+    ("電車", "デンシャ", "普通名詞", Category.COMMON, 3000, 0.865),
+    ("松茸", "マツタケ", "普通名詞", Category.COMMON, 6500, 0.369),
+    ("空", "ソラ", "普通名詞", Category.COMMON, 3000, 0.855),
+    ("科学", "カガク", "普通名詞", Category.COMMON, 2000, 0.965),
+    ("価格", "カカク", "普通名詞", Category.COMMON, 2000, 0.866),
+    ("東京", "トウキョウ", "固有名詞", Category.PLACE, 2800, 1.000),
+    ("田中", "タナカ", "固有名詞", Category.PERSON, 3000, 0.858),
     # 同音異表記。重複排除の検証に使う。
-    ("仕組", "シクミ", "普通名詞", Category.COMMON, 5000),
-    ("し組み", "シクミ", "一般", Category.COMMON, 12000),
+    ("仕組", "シクミ", "普通名詞", Category.COMMON, 5000, 0.500),
+    ("し組み", "シクミ", "一般", Category.COMMON, 12000, 0.250),
 ]
 
 
 def _sample_entries() -> list[IndexEntry]:
     entries: list[IndexEntry] = []
-    for surface, reading, pos, category, cost in _SAMPLE_VOCABULARY:
+    for surface, reading, pos, category, cost, familiarity in _SAMPLE_VOCABULARY:
         pronunciation = analyze_reading(reading)
         entries.append(
             IndexEntry(
@@ -49,6 +60,7 @@ def _sample_entries() -> list[IndexEntry]:
                 pos=pos,
                 category=category,
                 cost=cost,
+                familiarity=familiarity,
             )
         )
     return entries

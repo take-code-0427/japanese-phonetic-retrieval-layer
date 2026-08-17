@@ -33,13 +33,7 @@ from .distance import (
     weighted_edit_distance,
 )
 from .embedding import embed
-from .index import (
-    COST_FAMILIAR,
-    COST_RARE,
-    DEFAULT_CATEGORIES,
-    Category,
-    IndexEntry,
-)
+from .index import DEFAULT_CATEGORIES, Category, IndexEntry
 from .phonology import Pronunciation, analyze_reading
 from .phrase import (
     DEFAULT_BEAM_WIDTH,
@@ -104,24 +98,39 @@ class ScoreWeights:
 #: rhyme      韻を踏む語。語尾と母音列を重視し、語頭の一致は求めない。
 #: mishearing 聞き間違い・ASR 補正。全体の音韻とリズムの一致を最重視。
 #:
+#: **`pun` の `familiarity` は 0.25 が上限** (v9 で 0.15 から上げた)。ダジャレは
+#: 相手が知っている語でなければ成立しないので効かせたいが、上げすぎると音が
+#: 離れる。実測で 0.30 では「パソコン」の 1 位が「家族」、「りんご」の 1 位が
+#: 「前後」になった。0.35 では「乳首」に「一部」「記述」が入る。
+#:
+#: **旧指標 (Sudachi の連接コスト) では上げると悪化した。** あれは頻度ではなく
+#: 知名度としては逆転していたので (`frequency` の項)、0.50 まで上げると「電話」
+#: の上位が「デンダ」「レンガ」「ダンガ」で埋まった。**同じ重みでも指標が違えば
+#: 結論が変わる。**
+#:
 #: `containment` は「クエリの音が完全な形で入っている」度合い。pun と
 #: mishearing に入れて rhyme には入れない — **韻は語尾の一致を見るので、
 #: 語頭に余分が付いているかどうかが関係しない**。「りんご」に対する
 #: 「ラリンゴ」は韻としては「リンゴ」と同じ扱いでよく、包含を足すと
 #: `coda` と競合して語尾の弱い包含語が混ざる。
 #:
-#: **0.06 は「上位に入るが埋め尽くさない」線。** 包含候補は編集距離を 1.0 と
-#: 見るので (`_score_candidates`)、この重みは丸ごと上乗せになる。5 クエリ x
-#: 上位 8 件での包含語の件数:
+#: **0.12 は「上位に入るが埋め尽くさない」線。** 包含候補は編集距離を 1.0 と
+#: 見るので (`_score_candidates`)、この重みは丸ごと上乗せになる。
+#: `familiarity` 0.25 での上位 8 件に含まれる包含語の件数:
 #:
-#:     containment  0.04  0.06  0.08  0.10
-#:     りんご        2/8   4/8   5/8   7/8
-#:     科学         2/8   2/8   3/8   5/8
+#:     containment  0.06  0.09  0.12  0.15  0.18
+#:     りんご         2     4     5     5     5
+#:     電話          0     0     2     3     5
+#:     パソコン        3     5     6     7     8
+#:     眼鏡          0     0     3     5     6
 #:
-#: 0.10 では「クリンゴン語」「グリンゴッツ」のような稀語が本来の近傍
-#: (リンボ・ディンゴ) を押し出し、0.04 では「科学」の包含語が 4 位より下に
-#: しか来ない。稀語が上位に残ること自体は `familiarity` が抑える
-#: (実測で「微倫吾」0.50・「カワテブクロ」0.55)。
+#: 0.18 では「パソコン」が 8/8 と埋め尽くされ、0.06 では「電話」「眼鏡」の
+#: 包含語が上位 8 件に 1 つも入らない。
+#:
+#: **この値は `familiarity` と釣り合っている。** 頻度表は UniDic 短単位なので
+#: 複合語 (「エア電話」「ノートパソコン」) は未収録で `UNKNOWN_FAMILIARITY`
+#: に落ちる。一般性の重みを上げると包含語がそのぶん押されるので、両方を
+#: 一緒に動かさなければならない。旧指標 (連接コスト) の頃は 0.06 だった。
 PRESETS: dict[str, ScoreWeights] = {
     "pun": ScoreWeights(
         phoneme=0.50,
@@ -129,11 +138,14 @@ PRESETS: dict[str, ScoreWeights] = {
         mora=0.05,
         coda=0.10,
         vowel=0.05,
-        familiarity=0.15,
-        containment=0.06,
+        familiarity=0.25,
+        containment=0.12,
     ),
+    # rhyme の一般性は 0.10 まで。上げると語尾の一致が崩れる — 実測で 0.15 の
+    # 「眼鏡」に「姓」「ながら」、0.20 で「回」が入った。韻は語尾が合っている
+    # ことが条件なので、一般性で押し込むと条件を満たさない語が混ざる。
     "rhyme": ScoreWeights(
-        phoneme=0.20, embedding=0.10, mora=0.10, coda=0.35, vowel=0.20, familiarity=0.05
+        phoneme=0.20, embedding=0.10, mora=0.10, coda=0.35, vowel=0.20, familiarity=0.10
     ),
     "mishearing": ScoreWeights(
         phoneme=0.65,
@@ -847,7 +859,7 @@ class PhoneticSearcher:
         embedding = np.clip(embedding_scores, 0.0, None)
         candidate_moras = store.mora_counts[rows].astype(np.int32)
         mora = _mora_similarity_array(pronunciation.mora_count, candidate_moras)
-        familiarity = _familiarity_array(store.costs[rows])
+        familiarity = store.familiarities[rows].astype(np.float64)
 
         partial = (
             weights.embedding * embedding
@@ -1347,12 +1359,6 @@ def _mora_similarity_array(query_moras: int, candidates: np.ndarray) -> np.ndarr
     return np.clip(1.0 - gap / scale, 0.0, 1.0)
 
 
-def _familiarity_array(costs: np.ndarray) -> np.ndarray:
-    """`familiarity_of` を候補全体にまとめて適用する。"""
-    span = COST_RARE - COST_FAMILIAR
-    return np.clip(1.0 - (costs.astype(np.float64) - COST_FAMILIAR) / span, 0.0, 1.0)
-
-
 def _representative_rank(result: SearchResult) -> tuple[float, float, float, str]:
     """同音異表記の中で代表として残す優先度。大きいほど優先。
 
@@ -1371,10 +1377,10 @@ def _representative_rank(result: SearchResult) -> tuple[float, float, float, str
     (`tests/test_acceptance.py::test_edit_distance_pruning_does_not_change_ranking`
     がこの安定性を検証する)。
 
-    `familiarity` は同点になりやすい。`COST_FAMILIAR` (5000) 以下のコストは
-    すべて 1.0 に飽和するので、「仕組み」(4500) と「仕組」(5000) は一般性では
-    分けられない。表層の符号順という決め方自体に意味はなく、**再現性だけを
-    与えている**。
+    `familiarity` は同点になりやすい。頻度表に無い語はすべて
+    `frequency.UNKNOWN_FAMILIARITY` で並ぶので、同音異表記が揃って未収録だと
+    一般性では分けられない。表層の符号順という決め方自体に意味はなく、
+    **再現性だけを与えている**。
     """
     return (
         _surface_informativeness(result),

@@ -61,12 +61,7 @@ from .distance import (
     phoneme_ids,
     weighted_edit_distance,
 )
-from .index import (
-    COST_FAMILIAR,
-    COST_RARE,
-    DEFAULT_CATEGORIES,
-    Category,
-)
+from .index import DEFAULT_CATEGORIES, Category
 from .phonology import Mora, Pronunciation, analyze_reading
 from .store import PhoneticStore
 
@@ -207,19 +202,6 @@ WEIGHT_FAMILIARITY = 0.16
 #: 重くすると稀な漢字語 (「撰り」「梻」「炮り」) が既知の語に勝つ。実測で 0.12 と
 #: 一般性 0.16 が逆転していた頃は「ワタシノナマエハ」が「分か死の七異派」になった。
 WEIGHT_INFORMATIVENESS = 0.08
-
-#: Sudachi のコストが 0 以下の語に与える一般性。
-#:
-#: **`index.familiarity_of` はこれを 1.0 と見る** (コストの反転なので 0 が最良に
-#: なる)。だが full 辞書の `cost <= 0` は 51732 件あり、中身は「炮り」「合ん」
-#: 「合れ」「アがん」のような活用の断片や稀な異表記で、実際に一般的な語ではない。
-#: コストが振られていない (= 言語モデルが評価していない) ことの表れなので、
-#: **「最も一般的」ではなく「わからない」として扱う。**
-#:
-#: `search` 側でこれが問題にならないのは、一般性が同点をほどく程度の重み
-#: (0.05〜0.15) しか持たないため。分割合成では一般性が候補の採否を決めるので、
-#: 1.0 のままだと「私の名前は」より「分か死の七異派」が上位に来る (実測)。
-UNKNOWN_COST_FAMILIARITY = 0.15
 
 #: 語の数に対する減点。
 #:
@@ -738,14 +720,8 @@ class PhraseComposer:
             lengths = self.store.phoneme_lengths(rows)
             similarity = _chunk_similarity(distances, query_ids.size, lengths)
 
-            # 一般性は `index.familiarity_of` の配列版。境界の定数はそちらから
-            # 引く (片方だけ動かすと分割合成と通常検索で尺度が食い違う)。
-            span = COST_RARE - COST_FAMILIAR
-            costs = self.store.costs[rows].astype(np.float64)
-            familiarity = np.clip(1.0 - (costs - COST_FAMILIAR) / span, 0.0, 1.0)
-            # コスト 0 以下は「最も一般的」ではなく「わからない」として扱う
-            # (`UNKNOWN_COST_FAMILIARITY` の項を参照)。
-            familiarity = np.where(costs <= 0.0, UNKNOWN_COST_FAMILIARITY, familiarity)
+            # 一般性は索引が列で持つ (`frequency` が構築時に埋める)。
+            familiarity = self.store.familiarities[rows].astype(np.float64)
             # 表層の情報量は文字列を復号しないと出せないので、配列で出せる分
             # (音韻 + 一般性) だけで広めに絞り、そこから先は 1 件ずつ見る。
             partial = WEIGHT_PHONETIC * similarity + WEIGHT_FAMILIARITY * familiarity

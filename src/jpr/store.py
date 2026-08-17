@@ -44,7 +44,7 @@ from .phonology import vowel_skeleton_of
 #: 持ち方が変わったときは上げる (読めば壊れる)。読み方だけを変えたときは上げない —
 #: 再構築は 10 分かかるので、動くものを動かなくする理由がない。索引の内容そのものが
 #: 変わったとき (語彙の範囲など) も上げる。形式は読めても結果が説明できなくなる。
-FORMAT_VERSION = 8
+FORMAT_VERSION = 9
 
 #: 候補生成に使う空間。
 #:
@@ -88,6 +88,7 @@ _ENTRY_ARRAYS = (
     "category_vocabulary",
     "category_ids",
     "costs",
+    "familiarities",
     "mora_counts",
     "phoneme_vocabulary",
     "phoneme_ids",
@@ -303,6 +304,7 @@ def _encode_entries(entries: Sequence[IndexEntry]) -> dict[str, np.ndarray]:
         "category_vocabulary": np.array(category_values, dtype=np.str_),
         "category_ids": np.array([category_ids[e.category.value] for e in entries], dtype=np.int8),
         "costs": np.array([e.cost for e in entries], dtype=np.int32),
+        "familiarities": np.array([e.familiarity for e in entries], dtype=np.float32),
         "mora_counts": np.array([e.mora_count for e in entries], dtype=np.int16),
         "phoneme_vocabulary": np.array(phoneme_vocabulary, dtype=np.str_),
         "phoneme_ids": np.array(phoneme_ids, dtype=np.uint8),
@@ -399,6 +401,7 @@ class PhoneticStore:
         self._pos_ids_view = _byte_view(self._data["pos_ids"]).cast("h")
         self._category_ids_view = _byte_view(self._data["category_ids"]).cast("b")
         self._costs_view = _byte_view(self._data["costs"]).cast("i")
+        self._familiarities_view = _byte_view(self._data["familiarities"]).cast("f")
 
         self._vectors: dict[str, np.ndarray] = {}
         self._group_starts: np.ndarray | None = None
@@ -506,6 +509,7 @@ class PhoneticStore:
             pos=self._pos_vocabulary[self._pos_ids_view[row]],
             category=self._category_vocabulary[self._category_ids_view[row]],
             cost=self._costs_view[row],
+            familiarity=self._familiarities_view[row],
         )
 
     def category_of(self, row: int) -> Category:
@@ -534,6 +538,11 @@ class PhoneticStore:
     @property
     def costs(self) -> np.ndarray:
         return self._data["costs"]
+
+    @property
+    def familiarities(self) -> np.ndarray:
+        """行ごとの一般性 (0.0〜1.0)。rerank が候補全体に対して引く。"""
+        return self._data["familiarities"]
 
     @property
     def mora_counts(self) -> np.ndarray:

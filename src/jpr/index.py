@@ -15,12 +15,6 @@ EXCLUDED_POS = frozenset({"助詞", "助動詞", "補助記号", "記号", "空�
 
 _KATAKANA = frozenset(chr(code) for code in range(0x30A1, 0x30FB)) | {"ー"}
 
-# Sudachi のコストを一般性に写すための境界。full 辞書の実測分布 (中央値 11000、
-# 第 1 十分位 5000) をもとに、下位 1 割以下を「よく知られた語」、
-# 上位 1/4 以上を「稀な語」とみなす。
-COST_FAMILIAR = 5000
-COST_RARE = 15000
-
 
 class Category(StrEnum):
     """語彙カテゴリ。
@@ -68,31 +62,17 @@ class IndexEntry:
     mora_count: int
     pos: str
     category: Category
-    #: Sudachi のコスト。小さいほど一般的な語である傾向がある。
+    #: Sudachi のコスト。同音異表記の代表選び (`search._representative_rank`) が
+    #: 同点をほどくのに使う。**一般性の指標としては使わない** — 下の
+    #: `familiarity` を参照。
     cost: int
+    #: 語の一般性 (0.0〜1.0)。Wikipedia の出現記事数から測る
+    #: (`frequency.familiarity_lookup`)。
+    familiarity: float
 
     @property
     def is_proper_noun(self) -> bool:
         return self.category in (Category.PRODUCT, Category.PERSON, Category.PLACE)
-
-    @property
-    def familiarity(self) -> float:
-        """語の一般性を 0.0〜1.0 で近似する。
-
-        Sudachi のコストは言語モデル上の出現しにくさなので、これを反転して
-        「知られている語らしさ」の弱い指標として使う。厳密な頻度ではないため
-        順位の同点をほどく程度の重みでしか使わないこと。
-        """
-        return familiarity_of(self.cost)
-
-
-def familiarity_of(cost: int) -> float:
-    """Sudachi のコストを 0.0〜1.0 の一般性に写す。"""
-    if cost <= COST_FAMILIAR:
-        return 1.0
-    if cost >= COST_RARE:
-        return 0.0
-    return 1.0 - (cost - COST_FAMILIAR) / (COST_RARE - COST_FAMILIAR)
 
 
 def has_pronounceable_reading(reading: str) -> bool:
@@ -113,14 +93,11 @@ def is_searchable_surface(surface: str) -> bool:
 
 
 __all__ = [
-    "COST_FAMILIAR",
-    "COST_RARE",
     "DEFAULT_CATEGORIES",
     "EXCLUDED_POS",
     "Category",
     "IndexEntry",
     "classify",
-    "familiarity_of",
     "has_pronounceable_reading",
     "is_searchable_surface",
 ]

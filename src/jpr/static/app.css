@@ -571,11 +571,38 @@ main {
 
 /* ---------- 署名: アライメント帯 ---------- */
 
-/* 列の中に開くので、行のグリッドに桁を合わせる必要はなくなった。 */
+/* **列の幅に収めない。** 帯は音素 1 つに 1 列を使うので必要な幅がクエリと候補の
+ * 音素数で決まり、列の幅 (SLOT_PX 250px) とは何の関係もない。実測で 4 モーラ対
+ * 4 モーラ (6 列) が 264px、7 モーラ対 7 モーラ (10 列) が 440px を要求する一方、
+ * 列の内寸は 238px しかない。収めようとすると横スクロールになり、**帯の右端が
+ * 隠れて「どの音素がどう対応したか」という帯の唯一の役目が果たせない**
+ * (スクロールバーを出しても、隣の列と並べて読める図ではなくなる)。
+ *
+ * だから中身が要求する幅をそのまま取り (`width: max-content`)、隣の列の上に
+ * 重ねる。列の幅を開いたときだけ広げる案は取れない — **パネルは同時に何枚でも
+ * 開く**ので、幅を配り直すと開くたびに他の列の行が組み変わって順位の
+ * 読み比べが崩れる。重ねる側は動かない。
+ *
+ * 重なる以上、地は透けてはいけない (`--bg-sunken` は半透明ではないが、
+ * 隣の列の枠線が縁から覗くので border と影で切り分ける)。
+ *
+ * **幅を決めるのは帯だけ** (`--align-track-px` を JS が実測して渡す)。
+ * `width: max-content` を素で使うと、折り返さない行 — 見出しの 1 文と
+ * 脚注の 6 項目 — が幅を決めてしまい、6 列 (200px) の帯に対して 556px の
+ * パネルになった。あちらは折り返して困らない文なので、帯の要求に合わせて
+ * 折り返させる。下限に列の幅を敷くのは、短い対で行より狭いパネルが
+ * ぶら下がると開いた行の位置が読めなくなるため。 */
 .align {
-  padding: 4px 4px 18px;
+  position: relative;
+  z-index: 3;
+  width: max(100%, var(--align-track-px, 0px));
+  max-width: min(760px, calc(100vw - 2 * var(--gutter)));
+  padding: 4px 10px 12px;
   background: var(--bg-sunken);
-  border-top: 1px dashed var(--line);
+  border: 1px solid var(--line-bright);
+  border-top-style: dashed;
+  border-radius: 0 var(--r) var(--r) 0;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 0.45);
 }
 
 .align-title {
@@ -583,7 +610,7 @@ main {
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--ink-faint);
-  margin: 14px 0 12px;
+  margin: 10px 0 8px;
 }
 
 /* 2 語の連続表記。下の対応は音素単位に切って見せるので、発音全体としての
@@ -592,7 +619,7 @@ main {
   display: flex;
   flex-wrap: wrap;
   gap: 6px 22px;
-  margin: 0 0 14px;
+  margin: 0 0 10px;
 }
 .align-ipa-cell { display: flex; align-items: baseline; gap: 7px; }
 .align-ipa-cell .ipa { font-size: 14px; }
@@ -600,16 +627,23 @@ main {
 /* 音素の対応を縦 2 段で並べる。列の幅は等分で、対応しない音素は
  * 破線の空きになる。編集距離が「どの音素をどう読み替えたか」まで
  * 見えるようにするための表示。 */
-.align-track { display: flex; align-items: stretch; overflow-x: auto; padding-bottom: 4px; }
+/* 幅はパネル側 (`max-content`) が中身に合わせるので、ここでスクロールを
+ * 用意する必要はない。上限に当たる長い対だけが横スクロールに落ちる。 */
+.align-track { display: flex; align-items: stretch; overflow-x: auto; }
 
+/* 列の幅は中身が要求する分だけ。**44px の固定幅は中身の 1.5 倍あった** —
+ * 実測でチップが 22.5〜29px (`ky` のような 2 字の子音が最大)、距離の数値が
+ * 20px なので、29px + 左右 padding で全部が収まる。余りは列の間隔として
+ * 見えるだけで何も示していない上、帯全体を 1.3 倍に伸ばして列の外へ
+ * 追い出す幅を増やしていた。 */
 .align-col {
   position: relative;
   display: grid;
-  grid-template-rows: auto 30px auto auto;
-  gap: 4px;
+  grid-template-rows: auto 26px auto auto;
+  gap: 3px;
   justify-items: center;
-  min-width: 44px;
-  padding: 0 3px;
+  min-width: 31px;
+  padding: 0 2px;
 }
 
 /* 同じモーラに属する音素 (子音 + 母音) を一括りに見せる。日本語の
@@ -631,8 +665,8 @@ main {
  * 止めると線が分断されて長さの比較ができない。 */
 .align-gauge {
   position: relative;
-  /* 列の左右 padding (3px) ぶん外に伸ばして隣の基線と繋ぐ。 */
-  width: calc(100% + 6px);
+  /* 列の左右 padding (2px) ぶん外に伸ばして隣の基線と繋ぐ。 */
+  width: calc(100% + 4px);
   border-top: 1px solid var(--line-bright);
 }
 .align-gauge span {
@@ -659,8 +693,8 @@ main {
 .align-foot {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 20px;
-  margin-top: 14px;
+  gap: 6px 16px;
+  margin-top: 10px;
   font-family: var(--mono);
   font-size: 11.5px;
   color: var(--ink-dim);
@@ -1039,7 +1073,6 @@ main {
   .seg { padding: 7px 10px; }
   .seg-note { font-size: 10px; }
   .advanced-body { grid-template-columns: 1fr; }
-  .align { padding-left: 4px; }
 }
 
 @media (max-width: 620px) {

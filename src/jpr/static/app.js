@@ -299,6 +299,7 @@ function resultRow(result, queryPhonemes, rank, range) {
         b: result.phonemes.join(" "),
       });
       panel.replaceChildren(...alignmentNodes(data, result));
+      sizePanelToTrack(panel);
     } catch (error) {
       panel.textContent = `対応付けを取得できません: ${error.message}`;
     }
@@ -306,6 +307,39 @@ function resultRow(result, queryPhonemes, rank, range) {
 
   li.dataset.rank = String(rank);
   return li;
+}
+
+/** パネルの幅を帯の実寸に合わせ、画面から溢れるなら左へ寄せる。
+ *
+ * 帯は音素 1 つに 1 列を使うので、必要な幅は列の幅ではなく対の長さで決まる。
+ * CSS 側は `--align-track-px` を下限として読む (`.align` の項)。素の
+ * `width: max-content` に任せると、**折り返さない脚注の 1 行が幅を決めて**
+ * 6 列の帯に 556px のパネルが付いた。帯だけを測って渡す。
+ *
+ * 測るのは `scrollWidth` — 溢れた状態の実寸なので、パネルが狭いままでも
+ * 「本当はどれだけ要るか」が取れる。
+ *
+ * **右端の列では左へ伸ばす。** パネルは列の左端から右へ広がるので、最後の
+ * モーラ数の列で開くと画面外へ出る (実測で 7 モーラの帯が右端 1480px ·
+ * ビューポート 1440px)。溢れたぶんだけ負の margin で引き戻す — 行の中の
+ * 位置は変えず、描画だけを左へずらす。 */
+function sizePanelToTrack(panel) {
+  const track = panel.querySelector(".align-track");
+  if (!track) return;
+  // `box-sizing: border-box` なので width は padding と border を含む。
+  // 帯が収まる内寸を確保するには、その分を足した外寸を渡す。
+  const style = getComputedStyle(panel);
+  const inset =
+    parseFloat(style.paddingLeft) +
+    parseFloat(style.paddingRight) +
+    parseFloat(style.borderLeftWidth) +
+    parseFloat(style.borderRightWidth);
+  panel.style.setProperty("--align-track-px", `${Math.ceil(track.scrollWidth + inset)}px`);
+
+  // 幅が確定してから溢れを測る。ずらす前を基準にしたいので、前回ぶんは戻す。
+  panel.style.marginLeft = "";
+  const overflow = panel.getBoundingClientRect().right - document.documentElement.clientWidth;
+  if (overflow > 0) panel.style.marginLeft = `${-Math.ceil(overflow)}px`;
 }
 
 /** 署名要素: 音素の対応付けを縦 2 段で並べ、対ごとの素性距離を縦棒で示す。 */
@@ -338,7 +372,9 @@ function alignmentNodes(data, result) {
   // 距離を高さに写す基準。子音と母音の置換 (1.0) が満杯になるよう固定し、
   // 行ごとに最大値で正規化しない。行間で高さが比較できなくなるため。
   const GAUGE_MAX = 1.0;
-  const GAUGE_PX = 30;
+  // CSS の `.align-col` の 2 行目の高さと一致させる。ここだけ大きいと
+  // 満杯の棒が次の行 (候補側のチップ) に食い込む。
+  const GAUGE_PX = 26;
 
   // モーラの先頭に区切りを立てる。子音の直後の音素は同じモーラの母音なので
   // 境界にならない。挿入・削除では片側に音素が無いため、クエリ側の列が

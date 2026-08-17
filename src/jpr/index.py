@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -34,6 +35,33 @@ class Category(StrEnum):
 
 #: 既定で検索対象にするカテゴリ。人名・地名は明示的に指定したときだけ引く。
 DEFAULT_CATEGORIES = frozenset({Category.COMMON, Category.PRODUCT, Category.OTHER})
+
+
+def parse_categories(names: Iterable[str]) -> list[Category] | None:
+    """カテゴリ名の並びを `Category` に変換する。空なら `None` (= 既定)。
+
+    未知の名前は利用可能な一覧を添えて `ValueError`。**窓ごとに違うのは
+    エラーの出し方だけ** (CLI は標準エラーに 1 行、Web は 400、MCP は JSON)
+    なので、検証はここに集めて送出は呼び出し側に任せる。
+    """
+    result: list[Category] = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            result.append(Category(name))
+        except ValueError:
+            valid = ", ".join(c.value for c in Category)
+            raise ValueError(f"未知のカテゴリ '{name}' (利用可能: {valid})") from None
+    return result or None
+
+
+def parse_category_list(value: str | None) -> list[Category] | None:
+    """カンマ区切りのカテゴリ名を `Category` に変換する。CLI と Web の入口。"""
+    if not value:
+        return None
+    return parse_categories(value.split(","))
 
 
 def classify(pos: tuple[str, ...]) -> Category:
@@ -100,4 +128,6 @@ __all__ = [
     "classify",
     "has_pronounceable_reading",
     "is_searchable_surface",
+    "parse_categories",
+    "parse_category_list",
 ]

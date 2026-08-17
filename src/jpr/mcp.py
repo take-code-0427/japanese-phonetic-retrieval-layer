@@ -13,10 +13,15 @@ from typing import Any
 
 from mcp.server import MCPServer
 
-from .distance import ipa_transcription
-from .index import Category
+from .index import Category, parse_categories
 from .phrase import DEFAULT_MAX_CHUNK_MORAS, DEFAULT_MIN_CHUNK_SCORE
 from .search import DEFAULT_CANDIDATES, PRESETS, PhoneticSearcher
+from .serialize import (
+    comparison_payload,
+    phrase_candidate_payload,
+    pronunciation_payload,
+    search_result_payload,
+)
 from .store import PhoneticStore, default_store_path
 
 _SEARCH_DESCRIPTION = """\
@@ -40,7 +45,12 @@ min_mora / max_mora を使う。通常の検索は音韻空間の近傍を引く
 結果の `containment` は「クエリの音がその語に完全な形で入っている」度合い
 (0 なら入っていない)。「りんご」に対する「ラリンゴ」「五輪後」のような語が
 これに当たり、値はクエリが語全体に占める割合なので余分が多いほど低い。
-「〜が入っている語」「〜を含む語」を問われたときはこのフィールドで絞る。"""
+「〜が入っている語」「〜を含む語」を問われたときはこのフィールドで絞る。
+
+`score` の内訳も返すので、順位の理由を検算できる: `phonetic_similarity`
+(音素列全体)、`coda_similarity` (語尾)、`vowel_similarity` (母音列 = 韻)、
+`familiarity` (語の一般性)。発音を人に示すときは `ipa` を使う
+(`phonemes` は内部表記)。"""
 
 _COMPOSE_DESCRIPTION = """\
 長い入力を「複数の語 + 助詞」の連なりに置き換える (空耳・替え歌)。
@@ -141,15 +151,13 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                 ensure_ascii=False,
             )
 
-        parsed: list[Category] | None = None
-        if categories:
-            try:
-                parsed = [Category(name) for name in categories]
-            except ValueError as exc:
-                return json.dumps(
-                    {"error": str(exc), "available": [c.value for c in Category]},
-                    ensure_ascii=False,
-                )
+        try:
+            parsed = parse_categories(categories or ())
+        except ValueError as exc:
+            return json.dumps(
+                {"error": str(exc), "available": [c.value for c in Category]},
+                ensure_ascii=False,
+            )
 
         engine = searcher()
         scanned: int | None = None
@@ -172,10 +180,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
         )
         payload: dict[str, Any] = {
             "query": query,
-            "reading": pronunciation.reading,
-            "phonemes": list(pronunciation.phonemes),
-            "ipa": ipa_transcription(pronunciation.phonemes),
-            "mora_count": pronunciation.mora_count,
+            **pronunciation_payload(pronunciation),
             "preset": preset,
             "min_mora": min_mora,
             "max_mora": max_mora,
@@ -184,22 +189,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
                 "score は音韻的な近さのみを表し、意味は考慮していない。"
                 "意味的な制約がある問いでは、この候補から意味で選び直すこと。"
             ),
-            "results": [
-                {
-                    "word": r.surface,
-                    "reading": r.reading,
-                    "score": r.score,
-                    "phonetic_similarity": r.phonetic_similarity,
-                    "coda_similarity": r.coda_similarity,
-                    # クエリの音が完全な形で入っているか (0 なら入っていない)。
-                    # 値はクエリが候補の音素列に占める割合で、余分が多いほど低い。
-                    "containment": r.containment,
-                    "mora_count": r.mora_count,
-                    "category": r.category.value,
-                    "familiarity": r.familiarity,
-                }
-                for r in results
-            ],
+            "results": [search_result_payload(r) for r in results],
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -234,37 +224,13 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
         return json.dumps(
             {
                 "text": text,
-                "reading": pronunciation.reading,
-                "phonemes": list(pronunciation.phonemes),
-                "ipa": ipa_transcription(pronunciation.phonemes),
-                "mora_count": pronunciation.mora_count,
+                **pronunciation_payload(pronunciation),
                 "note": (
                     "score は音韻的な近さのみを表し、意味は考慮していない。"
                     "上位は音が合うだけの無意味な列になりやすいので、"
                     "segments の対応を見て意味が通る候補を選び直すこと。"
                 ),
-                "results": [
-                    {
-                        "text": c.text,
-                        "reading": c.reading,
-                        "score": c.score,
-                        "phonetic_similarity": c.phonetic_similarity,
-                        "segment_count": c.segment_count,
-                        "segments": [
-                            {
-                                "surface": s.surface,
-                                "reading": s.reading,
-                                # 入力側のこの区間の読み。「どこが」を示すのに要る。
-                                "source_reading": s.source_reading,
-                                "mora_range": [s.start, s.end],
-                                "similarity": s.similarity,
-                                "is_particle": s.is_particle,
-                            }
-                            for s in c.segments
-                        ],
-                    }
-                    for c in candidates
-                ],
+                "results": [phrase_candidate_payload(c) for c in candidates],
             },
             ensure_ascii=False,
             indent=2,
@@ -279,27 +245,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
             b: 比較する表現。
         """
         comparison = searcher().compare(a, b)
-        return json.dumps(
-            {
-                "a": {
-                    "text": comparison.a_text,
-                    "reading": comparison.a_reading,
-                    "phonemes": list(comparison.a_phonemes),
-                    "ipa": ipa_transcription(comparison.a_phonemes),
-                },
-                "b": {
-                    "text": comparison.b_text,
-                    "reading": comparison.b_reading,
-                    "phonemes": list(comparison.b_phonemes),
-                    "ipa": ipa_transcription(comparison.b_phonemes),
-                },
-                "phonetic_similarity": comparison.similarity,
-                "phonetic_distance": comparison.distance,
-                "spaces": comparison.spaces,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        return json.dumps(comparison_payload(comparison), ensure_ascii=False, indent=2)
 
     @server.tool(name="pronounce", description=_PRONOUNCE_DESCRIPTION)
     def pronounce(text: str) -> str:
@@ -312,11 +258,7 @@ def create_server(index_path: Path | str | None = None) -> MCPServer:
         return json.dumps(
             {
                 "text": text,
-                "reading": pronunciation.reading,
-                "phonemes": list(pronunciation.phonemes),
-                "ipa": ipa_transcription(pronunciation.phonemes),
-                "mora_count": pronunciation.mora_count,
-                "moras": [m.kana or m.special for m in pronunciation.moras],
+                **pronunciation_payload(pronunciation),
                 "vowel_skeleton": list(pronunciation.vowel_skeleton),
             },
             ensure_ascii=False,

@@ -19,8 +19,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .distance import CONSONANTS, VOWELS, align_phonemes, ipa_transcription, phoneme_ipa
-from .index import Category
+from .distance import CONSONANTS, VOWELS, align_phonemes, phoneme_ipa
+from .index import Category, parse_category_list
 from .phonology import GEMINATE, LONG, MORAIC_N, analyze_reading
 from .phrase import (
     DEFAULT_BEAM_WIDTH,
@@ -36,6 +36,14 @@ from .search import (
     PRESETS,
     PhoneticSearcher,
     compare_pronunciations,
+)
+from .serialize import (
+    comparison_payload,
+    lattice_edge_payload,
+    lattice_node_payload,
+    phrase_candidate_payload,
+    pronunciation_payload,
+    search_result_payload,
 )
 from .store import CANDIDATE_SPACES, PhoneticStore, default_store_path
 
@@ -117,22 +125,10 @@ SCAN_QUEUE_TIMEOUT = 30.0
 
 def _parse_categories(value: str | None) -> list[Category] | None:
     """カンマ区切りのカテゴリ名を Category に変換する。"""
-    if not value:
-        return None
-    result: list[Category] = []
-    for name in value.split(","):
-        name = name.strip()
-        if not name:
-            continue
-        try:
-            result.append(Category(name))
-        except ValueError:
-            valid = ", ".join(c.value for c in Category)
-            raise HTTPException(
-                status_code=400,
-                detail=f"未知のカテゴリ '{name}' (利用可能: {valid})",
-            ) from None
-    return result or None
+    try:
+        return parse_category_list(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 def create_app(index_path: Path | str | None = None) -> FastAPI:
@@ -255,33 +251,10 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         return {
             "below_floor": fell_back,
             "query": q,
-            "reading": pronunciation.reading,
-            "phonemes": list(pronunciation.phonemes),
-            "ipa": ipa_transcription(pronunciation.phonemes),
-            "mora_count": pronunciation.mora_count,
+            **pronunciation_payload(pronunciation),
             "preset": preset,
             "scanned": scanned,
-            "results": [
-                {
-                    "word": r.surface,
-                    "reading": r.reading,
-                    "score": r.score,
-                    "phonetic_similarity": r.phonetic_similarity,
-                    "embedding_similarity": r.embedding_similarity,
-                    "coda_similarity": r.coda_similarity,
-                    "vowel_similarity": r.vowel_similarity,
-                    "containment": r.containment,
-                    "mora_count": r.mora_count,
-                    "category": r.category.value,
-                    "pos": r.pos,
-                    "familiarity": r.familiarity,
-                    "phonemes": list(r.phonemes),
-                    # 促音の重複は後続音素を見ないと書けないので、連続表記は
-                    # JS に組ませずここで作る (`ipa_transcription` の docstring)。
-                    "ipa": ipa_transcription(r.phonemes),
-                }
-                for r in results
-            ],
+            "results": [search_result_payload(r) for r in results],
         }
 
     @app.get("/api/phrase")
@@ -311,39 +284,9 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         )
         return {
             "text": text,
-            "reading": pronunciation.reading,
-            "phonemes": list(pronunciation.phonemes),
-            "ipa": ipa_transcription(pronunciation.phonemes),
-            "mora_count": pronunciation.mora_count,
-            # 入力側のモーラ列。区間の対応を画面に描くのに要る。
-            "moras": [m.kana or m.special for m in pronunciation.moras],
+            **pronunciation_payload(pronunciation),
             "total": len(candidates),
-            "results": [
-                {
-                    "text": c.text,
-                    "reading": c.reading,
-                    "score": c.score,
-                    "phonetic_similarity": c.phonetic_similarity,
-                    "segment_count": c.segment_count,
-                    "segments": [
-                        {
-                            "surface": s.surface,
-                            "reading": s.reading,
-                            "source_reading": s.source_reading,
-                            "start": s.start,
-                            "end": s.end,
-                            "mora_count": s.mora_count,
-                            "similarity": s.similarity,
-                            "is_particle": s.is_particle,
-                            "phonemes": list(s.phonemes),
-                            # 促音の重複は後続音素を見ないと書けないのでここで作る。
-                            "ipa": ipa_transcription(s.phonemes),
-                        }
-                        for s in c.segments
-                    ],
-                }
-                for c in candidates
-            ],
+            "results": [phrase_candidate_payload(c) for c in candidates],
         }
 
     @app.get("/api/phrase/lattice")
@@ -382,36 +325,14 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         )
         return {
             "text": text,
-            "reading": pronunciation.reading,
-            "ipa": ipa_transcription(pronunciation.phonemes),
-            "mora_count": pronunciation.mora_count,
-            # ノードをモーラ位置に並べるので、入力側のモーラ列が要る。
-            "moras": [m.kana or m.special for m in pronunciation.moras],
+            **pronunciation_payload(pronunciation),
             "node_count": lattice.node_count,
             "path_count": lattice.path_count,
             "beam_width": lattice.beam_width,
             # 予算のために経路を削ったか。画面に「もっとある」ことを出す。
             "truncated": lattice.truncated,
-            "nodes": [
-                {
-                    "id": n.id,
-                    "surface": n.surface,
-                    "reading": n.reading,
-                    "start": n.start,
-                    "end": n.end,
-                    "mora_count": n.mora_count,
-                    "source_reading": n.source_reading,
-                    "similarity": n.similarity,
-                    "is_particle": n.is_particle,
-                    "path_count": n.path_count,
-                    "best_score": n.best_score,
-                }
-                for n in lattice.nodes
-            ],
-            "edges": [
-                {"source": e.source, "target": e.target, "path_count": e.path_count}
-                for e in lattice.edges
-            ],
+            "nodes": [lattice_node_payload(n) for n in lattice.nodes],
+            "edges": [lattice_edge_payload(e) for e in lattice.edges],
             # 図から一覧に戻れるように経路も返す。ノードを選んで絞り込むとき、
             # どの経路が残るかをフロントが計算できる。
             "paths": [
@@ -433,11 +354,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
         pronunciation = searcher().pronounce(text)
         return {
             "text": text,
-            "reading": pronunciation.reading,
-            "phonemes": list(pronunciation.phonemes),
-            "ipa": ipa_transcription(pronunciation.phonemes),
-            "mora_count": pronunciation.mora_count,
-            "moras": [m.kana or m.special for m in pronunciation.moras],
+            **pronunciation_payload(pronunciation),
             "vowel_skeleton": list(pronunciation.vowel_skeleton),
         }
 
@@ -454,23 +371,7 @@ def create_app(index_path: Path | str | None = None) -> FastAPI:
             analyze_reading(extractor.reading_of(a)),
             analyze_reading(extractor.reading_of(b)),
         )
-        return {
-            "a": {
-                "text": comparison.a_text,
-                "reading": comparison.a_reading,
-                "phonemes": list(comparison.a_phonemes),
-                "ipa": ipa_transcription(comparison.a_phonemes),
-            },
-            "b": {
-                "text": comparison.b_text,
-                "reading": comparison.b_reading,
-                "phonemes": list(comparison.b_phonemes),
-                "ipa": ipa_transcription(comparison.b_phonemes),
-            },
-            "similarity": comparison.similarity,
-            "distance": comparison.distance,
-            "spaces": comparison.spaces,
-        }
+        return comparison_payload(comparison)
 
     @app.get("/api/info")
     def api_info() -> dict[str, Any]:

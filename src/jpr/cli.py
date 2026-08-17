@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .distance import ipa_transcription
-from .index import Category
+from .index import Category, parse_category_list
 from .phonology import analyze_reading
 from .phrase import (
     DEFAULT_BEAM_WIDTH,
@@ -18,6 +18,12 @@ from .phrase import (
     DEFAULT_MIN_CHUNK_SCORE,
 )
 from .search import DEFAULT_CANDIDATES, DEFAULT_PRESET, PRESETS, PhoneticSearcher
+from .serialize import (
+    comparison_payload,
+    phrase_candidate_payload,
+    pronunciation_payload,
+    search_result_payload,
+)
 from .store import CANDIDATE_SPACES, PhoneticStore, default_store_path
 
 
@@ -46,20 +52,11 @@ def _print_json(payload: object) -> None:
 
 
 def _parse_categories(value: str | None) -> list[Category] | None:
-    if not value:
-        return None
-    result: list[Category] = []
-    for name in value.split(","):
-        name = name.strip()
-        if not name:
-            continue
-        try:
-            result.append(Category(name))
-        except ValueError:
-            valid = ", ".join(c.value for c in Category)
-            print(f"エラー: 未知のカテゴリ '{name}' (利用可能: {valid})", file=sys.stderr)
-            raise SystemExit(1) from None
-    return result or None
+    try:
+        return parse_category_list(value)
+    except ValueError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 def cmd_similar(args: argparse.Namespace) -> int:
@@ -99,34 +96,13 @@ def cmd_similar(args: argparse.Namespace) -> int:
         _print_json(
             {
                 "query": args.query,
-                "reading": pronunciation.reading,
-                "phonemes": list(pronunciation.phonemes),
-                "ipa": ipa_transcription(pronunciation.phonemes),
-                "mora_count": pronunciation.mora_count,
+                **pronunciation_payload(pronunciation),
                 "preset": args.preset,
                 "elapsed_ms": round(elapsed, 1),
                 # 全走査したときだけ、母集団の規模を添える。
                 "scanned": scanned,
                 "result_count": len(results),
-                "results": [
-                    {
-                        "word": r.surface,
-                        "reading": r.reading,
-                        "score": r.score,
-                        "phonetic_similarity": r.phonetic_similarity,
-                        "embedding_similarity": r.embedding_similarity,
-                        "coda_similarity": r.coda_similarity,
-                        "vowel_similarity": r.vowel_similarity,
-                        "containment": r.containment,
-                        "mora_count": r.mora_count,
-                        "category": r.category.value,
-                        "pos": r.pos,
-                        "familiarity": r.familiarity,
-                        "phonemes": list(r.phonemes),
-                        "ipa": ipa_transcription(r.phonemes),
-                    }
-                    for r in results
-                ],
+                "results": [search_result_payload(r) for r in results],
             }
         )
         return 0
@@ -182,37 +158,10 @@ def cmd_phrase(args: argparse.Namespace) -> int:
         _print_json(
             {
                 "text": args.text,
-                "reading": pronunciation.reading,
-                "phonemes": list(pronunciation.phonemes),
-                "ipa": ipa_transcription(pronunciation.phonemes),
-                "mora_count": pronunciation.mora_count,
+                **pronunciation_payload(pronunciation),
                 "elapsed_ms": round(elapsed, 1),
                 "result_count": len(candidates),
-                "results": [
-                    {
-                        "text": c.text,
-                        "reading": c.reading,
-                        "score": c.score,
-                        "phonetic_similarity": c.phonetic_similarity,
-                        "segment_count": c.segment_count,
-                        "segments": [
-                            {
-                                "surface": s.surface,
-                                "reading": s.reading,
-                                "source_reading": s.source_reading,
-                                "start": s.start,
-                                "end": s.end,
-                                "mora_count": s.mora_count,
-                                "similarity": s.similarity,
-                                "is_particle": s.is_particle,
-                                "phonemes": list(s.phonemes),
-                                "ipa": ipa_transcription(s.phonemes),
-                            }
-                            for s in c.segments
-                        ],
-                    }
-                    for c in candidates
-                ],
+                "results": [phrase_candidate_payload(c) for c in candidates],
             }
         )
         return 0
@@ -254,25 +203,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        _print_json(
-            {
-                "a": {
-                    "text": comparison.a_text,
-                    "reading": comparison.a_reading,
-                    "phonemes": list(comparison.a_phonemes),
-                    "ipa": ipa_transcription(comparison.a_phonemes),
-                },
-                "b": {
-                    "text": comparison.b_text,
-                    "reading": comparison.b_reading,
-                    "phonemes": list(comparison.b_phonemes),
-                    "ipa": ipa_transcription(comparison.b_phonemes),
-                },
-                "similarity": comparison.similarity,
-                "distance": comparison.distance,
-                "spaces": comparison.spaces,
-            }
-        )
+        _print_json(comparison_payload(comparison))
         return 0
 
     for text, reading, phonemes in (

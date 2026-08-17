@@ -120,11 +120,10 @@ async def test_compose_splits_the_input_into_segments(server) -> None:
     assert best["segment_count"] >= 2
     # 区間の対応が読めないと空耳として検証できない。
     for segment in best["segments"]:
-        assert set(segment) >= {"surface", "reading", "source_reading", "mora_range"}
-        start, end = segment["mora_range"]
-        assert start < end
+        assert set(segment) >= {"surface", "reading", "source_reading", "start", "end"}
+        assert segment["start"] < segment["end"]
     # 区間は入力を隙間なく覆う。
-    covered = [s["mora_range"] for s in best["segments"]]
+    covered = [(s["start"], s["end"]) for s in best["segments"]]
     assert covered[0][0] == 0
     assert covered[-1][1] == payload["mora_count"]
     for left, right in itertools.pairwise(covered):
@@ -142,7 +141,7 @@ async def test_compare_separates_axes(server) -> None:
     payload = await call(server, "compare_phonetically", {"a": "乳首", "b": "チョコビ"})
     assert payload["a"]["reading"] == "チクビ"
     assert payload["b"]["reading"] == "チョコビ"
-    assert payload["phonetic_similarity"] > 0.75
+    assert payload["similarity"] > 0.75
     # 空間別の内訳で「どこが似ているか」を示す。
     assert payload["spaces"]["consonant"] > payload["spaces"]["vowel"]
 

@@ -438,6 +438,12 @@ class _ChunkOption:
     phonemes: tuple[str, ...]
 
 
+#: ビーム探索が持ち回る 1 本の経路 (累積スコア, 当てた選択肢, 覆った区間)。
+#: スコアが累積なのは伸ばすたびに足すためで、経路どうしの比較は
+#: 区間あたりの平均で行う (`_prune`)。
+_Path = tuple[float, tuple[_ChunkOption, ...], tuple[tuple[int, int], ...]]
+
+
 class PhraseComposer:
     """入力を「複数の語 + 助詞」の連なりに合成する。
 
@@ -536,11 +542,48 @@ class PhraseComposer:
         入力長に対して線形に増えるぶん遅くなる。`beam_width` は連結の探索幅で、
         上げると「そこまでは少し悪いが続きが合う」経路を拾いやすくなる。
         """
+        pronunciation, moras, options = self._prepare(
+            text,
+            pronunciation,
+            max_chunk_moras=max_chunk_moras,
+            chunk_candidates=chunk_candidates,
+            min_chunk_score=min_chunk_score,
+            allow_particles=allow_particles,
+        )
+        if not moras:
+            return pronunciation, []
+
+        paths = self._search_paths(
+            moras,
+            options,
+            beam_width=beam_width,
+            limit=limit,
+        )
+        return pronunciation, paths
+
+    def _prepare(
+        self,
+        text: str,
+        pronunciation: Pronunciation | None,
+        *,
+        max_chunk_moras: int,
+        chunk_candidates: int,
+        min_chunk_score: float,
+        allow_particles: bool,
+    ) -> tuple[Pronunciation, tuple[Mora, ...], dict[tuple[int, int], tuple[_ChunkOption, ...]]]:
+        """読みの解析と区間ごとの照合。`compose` と `lattice` の共通の入口。
+
+        **ビーム幅に依存しない部分だけを持つ。** 区間の照合が支配的なコスト
+        なので、`lattice` がビームを広げて作り直すあいだも 1 度で済む。
+
+        モーラが空なら照合も空で返る。空入力の戻り値は経路 (`[]`) と
+        ラティスで違うので、その判断は呼び出し側に残す。
+        """
         if pronunciation is None:
             pronunciation = analyze_reading(text)
         moras = pronunciation.moras
         if not moras:
-            return pronunciation, []
+            return pronunciation, moras, {}
 
         options = self._chunk_options(
             moras,
@@ -549,13 +592,7 @@ class PhraseComposer:
             min_chunk_score=min_chunk_score,
             allow_particles=allow_particles,
         )
-        paths = self._search_paths(
-            moras,
-            options,
-            beam_width=beam_width,
-            limit=limit,
-        )
-        return pronunciation, paths
+        return pronunciation, moras, options
 
     # --- ラティス (候補群を 1 枚の DAG に畳む) -----------------------------
 
@@ -592,19 +629,16 @@ class PhraseComposer:
         広げて作り直すあいだ**使い回す**。これが支配的なコストなので、
         作り直すと試行回数ぶん丸ごと払うことになる。
         """
-        if pronunciation is None:
-            pronunciation = analyze_reading(text)
-        moras = pronunciation.moras
-        if not moras:
-            return pronunciation, PhraseLattice((), (), (), 0, beam_width, False)
-
-        options = self._chunk_options(
-            moras,
+        pronunciation, moras, options = self._prepare(
+            text,
+            pronunciation,
             max_chunk_moras=max_chunk_moras,
             chunk_candidates=chunk_candidates,
             min_chunk_score=min_chunk_score,
             allow_particles=allow_particles,
         )
+        if not moras:
+            return pronunciation, PhraseLattice((), (), (), 0, beam_width, False)
 
         # 予算に届くまでビームを広げる。**採用するのは予算を超えない最後の幅**。
         # 超えた幅の結果をそのまま返すと `node_budget` が守られない。
@@ -837,9 +871,7 @@ class PhraseComposer:
         total = len(moras)
         # beam[i] = 位置 i までを覆う経路のリスト。
         # 経路は (累積スコア, 区間数, 選択肢の列)。
-        beam: list[list[tuple[float, tuple[_ChunkOption, ...], tuple[tuple[int, int], ...]]]] = [
-            [] for _ in range(total + 1)
-        ]
+        beam: list[list[_Path]] = [[] for _ in range(total + 1)]
         beam[0].append((0.0, (), ()))
 
         # 区間の最大長は選択肢の張り方と一致させる。ここを `_chunk_options` と
@@ -1064,9 +1096,9 @@ def _fit_lattice(
 
 
 def _prune(
-    paths: list[tuple[float, tuple[_ChunkOption, ...], tuple[tuple[int, int], ...]]],
+    paths: list[_Path],
     width: int,
-) -> list[tuple[float, tuple[_ChunkOption, ...], tuple[tuple[int, int], ...]]]:
+) -> list[_Path]:
     """経路を上位 `width` 本に絞る。
 
     比較は**区間あたりの平均**で行う。累積スコアで比べると区間数の多い経路が

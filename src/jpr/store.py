@@ -536,10 +536,6 @@ class PhoneticStore:
             return -1
 
     @property
-    def costs(self) -> np.ndarray:
-        return self._data["costs"]
-
-    @property
     def familiarities(self) -> np.ndarray:
         """行ごとの一般性 (0.0〜1.0)。rerank が候補全体に対して引く。"""
         return self._data["familiarities"]

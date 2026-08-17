@@ -998,21 +998,10 @@ class PhoneticSearcher:
         return survivors, phonetic
 
     def _phonetic_scores(self, rows: np.ndarray, query_ids: np.ndarray) -> np.ndarray:
-        """候補行の編集距離ベースの類似度。索引の CSR をそのまま Rust に渡す。
-
-        同じ音素列の行 (同音異表記) には同じ距離しか出ないので、代表 1 行だけ
-        計算して残りへ配る (`_group_representatives`)。4〜6 モーラ帯の候補では
-        ユニークな音素列が 58.8% しかなく、距離計算が 4 割減る。
-        """
-        blob, bounds, distance_ids = self.store.phoneme_csr
-        groups = self.store.group_ids[rows].astype(np.int64)
-        representatives = self._group_representatives(groups)
-        if representatives is None:
-            distances = edit_distance_csr(query_ids, groups, blob, bounds, distance_ids)
-        else:
-            leaders, inverse = representatives
-            distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
-        return _edit_similarity_array(distances, query_ids.size, self.store.phoneme_lengths(rows))
+        """候補行の編集距離ベースの類似度。索引の CSR をそのまま Rust に渡す。"""
+        return self._csr_similarity(
+            rows, query_ids, self.store.phoneme_csr, self.store.phoneme_lengths(rows)
+        )
 
     def _vowel_scores(self, rows: np.ndarray, query_ids: np.ndarray) -> np.ndarray:
         """候補行の母音骨格の類似度。`_phonetic_scores` の母音版。
@@ -1022,7 +1011,29 @@ class PhoneticSearcher:
         `distance.vowel_skeleton_similarity` で、**2 者は同じ値を返さなければ
         ならない** (`tests/test_search.py` が一致を検証する)。
         """
-        blob, bounds, distance_ids = self.store.vowel_csr
+        return self._csr_similarity(
+            rows, query_ids, self.store.vowel_csr, self.store.vowel_lengths(rows)
+        )
+
+    def _csr_similarity(
+        self,
+        rows: np.ndarray,
+        query_ids: np.ndarray,
+        csr: tuple[np.ndarray, np.ndarray, np.ndarray],
+        lengths: np.ndarray,
+    ) -> np.ndarray:
+        """候補行の CSR 列に対する編集距離を類似度に直す。
+
+        音素列と母音骨格で共通の経路。**Rust には母音専用のコードが無い** —
+        骨格の記号はすべて音素なので、コスト表・正規化・グループ代表の
+        畳み込みをそのまま共有する (`store.vowel_csr` の項)。読む CSR と
+        正規化に使う長さだけが軸ごとに違う。
+
+        同じ音素列の行 (同音異表記) には同じ距離しか出ないので、代表 1 行だけ
+        計算して残りへ配る (`_group_representatives`)。4〜6 モーラ帯の候補では
+        ユニークな音素列が 58.8% しかなく、距離計算が 4 割減る。
+        """
+        blob, bounds, distance_ids = csr
         groups = self.store.group_ids[rows].astype(np.int64)
         representatives = self._group_representatives(groups)
         if representatives is None:
@@ -1030,7 +1041,7 @@ class PhoneticSearcher:
         else:
             leaders, inverse = representatives
             distances = edit_distance_csr(query_ids, leaders, blob, bounds, distance_ids)[inverse]
-        return _edit_similarity_array(distances, query_ids.size, self.store.vowel_lengths(rows))
+        return _edit_similarity_array(distances, query_ids.size, lengths)
 
     def _group_representatives(self, groups: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
         """候補のグループ列を重複のない代表に畳む。
@@ -1047,17 +1058,7 @@ class PhoneticSearcher:
         """
         if groups.size < max(_GROUP_DEDUPE_MIN_CANDIDATES, 2):
             return None
-        deltas = np.diff(groups)
-        if np.any(deltas < 0):
-            # rows が昇順でない (グループの隣接が保証できない)。
-            return None
-        first = np.empty(groups.size, dtype=bool)
-        first[0] = True
-        np.not_equal(deltas, 0, out=first[1:])
-        leaders = groups[first]
-        if leaders.size == groups.size:
-            return None
-        return leaders, np.cumsum(first) - 1
+        return _collapse_sorted_runs(groups)
 
     def _space_scores(
         self,
@@ -1105,17 +1106,11 @@ class PhoneticSearcher:
         # は `arange` を返す)。昇順ならグループ列も昇順なので、隣接比較だけで
         # 代表が取れる。**その前提が崩れたら畳まない** — 黙って別のグループの
         # スコアを配るより、重複ぶん引き直すほうがいい。
-        deltas = np.diff(groups)
-        if np.any(deltas < 0):
+        collapsed = _collapse_sorted_runs(groups)
+        if collapsed is None:
             return store.dot_selected_groups(space, query, groups)
-        first = np.empty(groups.size, dtype=bool)
-        first[0] = True
-        np.not_equal(deltas, 0, out=first[1:])
-        leaders = groups[first]
-        selected = store.dot_selected_groups(space, query, leaders)
-        if leaders.size == groups.size:
-            return selected
-        return selected[np.cumsum(first) - 1]
+        leaders, inverse = collapsed
+        return store.dot_selected_groups(space, query, leaders)[inverse]
 
     def _materialize(
         self,
@@ -1345,15 +1340,36 @@ def _top_positions(
     return positions[np.argsort(-values)].tolist()
 
 
-def _mora_similarity(a: int, b: int) -> float:
-    """モーラ数の近さ。同数なら 1.0、離れるにつれ線形に下がる。"""
-    if a == b:
-        return 1.0
-    return max(0.0, 1.0 - abs(a - b) / max(a, b, 1))
+def _collapse_sorted_runs(values: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """昇順の配列を重複のない代表に畳む。
+
+    戻り値は (代表, 各要素の代表位置)。代表側で求めた値を `[inverse]` で
+    gather すれば元の並びに戻る。**昇順でない、または畳める重複が無いときは
+    `None`** — 呼び出し側は元の配列をそのまま使えばよい。
+
+    `np.unique` を使わないのは、ハッシュ化 (実際にはソート) が要素数に効く
+    ため。97 万候補 x 2 空間で 378ms かかり、全走査経路が 2 倍に伸びた。
+    昇順なら同じ値は隣接するので、隣接比較 1 回で代表が取れる。
+
+    昇順の確認をここで行うのは、前提が崩れたときに黙って別の要素の値を
+    配らないため (候補数に線形で軽い)。
+    """
+    if values.size == 0:
+        return None
+    deltas = np.diff(values)
+    if np.any(deltas < 0):
+        return None
+    first = np.empty(values.size, dtype=bool)
+    first[0] = True
+    np.not_equal(deltas, 0, out=first[1:])
+    leaders = values[first]
+    if leaders.size == values.size:
+        return None
+    return leaders, np.cumsum(first) - 1
 
 
 def _mora_similarity_array(query_moras: int, candidates: np.ndarray) -> np.ndarray:
-    """`_mora_similarity` を候補全体にまとめて適用する。"""
+    """モーラ数の近さ。同数なら 1.0、離れるにつれ線形に下がる。"""
     gap = np.abs(candidates - query_moras).astype(np.float64)
     scale = np.maximum(np.maximum(candidates, query_moras), 1).astype(np.float64)
     return np.clip(1.0 - gap / scale, 0.0, 1.0)
